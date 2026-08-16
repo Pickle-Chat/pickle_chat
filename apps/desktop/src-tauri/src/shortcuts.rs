@@ -17,6 +17,12 @@
 //! fallback. Push-to-talk therefore works with the window focused no matter what
 //! the platform decides about the grab, which is the behaviour this whole module
 //! exists to guarantee.
+//!
+//! Mouse buttons are keyboard-only territory here: the shortcut layer has no
+//! notion of them, so a `Mouse4` binding is passed straight through as
+//! unregistered and the frontend is its whole implementation. Reaching a mouse
+//! button globally on Linux would mean reading the evdev device directly, which
+//! needs the user in the `input` group and is not attempted.
 
 use crate::state::{AppState, VoiceState};
 use parking_lot::Mutex;
@@ -108,6 +114,22 @@ pub fn apply(app: &AppHandle) -> Vec<BindingStatus> {
             continue;
         };
 
+        // Mouse bindings never reach the shortcut layer: it is keyboard-only,
+        // and handing it "Mouse4" would produce an "unsupported key" complaint
+        // that reads like a fault rather than a limit. The frontend implements
+        // these itself, focus-scoped.
+        if is_mouse(&accelerator) {
+            statuses.push(BindingStatus {
+                action: action.label().into(),
+                accelerator: accelerator.clone(),
+                registered: false,
+                error: Some(
+                    "Mouse buttons cannot be reserved system-wide; this works while Pickle is focused.".into(),
+                ),
+            });
+            continue;
+        }
+
         let status = match accelerator.parse::<Shortcut>() {
             Err(error) => BindingStatus {
                 action: action.label().into(),
@@ -174,8 +196,38 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, event_state: ShortcutState) 
     }
 }
 
+/// Whether an accelerator names a mouse button rather than a key.
+///
+/// Matches the last token so a modified binding like `Shift+Mouse4` is
+/// recognised too.
+fn is_mouse(accelerator: &str) -> bool {
+    accelerator
+        .rsplit('+')
+        .next()
+        .is_some_and(|token| token.trim().starts_with("Mouse"))
+}
+
 pub fn emit_voice_state(app: &AppHandle, voice: VoiceState) {
     if let Err(error) = app.emit(VOICE_STATE_EVENT, voice) {
         debug!(%error, "could not emit voice state to the frontend");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_mouse;
+
+    #[test]
+    fn mouse_bindings_are_told_apart_from_keys() {
+        assert!(is_mouse("Mouse4"));
+        assert!(
+            is_mouse("Shift+Mouse4"),
+            "a modified mouse binding still counts"
+        );
+        assert!(!is_mouse("KeyM"));
+        assert!(!is_mouse("Control+Shift+KeyM"));
+        assert!(!is_mouse(""));
+        // The key whose name merely starts the same way must not be caught.
+        assert!(!is_mouse("Control+MouseKeyIsNotAThing+KeyM"));
     }
 }

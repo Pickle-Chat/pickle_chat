@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import { api, type BindingStatus, type KeybindAction, type Keybinds } from "../api";
-import { captureAccelerator, describeAccelerator } from "../keys";
+import {
+  captureAccelerator,
+  captureMouseAccelerator,
+  describeAccelerator,
+  isMouseAccelerator,
+  type CaptureResult,
+} from "../keys";
 
 const BINDINGS: { action: KeybindAction; label: string; help: string }[] = [
   {
@@ -34,11 +40,21 @@ export function KeybindsTab({
     api.setKeybinds(next).then(setStatuses).catch((e) => onError(String(e)));
   };
 
-  // Capture runs on the window so it catches keys the button itself would never
-  // see, and swallows the press so binding Space or Enter does not also
-  // activate whatever is focused.
+  // Capture runs on the window so it catches input the button itself would
+  // never see, and swallows the press so binding Space, Enter, or a mouse
+  // button does not also activate whatever is under the pointer.
   useEffect(() => {
     if (capturing === null) return;
+
+    const accept = ({ accelerator, problem }: CaptureResult, fallback: string) => {
+      if (!accelerator) {
+        setProblem(problem ?? fallback);
+        return;
+      }
+      setProblem(null);
+      setCapturing(null);
+      save({ ...keybinds, [capturing]: accelerator });
+    };
 
     const onKeyDown = (event: KeyboardEvent) => {
       event.preventDefault();
@@ -50,22 +66,40 @@ export function KeybindsTab({
         return;
       }
 
-      const { accelerator, problem } = captureAccelerator(event);
-      if (!accelerator) {
-        setProblem(problem ?? "That key cannot be bound.");
-        return;
-      }
+      accept(captureAccelerator(event), "That key cannot be bound.");
+    };
 
-      setProblem(null);
-      setCapturing(null);
-      save({ ...keybinds, [capturing]: accelerator });
+    const onMouseDown = (event: MouseEvent) => {
+      // The left button still has to reach the interface, or there would be no
+      // way to click "cancel" out of capture mode.
+      if (event.button === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      accept(captureMouseAccelerator(event), "That mouse button cannot be bound.");
+    };
+
+    const swallow = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
     };
 
     window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
+    window.addEventListener("mousedown", onMouseDown, true);
+    window.addEventListener("auxclick", swallow, true);
+    window.addEventListener("contextmenu", swallow, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("mousedown", onMouseDown, true);
+      window.removeEventListener("auxclick", swallow, true);
+      window.removeEventListener("contextmenu", swallow, true);
+    };
   }, [capturing, keybinds]);
 
   const anyRefused = statuses.some((status) => !status.registered);
+  const anyMouse = BINDINGS.some((binding) => {
+    const accelerator = keybinds[binding.action];
+    return accelerator !== null && isMouseAccelerator(accelerator);
+  });
 
   return (
     <div className="settings-pane">
@@ -85,7 +119,7 @@ export function KeybindsTab({
                 }}
               >
                 {capturing === binding.action
-                  ? "Press a key… (Escape to cancel)"
+                  ? "Press a key or mouse button… (Escape to cancel)"
                   : accelerator
                     ? describeAccelerator(accelerator)
                     : "Not bound"}
@@ -98,10 +132,20 @@ export function KeybindsTab({
                   clear
                 </button>
               )}
-              {status && !status.registered && (
-                <span className="muted" title={status.error ?? undefined}>
-                  ⚠ not global
+              {accelerator && isMouseAccelerator(accelerator) ? (
+                <span
+                  className="muted"
+                  title="Mouse buttons cannot be reserved system-wide on any platform this app supports."
+                >
+                  ⚠ only while Pickle is focused
                 </span>
+              ) : (
+                status &&
+                !status.registered && (
+                  <span className="muted" title={status.error ?? undefined}>
+                    ⚠ not global
+                  </span>
+                )
               )}
             </div>
             {binding.help && <p className="muted">{binding.help}</p>}
@@ -115,7 +159,18 @@ export function KeybindsTab({
         </p>
       )}
 
-      {anyRefused && (
+      {anyMouse && (
+        <p className="muted">
+          Mouse buttons work while Pickle is focused, but cannot be reserved
+          system-wide: the shortcut layer this app uses handles keyboard keys
+          only. If you need push to talk to reach you while a game is in front,
+          bind a key as well — or ask about raw input device support, which can
+          read the mouse globally on Linux but needs your user added to the{" "}
+          <code>input</code> group.
+        </p>
+      )}
+
+      {anyRefused && !anyMouse && (
         <p className="muted">
           Keys marked <strong>not global</strong> could not be reserved
           system-wide, so they only work while the Pickle window is focused.
