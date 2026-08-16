@@ -1,0 +1,20 @@
+/target
+**/target
+
+# Node / Tauri frontend
+node_modules
+dist
+.vite
+
+# Tauri regenerates these from tauri.conf.json and the capability files.
+apps/desktop/src-tauri/gen/
+
+# Runtime state — these contain private keys. Never commit.
+/run
+*.key
+*.identity
+known_servers.json
+
+.DS_Store
+.env
+.env.local

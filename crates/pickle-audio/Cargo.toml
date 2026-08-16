@@ -1,0 +1,18 @@
+[package]
+name = "pickle-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Audio for Pickle: Opus encode/decode, jitter buffering, voice activity detection, and mixing."
+
+[dependencies]
+pickle-proto.workspace = true
+
+opus.workspace = true
+cpal.workspace = true
+
+bytes.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

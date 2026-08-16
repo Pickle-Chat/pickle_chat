@@ -1,0 +1,29 @@
+[package]
+name = "pickle-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Client core for Pickle: connection, identity pinning, and event stream."
+
+[dependencies]
+pickle-identity.workspace = true
+pickle-proto.workspace = true
+
+tokio.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pickle-server = { path = "../pickle-server" }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

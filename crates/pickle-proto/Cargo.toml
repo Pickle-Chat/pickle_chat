@@ -1,0 +1,15 @@
+[package]
+name = "pickle-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wire protocol for Pickle: control messages, framing, and voice datagram encoding."
+
+[dependencies]
+pickle-identity.workspace = true
+serde.workspace = true
+postcard.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
