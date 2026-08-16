@@ -75,6 +75,8 @@ pub fn run() {
             commands::stop_audio_preview,
             commands::connect,
             commands::disconnect,
+            commands::sessions,
+            commands::set_voice_session,
             commands::join_channel,
             commands::send_message,
             commands::set_muted,

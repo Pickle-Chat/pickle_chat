@@ -6,10 +6,13 @@
 
 use crate::bookmarks::{Bookmark, BookmarkInput};
 use crate::bridge;
-use crate::dto::{AudioDeviceDto, IdentityDto, IdentityListDto, SessionDto, VaultEntryDto};
+use crate::dto::{
+    AudioDeviceDto, ConnectionDto, IdentityDto, IdentityListDto, SessionDto, SessionListDto,
+    SpeakingDto, VaultEntryDto,
+};
 use crate::settings::{AudioSettings, Keybinds, Settings};
 use crate::shortcuts;
-use crate::state::{ActiveSession, AppState, VoiceState};
+use crate::state::{ActiveSession, AppState, SessionId, VoiceState};
 use pickle_audio::DeviceKind;
 use pickle_client::{ConnectOptions, TrustPolicy};
 use pickle_identity::{Identity, MineProgress};
@@ -46,20 +49,25 @@ pub fn set_nickname(state: State<'_, AppState>, nickname: String) -> Result<Iden
         return Err("A nickname needs at least one visible character.".into());
     }
 
-    {
+    let active = {
         let mut vault = state.vault.lock();
         let active = vault.active_fingerprint().to_string();
         vault
             .set_nickname(&active, trimmed)
             .map_err(|e| e.to_string())?;
-    }
+        active
+    };
     state.persist_vault()?;
 
-    // Take effect immediately if connected, rather than at next login.
-    if let Some(session) = state.session.lock().as_ref() {
-        session
-            .client
-            .send_control(pickle_proto::ClientControl::SetNickname(trimmed.into()));
+    // Take effect immediately, rather than at next login. Only on connections
+    // that signed in with this identity: another one's nickname belongs to a
+    // different key and is not ours to change here.
+    for session in state.sessions.lock().values() {
+        if session.identity == active {
+            session
+                .client
+                .send_control(pickle_proto::ClientControl::SetNickname(trimmed.into()));
+        }
     }
 
     Ok(identity_info(state))
@@ -81,30 +89,24 @@ pub fn add_identity(
         let mut vault = state.vault.lock();
         let fingerprint = vault.add(Identity::generate(), nickname, label.trim());
         // Switching immediately is the point of creating one; a new identity
-        // left unselected would look like nothing happened. Safe here because
-        // an identity cannot be created and connected in the same instant.
-        if state.session.lock().is_none() {
-            vault.set_active(&fingerprint).map_err(|e| e.to_string())?;
-        }
+        // left unselected would look like nothing happened.
+        vault.set_active(&fingerprint).map_err(|e| e.to_string())?;
     }
     state.persist_vault()?;
     Ok(identities(state))
 }
 
-/// Switch the active identity.
+/// Switch which identity new connections default to.
 ///
-/// Refused while connected: the active identity is what signed the login, and
-/// the server knows this client by that key. Changing it underneath a live
-/// session would leave the two disagreeing about who is talking.
+/// No longer refused while connected. A connection signs in with a *copy* of
+/// the key taken at connect time and records which identity that was, so
+/// changing the default afterwards cannot disturb a live session — "active"
+/// now means only "the one the next connection will use".
 #[tauri::command]
 pub fn set_active_identity(
     state: State<'_, AppState>,
     fingerprint: String,
 ) -> Result<IdentityListDto, String> {
-    if state.session.lock().is_some() {
-        return Err("Disconnect before switching identity — the server knows you by the key you signed in with.".into());
-    }
-
     state
         .vault
         .lock()
@@ -134,13 +136,19 @@ pub fn set_identity_label(
 /// Irreversible, and it costs every permission every server granted that key.
 /// The frontend confirms before calling this; the vault refuses to remove the
 /// last one regardless.
+///
+/// Refused while a connection is signed in with it. Unlike switching the active
+/// identity, this genuinely would strand a live session: the key it
+/// authenticated with would no longer exist to reconnect from.
 #[tauri::command]
 pub fn remove_identity(
     state: State<'_, AppState>,
     fingerprint: String,
 ) -> Result<IdentityListDto, String> {
-    if state.session.lock().is_some() {
-        return Err("Disconnect before removing an identity.".into());
+    if state.identity_in_use(&fingerprint) {
+        return Err(
+            "That identity is signed in to a server. Disconnect it before deleting the key.".into(),
+        );
     }
 
     state
@@ -249,23 +257,25 @@ pub fn audio_devices() -> Result<AudioDevices, String> {
     })
 }
 
-/// Connect, using the stored audio settings.
+/// Open a connection, leaving any existing ones alone.
 ///
-/// Devices and gate mode are no longer arguments: they belong to the settings
-/// menu, which can change them while connected, and taking them here as well
-/// would leave two sources of truth that disagree the moment either is used.
+/// Devices and gate mode are not arguments: they belong to the settings menu,
+/// which can change them while connected, and taking them here as well would
+/// leave two sources of truth that disagree the moment either is used.
+///
+/// `identity` names which key to sign in with, defaulting to the vault's active
+/// one. It is resolved to a copy before the handshake, so the vault can be
+/// changed afterwards without disturbing a live connection.
 #[tauri::command]
 pub async fn connect(
     app: AppHandle,
     state: State<'_, AppState>,
     address: String,
     password: Option<String>,
-) -> Result<SessionDto, String> {
-    // Replace any existing session rather than leaking one.
-    state.end_session();
-
+    identity: Option<String>,
+) -> Result<ConnectionDto, String> {
     let target = resolve(&address)?;
-    let nickname = state.active_nickname();
+    let (identity, nickname, fingerprint) = state.identity_for(identity.as_deref())?;
     let mut trust = state.trust_store()?;
 
     let mut options = ConnectOptions::new(target, nickname).with_trust(TrustPolicy::OnFirstUse);
@@ -273,17 +283,14 @@ pub async fn connect(
         options = options.with_password(password);
     }
 
-    // Copies the key out rather than holding the lock across the await. The
-    // guard is `!Send`, so keeping it would not even compile in an async
-    // command, and `connect` only borrows the identity to sign the challenge.
-    let identity = state.active_identity();
-
     let (client, events) = pickle_client::connect(options, &identity, &mut trust)
         .await
         .map_err(|e| e.to_string())?;
 
     let session_dto = SessionDto::from(client.session());
+    let id = state.next_session_id();
     info!(
+        session = id,
         server = %session_dto.server_name,
         client_id = session_dto.client_id,
         "connected"
@@ -291,48 +298,108 @@ pub async fn connect(
 
     let client = Arc::new(client);
 
-    // Starts from stored settings, replacing any engine the settings dialog left
-    // running for its meter, and rewires the capture pump to this client.
+    // Leaves a running engine alone: connecting a second server has no business
+    // reopening the devices and cutting the first one's audio.
     state
-        .start_audio(Some(Arc::clone(&client)))
+        .ensure_audio()
         .map_err(|e| format!("Connected, but {}", e.trim_start_matches("The ")))?;
 
-    let event_pump = bridge::spawn_event_pump(app, state.engine.clone(), events);
+    let event_pump =
+        bridge::spawn_event_pump(app, id, state.engine.clone(), state.voice.clone(), events);
 
-    *state.session.lock() = Some(ActiveSession { client, event_pump });
+    state.sessions.lock().insert(
+        id,
+        ActiveSession {
+            id,
+            client,
+            event_pump,
+            address: address.clone(),
+            identity: fingerprint,
+        },
+    );
 
-    Ok(session_dto)
+    // The first connection takes voice, since there is nothing to take it from.
+    // Later ones do not: looking at a new server should not cut you out of the
+    // conversation you are already in.
+    if state.voice.session().is_none() {
+        state.route_voice(id)?;
+    }
+
+    state.remember_open_connections();
+
+    Ok(ConnectionDto {
+        session: id,
+        info: session_dto,
+        identity: state
+            .sessions
+            .lock()
+            .get(&id)
+            .map(|s| s.identity.clone())
+            .unwrap_or_default(),
+    })
 }
 
 #[tauri::command]
-pub fn disconnect(state: State<'_, AppState>) {
-    state.end_session();
+pub fn disconnect(state: State<'_, AppState>, session: SessionId) {
+    state.end_session(session);
+    state.remember_open_connections();
+}
+
+/// Every live connection, for rebuilding the tab strip.
+#[tauri::command]
+pub fn sessions(state: State<'_, AppState>) -> SessionListDto {
+    let sessions = state.sessions.lock();
+    SessionListDto {
+        voice: state.voice.session(),
+        sessions: sessions
+            .values()
+            .map(|session| ConnectionDto {
+                session: session.id,
+                info: SessionDto::from(session.client.session()),
+                identity: session.identity.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Move the microphone to another connection.
+///
+/// Not called on tab switch: reading one server should not cut you out of a
+/// conversation on another. This is the explicit act.
+#[tauri::command]
+pub fn set_voice_session(state: State<'_, AppState>, session: SessionId) -> Result<(), String> {
+    state.route_voice(session)
 }
 
 #[tauri::command]
-pub fn join_channel(state: State<'_, AppState>, channel: u32) -> Result<(), String> {
-    with_session(&state, |session| {
-        session.client.join_channel(channel);
+pub fn join_channel(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active.client.join_channel(channel);
     })
 }
 
 #[tauri::command]
 pub fn send_message(
     state: State<'_, AppState>,
+    session: SessionId,
     channel: u32,
     content: String,
 ) -> Result<(), String> {
     if content.trim().is_empty() {
         return Ok(());
     }
-    with_session(&state, |session| {
+    state.with_session(session, |active| {
         // The nonce lets the UI match the server's echo to its optimistic
         // local render.
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        session.client.send_message(channel, content, nonce);
+        active.client.send_message(channel, content, nonce);
     })
 }
 
@@ -410,21 +477,30 @@ pub fn input_activity(state: State<'_, AppState>) -> InputActivity {
 /// appear in our own channel list. Folding our transmit state in here rather
 /// than special-casing it in the UI keeps this meaning one thing: everyone the
 /// channel can currently hear.
+/// Scoped to the connection holding voice, and says which that is. Speaker ids
+/// are assigned per server, so applying this list to another server's tab would
+/// light up whoever happens to share a number with someone talking elsewhere.
 #[tauri::command]
-pub fn speaking(state: State<'_, AppState>) -> Vec<u32> {
+pub fn speaking(state: State<'_, AppState>) -> SpeakingDto {
+    let Some(voice) = state.voice.session() else {
+        return SpeakingDto::default();
+    };
     let Some(engine) = state.engine.current() else {
-        return Vec::new();
+        return SpeakingDto::default();
     };
 
     let mut speaking = engine.speaking();
 
     if engine.is_transmitting() {
-        if let Some(session) = state.session.lock().as_ref() {
-            speaking.push(session.client.session().client_id);
+        if let Ok(client_id) = state.with_session(voice, |s| s.client.session().client_id) {
+            speaking.push(client_id);
         }
     }
 
-    speaking
+    SpeakingDto {
+        session: Some(voice),
+        clients: speaking,
+    }
 }
 
 #[derive(Serialize)]
@@ -528,12 +604,9 @@ pub fn set_audio_settings(state: State<'_, AppState>, audio: AudioSettings) -> R
     };
 
     if needs_restart {
-        let client = state
-            .session
-            .lock()
-            .as_ref()
-            .map(|session| Arc::clone(&session.client));
-        state.start_audio(client)?;
+        // The capture pump follows the voice route rather than owning a client,
+        // so a rebuild does not need to know where voice currently points.
+        state.start_audio()?;
     } else {
         engine.set_gate_mode(audio.gate_mode.into());
     }
@@ -568,28 +641,17 @@ pub fn keybind_status(app: AppHandle) -> Vec<shortcuts::BindingStatus> {
 /// live input meter and let someone actually hear whether a device works.
 #[tauri::command]
 pub fn start_audio_preview(state: State<'_, AppState>) -> Result<(), String> {
-    // Connected already means an engine is running and wired to the server;
-    // replacing it with a preview would silently cut the user's microphone.
-    if state.session.lock().is_some() {
-        return Ok(());
-    }
-    state.start_audio(None).map(|_| ())
+    // Leaves a running engine alone rather than replacing it, which would cut
+    // the microphone on whichever connection currently holds voice.
+    state.ensure_audio().map(|_| ())
 }
 
 #[tauri::command]
 pub fn stop_audio_preview(state: State<'_, AppState>) {
-    if state.session.lock().is_none() {
+    // Only when nothing is connected. With a live connection the engine is not
+    // a preview to be stopped — it is carrying someone's voice.
+    if state.sessions.lock().is_empty() {
         state.stop_audio();
-    }
-}
-
-fn with_session(state: &State<'_, AppState>, f: impl FnOnce(&ActiveSession)) -> Result<(), String> {
-    match state.session.lock().as_ref() {
-        Some(session) => {
-            f(session);
-            Ok(())
-        }
-        None => Err("Not connected to a server.".into()),
     }
 }
 

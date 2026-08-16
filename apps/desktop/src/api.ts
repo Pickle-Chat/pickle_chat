@@ -66,6 +66,31 @@ export interface Session {
   users: User[];
 }
 
+/// Identifies one connection for the lifetime of the process. Never reused, so
+/// a stale id from a closed tab fails rather than addressing another server.
+export type SessionId = number;
+
+export interface Connection {
+  session: SessionId;
+  info: Session;
+  /// Fingerprint of the identity this connection signed in with, which need not
+  /// be the currently active one.
+  identity: string;
+}
+
+export interface SessionList {
+  sessions: Connection[];
+  /// Which connection the microphone feeds, if any.
+  voice: SessionId | null;
+}
+
+/// Who is audible, and where. Speaker ids only mean something within one
+/// server, so the session is part of the answer rather than assumed.
+export interface Speaking {
+  session: SessionId | null;
+  clients: number[];
+}
+
 export interface AudioDevice {
   name: string;
   isDefault: boolean;
@@ -110,9 +135,20 @@ export interface Keybinds {
   toggleDeafen: string | null;
 }
 
+/// A connection that was open when the app last recorded its state.
+///
+/// No password: bookmarks hold those, matched by address when reconnecting.
+export interface OpenConnection {
+  address: string;
+  /// Fingerprint of the identity it signed in with, so a restore returns as the
+  /// same person rather than as whoever happens to be active.
+  identity: string;
+}
+
 export interface Settings {
   audio: AudioSettings;
   keybinds: Keybinds;
+  connections: OpenConnection[];
 }
 
 export interface Bookmark {
@@ -165,6 +201,8 @@ export interface ConnectRequest {
   [key: string]: unknown;
   address: string;
   password?: string;
+  /// Fingerprint of the identity to sign in with. Omitted means the active one.
+  identity?: string;
 }
 
 export const api = {
@@ -193,12 +231,19 @@ export const api = {
   startAudioPreview: () => invoke<void>("start_audio_preview"),
   stopAudioPreview: () => invoke<void>("stop_audio_preview"),
 
-  connect: (request: ConnectRequest) => invoke<Session>("connect", request),
-  disconnect: () => invoke<void>("disconnect"),
+  connect: (request: ConnectRequest) => invoke<Connection>("connect", request),
+  disconnect: (session: SessionId) => invoke<void>("disconnect", { session }),
+  sessions: () => invoke<SessionList>("sessions"),
 
-  joinChannel: (channel: number) => invoke<void>("join_channel", { channel }),
-  sendMessage: (channel: number, content: string) =>
-    invoke<void>("send_message", { channel, content }),
+  // Voice lives on one connection at a time; this is the explicit move. Not
+  // called on tab switch — reading one server should not cut you out of a
+  // conversation on another.
+  setVoiceSession: (session: SessionId) => invoke<void>("set_voice_session", { session }),
+
+  joinChannel: (session: SessionId, channel: number) =>
+    invoke<void>("join_channel", { session, channel }),
+  sendMessage: (session: SessionId, channel: number, content: string) =>
+    invoke<void>("send_message", { session, channel, content }),
 
   setMuted: (muted: boolean) => invoke<VoiceState>("set_muted", { muted }),
   setDeafened: (deafened: boolean) => invoke<VoiceState>("set_deafened", { deafened }),
@@ -206,7 +251,7 @@ export const api = {
   voiceState: () => invoke<VoiceState>("voice_state"),
 
   inputActivity: () => invoke<InputActivity>("input_activity"),
-  speaking: () => invoke<number[]>("speaking"),
+  speaking: () => invoke<Speaking>("speaking"),
 
   knownServers: () =>
     invoke<{ address: string; name: string; fingerprint: string }[]>("known_servers"),
@@ -220,8 +265,14 @@ export const api = {
     invoke<Bookmark[]>("update_bookmark", { id, bookmark }),
   removeBookmark: (id: number) => invoke<Bookmark[]>("remove_bookmark", { id }),
 
-  onServerEvent: (handler: (event: ServerEvent) => void): Promise<UnlistenFn> =>
-    listen<ServerEvent>("pickle:event", (e) => handler(e.payload)),
+  // Every event names the connection it came from, so the app can route it to
+  // the right tab rather than assuming there is only one.
+  onServerEvent: (
+    handler: (session: SessionId, event: ServerEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ session: SessionId; event: ServerEvent }>("pickle:event", (e) =>
+      handler(e.payload.session, e.payload.event),
+    ),
 
   onMiningProgress: (handler: (progress: MiningProgress) => void): Promise<UnlistenFn> =>
     listen<MiningProgress>("pickle:mining", (e) => handler(e.payload)),

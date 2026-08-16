@@ -92,11 +92,26 @@ pub struct Keybinds {
     pub toggle_deafen: Option<String>,
 }
 
+/// A connection that was open when the app last recorded its state.
+///
+/// No password: bookmarks hold those, and copying one here would spread the
+/// same secret across a second file with weaker protection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenConnection {
+    pub address: String,
+    /// Fingerprint of the identity it signed in with, so a restore returns as
+    /// the same person rather than as whoever happens to be active.
+    pub identity: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     pub audio: AudioSettings,
     pub keybinds: Keybinds,
+    /// What was connected last, for offering to reopen it.
+    pub connections: Vec<OpenConnection>,
 }
 
 impl Settings {
@@ -188,6 +203,10 @@ mod tests {
                 push_to_talk: Some("F13".into()),
                 ..Keybinds::default()
             },
+            connections: vec![OpenConnection {
+                address: "example.com:42071".into(),
+                identity: "abc-123".into(),
+            }],
         };
 
         settings.save(&path).unwrap();

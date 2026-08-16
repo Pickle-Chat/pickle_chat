@@ -460,3 +460,83 @@ async fn connecting_to_a_dead_address_fails_promptly() {
         Ok(_) => panic!("nothing should be listening at 192.0.2.1"),
     }
 }
+
+/// One identity, two servers, at the same time.
+///
+/// This is the foundation the desktop client's connection tabs rest on. Nothing
+/// in the protocol forbids it — `Client` holds no global state — but "nothing
+/// forbids it" is not the same as having seen it work, and the failure mode if
+/// it did not would be an app that silently drops the first connection when the
+/// second opens.
+#[tokio::test]
+async fn one_identity_can_hold_two_connections_at_once() {
+    let first = TestServer::start(|config| config.name = "First".into()).await;
+    let second = TestServer::start(|config| config.name = "Second".into()).await;
+
+    // The same key on both, which is what connecting to two servers as yourself
+    // actually means.
+    let identity = Identity::generate();
+    let mut trust = TrustStore::ephemeral();
+
+    let (client_a, mut events_a) = pickle_client::connect(
+        ConnectOptions::new(first.address, "alice"),
+        &identity,
+        &mut trust,
+    )
+    .await
+    .unwrap();
+    let (client_b, _events_b) = pickle_client::connect(
+        ConnectOptions::new(second.address, "alice"),
+        &identity,
+        &mut trust,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(client_a.session().server_name, "First");
+    assert_eq!(client_b.session().server_name, "Second");
+
+    // Distinct servers, so distinct identities — a client that had silently
+    // reconnected to the same one would pass every check above.
+    assert_ne!(
+        client_a.session().server_identity.fingerprint(),
+        client_b.session().server_identity.fingerprint(),
+    );
+
+    // The first connection is still live, not merely still in scope: opening
+    // the second must not have torn it down. A third client joining the first
+    // server proves it, since a dead connection would never hear about them.
+    let (other, _events) = connect_client(&first, "bob").await.unwrap();
+    expect_event(
+        &mut events_a,
+        "bob joining the first server",
+        |event| match event {
+            ClientEvent::UserJoined(user) if user.nickname == "bob" => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+    drop(other);
+}
+
+/// Client ids are assigned per server, so the same number means different
+/// people on different connections.
+///
+/// The desktop client keys its own session registry separately for exactly this
+/// reason, and the voice mixer is kept to one server at a time because it keys
+/// speakers this way.
+#[tokio::test]
+async fn client_ids_are_only_meaningful_within_one_server() {
+    let first = TestServer::default().await;
+    let second = TestServer::default().await;
+
+    let (a, _ea) = connect_client(&first, "alice").await.unwrap();
+    let (b, _eb) = connect_client(&second, "bob").await.unwrap();
+
+    assert_eq!(
+        a.session().client_id,
+        b.session().client_id,
+        "two fresh servers both start numbering from the same place, which is \
+         precisely why a client id cannot be used to tell connections apart",
+    );
+}

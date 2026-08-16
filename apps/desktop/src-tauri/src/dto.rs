@@ -5,6 +5,7 @@
 //! several protocol types carry things JavaScript has no use for — raw
 //! signatures, `Bytes` payloads, opaque key material.
 
+use crate::state::SessionId;
 use pickle_audio::DeviceInfo;
 use pickle_client::{ClientEvent, SessionInfo};
 use pickle_identity::{Identity, VaultEntry};
@@ -165,6 +166,36 @@ impl From<&SessionInfo> for SessionDto {
             users: session.users.iter().map(UserDto::from).collect(),
         }
     }
+}
+
+/// One live connection: its id, what the server told us, and who we are on it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionDto {
+    pub session: SessionId,
+    pub info: SessionDto,
+    /// Fingerprint of the identity this connection signed in with, which need
+    /// not be the vault's currently active one.
+    pub identity: String,
+}
+
+/// Who is audible, and on which connection.
+///
+/// The session is part of the answer rather than assumed: speaker ids only mean
+/// something within one server, so the UI must know where to apply them.
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakingDto {
+    pub session: Option<SessionId>,
+    pub clients: Vec<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListDto {
+    pub sessions: Vec<ConnectionDto>,
+    /// Which connection the microphone feeds, if any.
+    pub voice: Option<SessionId>,
 }
 
 #[derive(Serialize)]

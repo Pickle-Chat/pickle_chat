@@ -164,6 +164,16 @@ impl VoiceMixer {
         self.master_gain = gain.max(0.0);
     }
 
+    /// Forget every speaker.
+    ///
+    /// Speaker ids are assigned by the server, so they only mean anything within
+    /// one connection. A client that moves its voice to another server must
+    /// clear these, or the previous server's streams linger in the speaking list
+    /// and their ids collide with whatever the new server hands out.
+    pub fn clear_speakers(&mut self) {
+        self.streams.clear();
+    }
+
     /// When deafened, streams keep flowing but nothing is rendered — so
     /// undeafening resumes instantly instead of re-buffering.
     pub fn set_deafened(&mut self, deafened: bool) {
@@ -351,6 +361,23 @@ mod tests {
             1,
             "the stream should survive so undeafening resumes instantly"
         );
+    }
+
+    #[test]
+    fn clearing_speakers_empties_the_mixer() {
+        // What voice moving to another server relies on: the old server's ids
+        // mean nothing there and would collide with the new server's.
+        let mut mixer = VoiceMixer::new();
+        prime(&mut mixer, 1);
+        prime(&mut mixer, 2);
+        let mut out = vec![0.0f32; SAMPLES_PER_FRAME];
+        mixer.render(&mut out);
+        assert_eq!(mixer.active_streams(), 2);
+
+        mixer.clear_speakers();
+
+        assert_eq!(mixer.active_streams(), 0);
+        assert!(mixer.speaking().is_empty(), "and nobody is left speaking");
     }
 
     #[test]

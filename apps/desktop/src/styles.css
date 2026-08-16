@@ -621,3 +621,97 @@ code.fingerprint {
   width: 10px;
   height: 10px;
 }
+
+/* --- connection tabs ------------------------------------------------------ */
+
+.tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 8px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+}
+
+.tab > button {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 8px 4px 8px 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* A connection the server dropped. Kept so the reason stays readable. */
+.tab.dead > button {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.tab-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 8px 8px 8px 2px;
+  font-size: 14px;
+}
+
+.tab-close:hover {
+  color: var(--danger);
+}
+
+.tab-unread {
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 9px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.tab-voice {
+  font-size: 11px;
+}
+
+.tab.add {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 16px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.tab.add.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.tab-note {
+  align-self: center;
+  font-size: 12px;
+  padding-left: 8px;
+}
+
+.voice p {
+  font-size: 12px;
+  margin: 0;
+}

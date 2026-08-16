@@ -44,6 +44,13 @@ The server relays voice rather than mixing it. That costs a little bandwidth and
 buys per-speaker volume, independent jitter buffering, and room for positional
 audio later.
 
+A client may hold several connections at once, but voice lives on one of them at
+a time. Speaker ids are assigned per server, so audio from two servers would
+collide in a single mixer — and talking into several rooms at once is not
+something anyone asks for. Switching tabs deliberately does not move the
+microphone; reading one server should not cut you out of a conversation on
+another.
+
 ### Identity and trust
 
 There is no certificate authority anywhere, and a self-hosted server usually has
@@ -90,7 +97,8 @@ Working:
 
 - Server hosting, configuration, channels (including nesting), server passwords
 - Identity generation, mining, keystore, fingerprints
-- Several identities per user, switchable, with the active one signing the login
+- Several identities per user, switchable, with a chosen one signing each login
+- Several servers connected at once, a tab each, reopened on the next launch
 - Authentication with proof-of-work enforcement and certificate binding
 - Trust-on-first-use server pinning
 - Voice: capture, gating, Opus, relay, jitter buffering, mixing, mute/deafen

@@ -256,6 +256,12 @@ impl AudioEngine {
         self.mixer.lock().set_master_gain(gain);
     }
 
+    /// Forget every speaker, for when voice moves to a different server whose
+    /// speaker ids mean something else entirely.
+    pub fn clear_speakers(&self) {
+        self.mixer.lock().clear_speakers();
+    }
+
     pub fn remove_speaker(&self, client: ClientId) {
         self.mixer.lock().remove(client);
     }

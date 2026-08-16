@@ -1,28 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   api,
   type Bookmark,
   type Channel,
+  type Connection,
   type Identity,
   type Message,
-  type ServerEvent,
-  type Session,
+  type SessionId,
   type Settings,
   type User,
 } from "./api";
+import { EMPTY, reduce, type ConnectionState } from "./connections";
 import { LevelMeter } from "./LevelMeter";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { usePushToTalk } from "./usePushToTalk";
 
 export function App() {
   const [identity, setIdentity] = useState<Identity | null>(null);
-  const [session, setSession] = useState<Session | null>(null);
-  const [users, setUsers] = useState<User[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [activeChannel, setActiveChannel] = useState<number | null>(null);
+  const [connections, dispatch] = useReducer(reduce, EMPTY);
+  const [voiceSession, setVoiceSession] = useState<SessionId | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [restoring, setRestoring] = useState(false);
 
   useEffect(() => {
     api.identityInfo().then(setIdentity).catch((e) => setError(String(e)));
@@ -37,86 +37,107 @@ export function App() {
   );
 
   // Server events drive the whole UI. Voice never arrives here — it is mixed
-  // on the Rust side and goes straight to the speakers.
+  // on the Rust side and goes straight to the speakers. Each event names its
+  // connection, so it lands in the right tab.
   useEffect(() => {
-    const unlisten = api.onServerEvent((event) => applyEvent(event));
+    const unlisten = api.onServerEvent((session, event) =>
+      dispatch({ type: "event", session, event }),
+    );
     return () => {
       unlisten.then((fn) => fn());
     };
   }, []);
 
-  const applyEvent = useCallback((event: ServerEvent) => {
-    switch (event.type) {
-      case "userJoined":
-        setUsers((current) => [...current.filter((u) => u.clientId !== event.user.clientId), event.user]);
-        break;
-      case "userLeft":
-        setUsers((current) => current.filter((u) => u.clientId !== event.clientId));
-        break;
-      case "userMoved":
-        setUsers((current) =>
-          current.map((u) => (u.clientId === event.clientId ? { ...u, channel: event.channel } : u)),
-        );
-        break;
-      case "userUpdated":
-        setUsers((current) =>
-          current.map((u) => (u.clientId === event.user.clientId ? event.user : u)),
-        );
-        break;
-      case "message":
-        setMessages((current) => [...current, event.message]);
-        break;
-      case "serverError":
-        setError(event.detail);
-        break;
-      case "disconnected":
-        setError(`Disconnected: ${event.reason}`);
-        setSession(null);
-        setUsers([]);
-        break;
-      case "typing":
-        break;
-    }
-  }, []);
+  // Reopen what was connected last time.
+  //
+  // Driven from here rather than at startup in Rust so each attempt becomes its
+  // own tab: a server that is down, has changed identity, or now refuses the
+  // key shows that in its own tab instead of blocking the others or failing
+  // quietly.
+  useEffect(() => {
+    if (settings === null || settings.connections.length === 0) return;
 
-  const onConnected = (next: Session) => {
-    setSession(next);
-    setUsers(next.users);
-    setMessages([]);
-    setActiveChannel(next.defaultChannel);
+    let cancelled = false;
+    setRestoring(true);
+
+    (async () => {
+      const saved = await api.bookmarks().catch(() => [] as Bookmark[]);
+
+      for (const previous of settings.connections) {
+        if (cancelled) return;
+        // A bookmark for the same address supplies a remembered password; a
+        // server that needs one we do not have simply fails into its own tab.
+        const bookmark = saved.find((b) => b.address === previous.address);
+        try {
+          const connection = await api.connect({
+            address: previous.address,
+            password: bookmark?.password,
+            identity: previous.identity,
+          });
+          if (!cancelled) dispatch({ type: "opened", connection });
+        } catch (e) {
+          if (!cancelled) {
+            setError(`Could not reconnect to ${previous.address}: ${e}`);
+          }
+        }
+      }
+
+      if (!cancelled) setRestoring(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // Runs once, on the first settings load. Restoring again whenever settings
+    // change would reconnect every time a device or keybind was edited.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings !== null]);
+
+  const active = connections.active === null ? null : connections.byId[connections.active] ?? null;
+
+  const onConnected = (connection: Connection) => {
+    dispatch({ type: "opened", connection });
     setError(null);
+    refreshVoice();
   };
 
-  const onDisconnect = async () => {
-    await api.disconnect();
-    setSession(null);
-    setUsers([]);
-    setMessages([]);
+  const refreshVoice = () => {
+    api
+      .sessions()
+      .then((list) => setVoiceSession(list.voice))
+      .catch(() => {});
+  };
+
+  useEffect(refreshVoice, []);
+
+  const onDisconnect = async (session: SessionId) => {
+    await api.disconnect(session).catch((e) => setError(String(e)));
+    dispatch({ type: "closed", session });
+    refreshVoice();
   };
 
   return (
     <div className="app">
       <header className="titlebar">
         <span className="brand">Pickle</span>
-        {session ? (
-          <span className="server">
-            {session.serverName}
-            <code className="fingerprint" title={session.serverFingerprint}>
-              {session.serverFingerprint.slice(0, 14)}…
-            </code>
-          </span>
-        ) : (
-          <span className="muted">Not connected</span>
-        )}
         {identity && <IdentityBadge identity={identity} onChange={setIdentity} />}
         <button className="icon" onClick={() => setSettingsOpen(true)} aria-label="Settings">
           ⚙
         </button>
       </header>
 
+      <ConnectionTabs
+        connections={connections.order.map((id) => connections.byId[id])}
+        active={connections.active}
+        voice={voiceSession}
+        restoring={restoring}
+        onSelect={(session) => dispatch({ type: "focused", session })}
+        onClose={onDisconnect}
+      />
+
       {settingsOpen && (
         <SettingsDialog
-          connected={session !== null}
+          connected={connections.order.length > 0}
           onSettingsChange={setSettings}
           onIdentityChanged={() => {
             api.identityInfo().then(setIdentity).catch((e) => setError(String(e)));
@@ -134,33 +155,158 @@ export function App() {
         </div>
       )}
 
-      {session ? (
-        <main className="layout">
-          <ChannelList
-            channels={session.channels}
-            users={users}
-            activeChannel={activeChannel}
-            selfId={session.clientId}
-            onJoin={(id) => {
-              setActiveChannel(id);
-              api.joinChannel(id).catch((e) => setError(String(e)));
-            }}
-          />
-          <ChatPane
-            channel={session.channels.find((c) => c.id === activeChannel) ?? null}
-            messages={messages.filter((m) => m.channel === activeChannel)}
-            onSend={(content) => {
-              if (activeChannel !== null) {
-                api.sendMessage(activeChannel, content).catch((e) => setError(String(e)));
-              }
-            }}
-          />
-          <VoiceControls onError={setError} onDisconnect={onDisconnect} />
-        </main>
+      {active ? (
+        <ConnectionView
+          connection={active}
+          hasVoice={voiceSession === active.session}
+          onError={setError}
+          onSelectChannel={(channel) => {
+            dispatch({ type: "channelSelected", session: active.session, channel });
+            api.joinChannel(active.session, channel).catch((e) => setError(String(e)));
+          }}
+          onTakeVoice={() => {
+            api
+              .setVoiceSession(active.session)
+              .then(refreshVoice)
+              .catch((e) => setError(String(e)));
+          }}
+          onDisconnect={() => onDisconnect(active.session)}
+        />
       ) : (
         <ConnectForm onConnected={onConnected} onError={setError} />
       )}
     </div>
+  );
+}
+
+/// One tab per connection, plus a `+` for opening another.
+function ConnectionTabs({
+  connections,
+  active,
+  voice,
+  restoring,
+  onSelect,
+  onClose,
+}: {
+  connections: ConnectionState[];
+  active: SessionId | null;
+  voice: SessionId | null;
+  restoring: boolean;
+  onSelect: (session: SessionId | null) => void;
+  onClose: (session: SessionId) => void;
+}) {
+  return (
+    <nav className="tabs" role="tablist" aria-label="Connections">
+      {connections.map((connection) => (
+        <div
+          key={connection.session}
+          className={
+            active === connection.session ? "tab active" : connection.disconnected ? "tab dead" : "tab"
+          }
+        >
+          <button role="tab" aria-selected={active === connection.session} onClick={() => onSelect(connection.session)}>
+            {/* Marks where the microphone is, which is not necessarily the tab
+                being looked at. */}
+            {voice === connection.session && (
+              <span className="tab-voice" title="Voice is on this server" aria-label="Voice is on this server">
+                🔊
+              </span>
+            )}
+            {connection.info.serverName}
+            {connection.unread > 0 && active !== connection.session && (
+              <span className="tab-unread" aria-label={`${connection.unread} unread`}>
+                {connection.unread}
+              </span>
+            )}
+          </button>
+          <button
+            className="tab-close"
+            onClick={() => onClose(connection.session)}
+            aria-label={`Disconnect from ${connection.info.serverName}`}
+            title="Disconnect"
+          >
+            ×
+          </button>
+        </div>
+      ))}
+
+      <button
+        className={active === null ? "tab add active" : "tab add"}
+        onClick={() => onSelect(null)}
+        aria-label="Connect to another server"
+      >
+        +
+      </button>
+
+      {restoring && <span className="muted tab-note">Reconnecting…</span>}
+    </nav>
+  );
+}
+
+/// Everything for one connection.
+function ConnectionView({
+  connection,
+  hasVoice,
+  onError,
+  onSelectChannel,
+  onTakeVoice,
+  onDisconnect,
+}: {
+  connection: ConnectionState;
+  hasVoice: boolean;
+  onError: (error: string) => void;
+  onSelectChannel: (channel: number) => void;
+  onTakeVoice: () => void;
+  onDisconnect: () => void;
+}) {
+  if (connection.disconnected) {
+    return (
+      <div className="connect">
+        <h1>{connection.info.serverName}</h1>
+        <p className="banner error" role="alert">
+          Disconnected: {connection.disconnected}
+        </p>
+        <p className="muted">
+          The tab stays open so you can read why. Close it when you are done.
+        </p>
+        <button onClick={onDisconnect}>Close</button>
+      </div>
+    );
+  }
+
+  const channel =
+    connection.info.channels.find((c) => c.id === connection.activeChannel) ?? null;
+
+  return (
+    <main className="layout">
+      <ChannelList
+        session={connection.session}
+        channels={connection.info.channels}
+        users={connection.users}
+        activeChannel={connection.activeChannel}
+        selfId={connection.info.clientId}
+        hasVoice={hasVoice}
+        onJoin={onSelectChannel}
+      />
+      <ChatPane
+        channel={channel}
+        messages={connection.messages.filter((m) => m.channel === connection.activeChannel)}
+        onSend={(content) => {
+          if (connection.activeChannel !== null) {
+            api
+              .sendMessage(connection.session, connection.activeChannel, content)
+              .catch((e) => onError(String(e)));
+          }
+        }}
+      />
+      <VoiceControls
+        hasVoice={hasVoice}
+        serverName={connection.info.serverName}
+        onTakeVoice={onTakeVoice}
+        onError={onError}
+        onDisconnect={onDisconnect}
+      />
+    </main>
   );
 }
 
@@ -229,11 +375,12 @@ function ConnectForm({
   onConnected,
   onError,
 }: {
-  onConnected: (session: Session) => void;
+  onConnected: (connection: Connection) => void;
   onError: (error: string) => void;
 }) {
   const [address, setAddress] = useState("127.0.0.1:42071");
   const [password, setPassword] = useState("");
+  const [identity, setIdentity] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [known, setKnown] = useState<{ address: string; name: string; fingerprint: string }[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
@@ -247,7 +394,10 @@ function ConnectForm({
     e.preventDefault();
     setBusy(true);
     try {
-      onConnected(await api.connect({ address, password }));
+      onConnected(await api.connect({ address, password, identity }));
+      // Cleared so the form is ready for the next server rather than still
+      // holding the last one's password.
+      setPassword("");
     } catch (err) {
       onError(String(err));
     } finally {
@@ -289,6 +439,8 @@ function ConnectForm({
                     // A saved password is the reason to save one at all; leave
                     // any typed password alone when the bookmark has none.
                     if (bookmark.password !== undefined) setPassword(bookmark.password);
+                    // A bookmark may pin which identity to use for this server.
+                    setIdentity(bookmark.identity);
                   }}
                 >
                   {bookmark.label}
@@ -321,16 +473,21 @@ function ConnectForm({
 }
 
 function ChannelList({
+  session,
   channels,
   users,
   activeChannel,
   selfId,
+  hasVoice,
   onJoin,
 }: {
+  session: SessionId;
   channels: Channel[];
   users: User[];
   activeChannel: number | null;
   selfId: number;
+  /// Whether this connection is the one carrying voice.
+  hasVoice: boolean;
   onJoin: (id: number) => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
@@ -341,12 +498,23 @@ function ChannelList({
   // The interval matches the level meter's. This drives the user's own
   // indicator as well as everyone else's, and a slower tick made keying push to
   // talk feel like it had not registered.
+  //
+  // Only for the connection holding voice. Speaker ids are assigned per server,
+  // so applying another server's list here would light up whoever happens to
+  // share a number with someone talking elsewhere.
   useEffect(() => {
+    if (!hasVoice) {
+      setSpeaking([]);
+      return;
+    }
     const timer = setInterval(() => {
-      api.speaking().then(setSpeaking).catch(() => {});
+      api
+        .speaking()
+        .then((audible) => setSpeaking(audible.session === session ? audible.clients : []))
+        .catch(() => {});
     }, 100);
     return () => clearInterval(timer);
-  }, []);
+  }, [hasVoice, session]);
 
   const sorted = useMemo(
     () => [...channels].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)),
@@ -475,9 +643,15 @@ function ChatPane({
 }
 
 function VoiceControls({
+  hasVoice,
+  serverName,
+  onTakeVoice,
   onError,
   onDisconnect,
 }: {
+  hasVoice: boolean;
+  serverName: string;
+  onTakeVoice: () => void;
   onError: (error: string) => void;
   onDisconnect: () => void;
 }) {
@@ -505,15 +679,29 @@ function VoiceControls({
 
   return (
     <aside className="voice">
-      {/* No status text here: the channel list carries it against your own
-          name, alongside everyone else's. */}
-      <LevelMeter showStatus={false} />
-      <button className={muted ? "toggled" : undefined} onClick={toggleMute}>
-        {muted ? "Unmute" : "Mute"}
-      </button>
-      <button className={deafened ? "toggled" : undefined} onClick={toggleDeafen}>
-        {deafened ? "Undeafen" : "Deafen"}
-      </button>
+      {hasVoice ? (
+        <>
+          {/* No status text here: the channel list carries it against your own
+              name, alongside everyone else's. */}
+          <LevelMeter showStatus={false} />
+          <button className={muted ? "toggled" : undefined} onClick={toggleMute}>
+            {muted ? "Unmute" : "Mute"}
+          </button>
+          <button className={deafened ? "toggled" : undefined} onClick={toggleDeafen}>
+            {deafened ? "Undeafen" : "Deafen"}
+          </button>
+        </>
+      ) : (
+        <>
+          {/* Voice is elsewhere. Saying so, and offering the move explicitly, is
+              why switching tabs does not silently drag the microphone along. */}
+          <p className="muted">
+            Voice is on another server. Your microphone is not going to{" "}
+            {serverName}.
+          </p>
+          <button onClick={onTakeVoice}>Talk here instead</button>
+        </>
+      )}
       <button className="danger" onClick={onDisconnect}>
         Disconnect
       </button>
