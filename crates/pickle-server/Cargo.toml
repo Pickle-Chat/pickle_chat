@@ -1,0 +1,41 @@
+[package]
+name = "pickle-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Self-hosted Pickle server: QUIC transport, cryptographic identity auth, and voice relay."
+
+[lib]
+name = "pickle_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pickle-server"
+path = "src/main.rs"
+
+[dependencies]
+pickle-identity.workspace = true
+pickle-proto.workspace = true
+
+tokio.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+
+serde.workspace = true
+toml.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+rand.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+directories.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

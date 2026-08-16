@@ -1,0 +1,20 @@
+[package]
+name = "pickle-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Self-sovereign cryptographic identity for Pickle: Ed25519 keys, proof-of-work security levels, and an on-disk keystore."
+
+[dependencies]
+ed25519-dalek.workspace = true
+rand.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+data-encoding.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

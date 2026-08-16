@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/Pickle-Chat/pickle_chat"
+
+[workspace.dependencies]
+pickle-identity = { path = "crates/pickle-identity" }
+pickle-proto = { path = "crates/pickle-proto" }
+pickle-audio = { path = "crates/pickle-audio" }
+pickle-client = { path = "crates/pickle-client" }
+
+# --- async runtime / transport ---------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+
+# QUIC. `ring` rather than the default aws-lc-rs backend: aws-lc-rs wants cmake
+# and nasm at build time, and we want `cargo build` to work on a bare machine.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+
+# --- crypto ----------------------------------------------------------------
+# Pinned to 2.x deliberately: 3.0 pulls rand_core 0.10 + sha2 0.11, which would
+# put two generations of both in the tree alongside rustls/rcgen.
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+rand = "0.8"
+sha2 = "0.10"
+zeroize = "1"
+
+# --- serialization ---------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc", "use-std"] }
+toml = "0.8"
+data-encoding = "2"
+
+# --- audio -----------------------------------------------------------------
+cpal = "0.18"
+# Pure-Rust Opus: no native libopus to link, so a clean `cargo build` works on
+# any machine without a system package or cmake.
+opus = { package = "rusty-opus", version = "0.9" }
+
+# --- misc ------------------------------------------------------------------
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+bytes = "1"
+directories = "5"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Audio and crypto are painfully slow in an unoptimised debug build; the voice
+# path drops frames without this.
+[profile.dev.package.rusty-opus]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
