@@ -13,6 +13,7 @@ mod bookmarks;
 mod bridge;
 mod commands;
 mod dto;
+mod mouse_grab;
 mod settings;
 mod shortcuts;
 mod state;

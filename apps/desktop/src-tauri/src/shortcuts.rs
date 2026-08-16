@@ -24,6 +24,7 @@
 //! button globally on Linux would mean reading the evdev device directly, which
 //! needs the user in the `input` group and is not attempted.
 
+use crate::mouse_grab::{self, MouseGrab};
 use crate::state::{AppState, VoiceState};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -67,6 +68,8 @@ pub struct BindingStatus {
 #[derive(Default)]
 pub struct Registry {
     bound: Mutex<Vec<(Shortcut, Action)>>,
+    /// Mouse readers, kept alive here. Replacing this stops the old ones.
+    mouse: Mutex<Option<MouseGrab>>,
 }
 
 impl Registry {
@@ -108,6 +111,7 @@ pub fn apply(app: &AppHandle) -> Vec<BindingStatus> {
     ];
 
     let mut statuses = Vec::new();
+    let mut mouse_bindings: Vec<(String, Action)> = Vec::new();
 
     for (action, accelerator) in wanted {
         let Some(accelerator) = accelerator.filter(|a| !a.trim().is_empty()) else {
@@ -116,17 +120,10 @@ pub fn apply(app: &AppHandle) -> Vec<BindingStatus> {
 
         // Mouse bindings never reach the shortcut layer: it is keyboard-only,
         // and handing it "Mouse4" would produce an "unsupported key" complaint
-        // that reads like a fault rather than a limit. The frontend implements
-        // these itself, focus-scoped.
+        // that reads like a fault rather than a limit. They are collected and
+        // handed to the input-device reader below instead.
         if is_mouse(&accelerator) {
-            statuses.push(BindingStatus {
-                action: action.label().into(),
-                accelerator: accelerator.clone(),
-                registered: false,
-                error: Some(
-                    "Mouse buttons cannot be reserved system-wide; this works while Pickle is focused.".into(),
-                ),
-            });
+            mouse_bindings.push((accelerator, action));
             continue;
         }
 
@@ -164,6 +161,25 @@ pub fn apply(app: &AppHandle) -> Vec<BindingStatus> {
         statuses.push(status);
     }
 
+    // Replacing the previous grab stops its readers, which is what keeps a
+    // rebind from leaving two threads watching one device — they could
+    // otherwise split a press and its release and latch the microphone open.
+    let (grab, outcome) = if mouse_bindings.is_empty() {
+        (None, mouse_grab::GrabOutcome::NoDevice)
+    } else {
+        mouse_grab::start(app.clone(), &mouse_bindings)
+    };
+    *registry.mouse.lock() = grab;
+
+    for (accelerator, action) in mouse_bindings {
+        statuses.push(BindingStatus {
+            action: action.label().into(),
+            accelerator,
+            registered: outcome.is_active(),
+            error: outcome.explain(),
+        });
+    }
+
     statuses
 }
 
@@ -172,21 +188,25 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, event_state: ShortcutState) 
     let Some(action) = app.state::<Registry>().action_for(shortcut) else {
         return;
     };
+    dispatch(app, action, matches!(event_state, ShortcutState::Pressed));
+}
+
+/// Apply an action, however it was triggered.
+///
+/// Shared with the mouse reader in [`crate::mouse_grab`], so a thumb button and
+/// a key bound to the same action cannot drift into behaving differently.
+pub fn dispatch(app: &AppHandle, action: Action, pressed: bool) {
     let state = app.state::<AppState>();
 
-    let outcome = match (action, event_state) {
-        (Action::PushToTalk, ShortcutState::Pressed) => {
-            state.set_push_to_talk_held(true);
-            return;
-        }
-        (Action::PushToTalk, ShortcutState::Released) => {
-            state.set_push_to_talk_held(false);
+    let outcome = match action {
+        Action::PushToTalk => {
+            state.set_push_to_talk_held(pressed);
             return;
         }
         // Toggles fire on press only; acting on release too would undo them.
-        (Action::ToggleMute, ShortcutState::Pressed) => state.toggle_muted(),
-        (Action::ToggleDeafen, ShortcutState::Pressed) => state.toggle_deafened(),
-        _ => return,
+        _ if !pressed => return,
+        Action::ToggleMute => state.toggle_muted(),
+        Action::ToggleDeafen => state.toggle_deafened(),
     };
 
     match outcome {

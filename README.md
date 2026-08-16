@@ -119,11 +119,24 @@ Known issues:
   also resolve it.
 - The encoder overshoots its bitrate target by roughly a third.
 - Audio devices must support 48 kHz natively; there is no resampling.
-- **Global keys are not guaranteed.** The grab goes through X11, so a key your
-  layout cannot produce is refused, and a Wayland session may not deliver the
-  key while another window has focus. The settings tab marks any binding the
-  system refused, and push to talk falls back to working while Pickle is
-  focused, so it is never silently dead.
+- **Global keys are not guaranteed.** The keyboard grab goes through X11, so a
+  key your layout cannot produce is refused, and a Wayland session may not
+  deliver the key while another window has focus. The settings tab marks any
+  binding the system refused, and push to talk falls back to working while
+  Pickle is focused, so it is never silently dead.
+- **Global mouse buttons need the `input` group.** The keyboard grab cannot see
+  mouse buttons at all, so a bound button is read from the mouse's input device
+  instead — which works under Wayland and X11 alike, but only if your user can
+  open it:
+
+  ```bash
+  sudo usermod -aG input $USER
+  ```
+
+  Log out and back in afterwards. Without it the button still works while
+  Pickle is focused. Pickle opens mouse devices only, never keyboards, watches
+  only the button you bound, and does not take that button away from anything
+  else using it.
 - The keystore is unencrypted. Treat it like an SSH private key — and back it
   up, because losing it means losing every permission every server granted you.
 

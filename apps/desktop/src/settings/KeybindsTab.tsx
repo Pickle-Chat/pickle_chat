@@ -95,7 +95,7 @@ export function KeybindsTab({
     };
   }, [capturing, keybinds]);
 
-  const anyRefused = statuses.some((status) => !status.registered);
+  const refused = statuses.filter((status) => !status.registered);
   const anyMouse = BINDINGS.some((binding) => {
     const accelerator = keybinds[binding.action];
     return accelerator !== null && isMouseAccelerator(accelerator);
@@ -132,21 +132,19 @@ export function KeybindsTab({
                   clear
                 </button>
               )}
-              {accelerator && isMouseAccelerator(accelerator) ? (
-                <span
-                  className="muted"
-                  title="Mouse buttons cannot be reserved system-wide on any platform this app supports."
-                >
-                  ⚠ only while Pickle is focused
-                </span>
-              ) : (
-                status &&
-                !status.registered && (
+              {status &&
+                (status.registered ? (
+                  accelerator &&
+                  isMouseAccelerator(accelerator) && (
+                    <span className="muted" title="Read from the mouse device directly.">
+                      global
+                    </span>
+                  )
+                ) : (
                   <span className="muted" title={status.error ?? undefined}>
-                    ⚠ not global
+                    ⚠ only while focused
                   </span>
-                )
-              )}
+                ))}
             </div>
             {binding.help && <p className="muted">{binding.help}</p>}
           </div>
@@ -159,25 +157,30 @@ export function KeybindsTab({
         </p>
       )}
 
-      {anyMouse && (
-        <p className="muted">
-          Mouse buttons work while Pickle is focused, but cannot be reserved
-          system-wide: the shortcut layer this app uses handles keyboard keys
-          only. If you need push to talk to reach you while a game is in front,
-          bind a key as well — or ask about raw input device support, which can
-          read the mouse globally on Linux but needs your user added to the{" "}
-          <code>input</code> group.
-        </p>
+      {refused.length > 0 && (
+        <div className="settings-field">
+          <p className="muted">
+            A binding marked <strong>only while focused</strong> could not be
+            claimed system-wide, so it does nothing while another window is in
+            front. What went wrong differs per binding:
+          </p>
+          <ul className="muted">
+            {refused.map((status) => (
+              <li key={status.action}>
+                <code>{describeAccelerator(status.accelerator)}</code> —{" "}
+                {status.error ?? "the system gave no reason."}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
 
-      {anyRefused && !anyMouse && (
+      {anyMouse && (
         <p className="muted">
-          Keys marked <strong>not global</strong> could not be reserved
-          system-wide, so they only work while the Pickle window is focused.
-          Usually this means the key is not one your keyboard layout can produce
-          — F13 through F24 are common culprits — or that your desktop has
-          already claimed the combination. Hover the warning for what the system
-          reported, and try an ordinary combination such as Control+Shift+M.
+          Mouse buttons are read from the input device directly, which is the
+          only way to see them while a game has focus. Pickle opens mouse
+          devices only, watches only the button you bound, and does not take the
+          button away from anything else using it.
         </p>
       )}
     </div>

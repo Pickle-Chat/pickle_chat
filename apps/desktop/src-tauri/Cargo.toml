@@ -33,5 +33,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 
+# Reading the mouse's input device directly is the only way to see a thumb
+# button while another application has focus; the shortcut layer is
+# keyboard-only. Linux-only, so other platforms do not carry the dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+
 [dev-dependencies]
 tempfile = "3"
