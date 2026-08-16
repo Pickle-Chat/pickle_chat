@@ -25,7 +25,7 @@ address; anyone outside your network will need UDP forwarded to that port.
 Run the desktop client:
 
 ```bash
-cd apps/desktop && npm install && npm run tauri dev
+cd apps/desktop && bun install && bun run dev:tauri
 ```
 
 ## How it works
