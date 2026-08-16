@@ -82,7 +82,7 @@ pub fn run() {
             commands::set_push_to_talk_held,
             commands::voice_state,
             commands::keybind_status,
-            commands::input_level,
+            commands::input_activity,
             commands::speaking,
             commands::known_servers,
             commands::forget_server,

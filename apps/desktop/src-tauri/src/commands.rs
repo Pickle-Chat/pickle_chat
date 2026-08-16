@@ -373,17 +373,34 @@ pub fn set_push_to_talk_held(state: State<'_, AppState>, held: bool) {
     state.set_push_to_talk_held(held);
 }
 
-/// Microphone level in dBFS, polled by the UI for its meter.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputActivity {
+    /// Microphone level in dBFS.
+    pub level_dbfs: f32,
+    /// Whether audio is actually going out.
+    pub transmitting: bool,
+}
+
+/// What the microphone is doing, polled by the UI for its meter and transmit
+/// indicator.
 ///
-/// Reads the engine rather than the session, so the settings dialog can show a
-/// live meter while disconnected.
+/// The two travel together because they are polled at the same rate and asking
+/// separately would double the bridge traffic for one widget. Reads the engine
+/// rather than the session, so the settings dialog has a live meter while
+/// disconnected.
 #[tauri::command]
-pub fn input_level(state: State<'_, AppState>) -> f32 {
-    state
-        .engine
-        .current()
-        .map(|engine| engine.input_level_dbfs())
-        .unwrap_or(f32::NEG_INFINITY)
+pub fn input_activity(state: State<'_, AppState>) -> InputActivity {
+    match state.engine.current() {
+        Some(engine) => InputActivity {
+            level_dbfs: engine.input_level_dbfs(),
+            transmitting: engine.is_transmitting(),
+        },
+        None => InputActivity {
+            level_dbfs: f32::NEG_INFINITY,
+            transmitting: false,
+        },
+    }
 }
 
 /// Who is currently audible, for the speaking indicator.

@@ -149,6 +149,13 @@ export interface VoiceState {
   deafened: boolean;
 }
 
+export interface InputActivity {
+  levelDbfs: number;
+  /// Whether audio is actually going out, which the level alone cannot say: a
+  /// loud room with the gate shut moves the meter and sends nothing.
+  transmitting: boolean;
+}
+
 // The index signature is what `invoke` requires of its argument object; the
 // named fields are what actually keeps call sites honest.
 //
@@ -198,7 +205,7 @@ export const api = {
   setPushToTalkHeld: (held: boolean) => invoke<void>("set_push_to_talk_held", { held }),
   voiceState: () => invoke<VoiceState>("voice_state"),
 
-  inputLevel: () => invoke<number>("input_level"),
+  inputActivity: () => invoke<InputActivity>("input_activity"),
   speaking: () => invoke<number[]>("speaking"),
 
   knownServers: () =>

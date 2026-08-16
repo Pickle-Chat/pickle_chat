@@ -79,6 +79,13 @@ struct CaptureControls {
     gate_mode: AtomicU8,
     /// Last measured input level, as `f32` bits, for a UI meter.
     level_dbfs: AtomicU32,
+    /// Whether the most recent frame was actually put on the wire.
+    ///
+    /// Distinct from the input level: a loud room with the gate shut, or a
+    /// muted microphone, both move the meter without sending anything. This is
+    /// what lets the UI say whether the user is being heard rather than merely
+    /// whether the microphone hears them.
+    transmitting: AtomicBool,
 }
 
 impl CaptureControls {
@@ -125,6 +132,7 @@ impl AudioEngine {
             push_to_talk_held: AtomicBool::new(false),
             gate_mode: AtomicU8::new(0),
             level_dbfs: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            transmitting: AtomicBool::new(false),
         });
         controls.set_gate_mode(config.gate_mode);
 
@@ -226,6 +234,14 @@ impl AudioEngine {
     /// Current microphone level in dBFS, for a level meter.
     pub fn input_level_dbfs(&self) -> f32 {
         f32::from_bits(self.controls.level_dbfs.load(Ordering::Relaxed))
+    }
+
+    /// Whether the most recent frame went on the wire.
+    ///
+    /// Answers "am I being heard", which the level meter cannot: the meter
+    /// moves for a loud room with the gate shut, and for a muted microphone.
+    pub fn is_transmitting(&self) -> bool {
+        self.controls.transmitting.load(Ordering::Relaxed)
     }
 
     pub fn set_speaker_gain(&self, client: ClientId, gain: f32) {
@@ -361,6 +377,12 @@ impl Capture {
         self.controls
             .level_dbfs
             .store(self.gate.level_dbfs().to_bits(), Ordering::Relaxed);
+        // Published before the early return, so the flag drops on the first
+        // silent frame rather than sticking at whatever the last sent frame
+        // left it as.
+        self.controls
+            .transmitting
+            .store(activity.should_transmit(), Ordering::Relaxed);
 
         if !activity.should_transmit() {
             self.transmitting = false;
@@ -531,6 +553,7 @@ mod tests {
             push_to_talk_held: AtomicBool::new(false),
             gate_mode: AtomicU8::new(0),
             level_dbfs: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            transmitting: AtomicBool::new(false),
         });
         controls.set_gate_mode(mode);
 
@@ -645,6 +668,51 @@ mod tests {
 
         let level = f32::from_bits(controls.level_dbfs.load(Ordering::Relaxed));
         assert!(level > -20.0 && level < 0.0, "got {level} dBFS");
+    }
+
+    #[test]
+    fn the_transmit_flag_follows_the_gate_not_the_level() {
+        // The distinction the indicator exists to draw: a loud room with the
+        // gate shut is not the same as being heard.
+        let (mut capture, _frames, controls) = test_capture(GateMode::PushToTalk);
+
+        capture.push(loud(SAMPLES_PER_FRAME).into_iter());
+        assert!(
+            !controls.transmitting.load(Ordering::Relaxed),
+            "loud but not keyed",
+        );
+
+        controls.push_to_talk_held.store(true, Ordering::Relaxed);
+        capture.push(loud(SAMPLES_PER_FRAME).into_iter());
+        assert!(controls.transmitting.load(Ordering::Relaxed), "keyed");
+
+        // Releasing does not stop transmission immediately: the gate holds open
+        // through its hangover so word endings are not clipped, and the
+        // indicator should stay lit for exactly as long as audio is still going
+        // out. So this pushes past the hangover before expecting it to drop.
+        controls.push_to_talk_held.store(false, Ordering::Relaxed);
+        let hangover_frames = crate::vad::DEFAULT_HANGOVER_MS.div_ceil(crate::FRAME_MS) as usize;
+        capture.push(loud(SAMPLES_PER_FRAME * (hangover_frames + 2)).into_iter());
+        assert!(
+            !controls.transmitting.load(Ordering::Relaxed),
+            "once the hangover expires it must drop rather than latch on",
+        );
+    }
+
+    #[test]
+    fn muting_clears_the_transmit_flag() {
+        let (mut capture, _frames, controls) = test_capture(GateMode::Continuous);
+        capture.push(loud(SAMPLES_PER_FRAME).into_iter());
+        assert!(controls.transmitting.load(Ordering::Relaxed));
+
+        controls.muted.store(true, Ordering::Relaxed);
+        // Two frames: the first closes the burst and still goes out, the second
+        // is silent. The indicator must be off by the end.
+        capture.push(loud(SAMPLES_PER_FRAME * 2).into_iter());
+        assert!(
+            !controls.transmitting.load(Ordering::Relaxed),
+            "a muted microphone must never read as transmitting",
+        );
     }
 
     #[test]

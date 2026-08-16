@@ -85,11 +85,11 @@ export function AudioTab({
 
       <div className="settings-field">
         <span className="settings-label">Input level</span>
-        <LevelMeter />
+        <LevelMeter connected={connected} />
         <p className="muted">
           {connected
-            ? "Speak to check your microphone is being heard."
-            : "Speak to check your microphone. Nothing is transmitted while disconnected."}
+            ? "The indicator lights while your voice is actually going out."
+            : "The indicator shows when the gate opens. Nothing leaves this machine while disconnected."}
         </p>
       </div>
 

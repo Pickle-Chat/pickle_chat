@@ -534,3 +534,50 @@ code.fingerprint {
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* --- transmit indicator --------------------------------------------------- */
+
+.level-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meter-fill.transmitting {
+  background: var(--accent);
+}
+
+.transmit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.transmit-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--line);
+  flex: none;
+}
+
+.transmit.live {
+  color: var(--accent);
+}
+
+.transmit.live .transmit-dot {
+  background: var(--accent);
+  /* A steady dot reads as a status light rather than an alert; the colour
+     change is the signal, so no animation is needed to notice it. */
+  box-shadow: 0 0 6px var(--accent);
+}
+
+/* Open but going nowhere — worth distinguishing from actually being heard. */
+.transmit.open .transmit-dot {
+  background: transparent;
+  border: 2px solid var(--accent);
+  width: 10px;
+  height: 10px;
+}
