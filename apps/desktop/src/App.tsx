@@ -337,10 +337,14 @@ function ChannelList({
 
   // Polled rather than pushed: speaking state changes every frame, and an
   // event per change would flood the bridge for something purely cosmetic.
+  //
+  // The interval matches the level meter's. This drives the user's own
+  // indicator as well as everyone else's, and a slower tick made keying push to
+  // talk feel like it had not registered.
   useEffect(() => {
     const timer = setInterval(() => {
       api.speaking().then(setSpeaking).catch(() => {});
-    }, 150);
+    }, 100);
     return () => clearInterval(timer);
   }, []);
 
@@ -364,16 +368,40 @@ function ChannelList({
           <ul className="occupants">
             {users
               .filter((user) => user.channel === channel.id)
-              .map((user) => (
-                <li
-                  key={user.clientId}
-                  className={speaking.includes(user.clientId) ? "speaking" : undefined}
-                >
-                  {user.nickname}
-                  {user.clientId === selfId && <span className="muted"> (you)</span>}
-                  {user.selfDeafened ? " 🔇" : user.selfMuted ? " 🎙️̸" : ""}
-                </li>
-              ))}
+              .map((user) => {
+                // `speaking` includes us when we are transmitting, so this one
+                // check covers everyone the channel can currently hear.
+                const talking = speaking.includes(user.clientId);
+                const silenced = user.selfDeafened || user.selfMuted;
+
+                return (
+                  <li key={user.clientId} className={talking ? "speaking" : undefined}>
+                    {/* Always rendered, so names do not shift sideways as
+                        people start and stop talking. */}
+                    <span
+                      className={talking ? "talk-dot on" : "talk-dot"}
+                      aria-hidden="true"
+                    />
+                    <span className="occupant-name">{user.nickname}</span>
+                    {user.clientId === selfId && <span className="muted">(you)</span>}
+                    {silenced && (
+                      <span
+                        title={user.selfDeafened ? "Deafened" : "Muted"}
+                        aria-label={user.selfDeafened ? "Deafened" : "Muted"}
+                      >
+                        {user.selfDeafened ? "🔇" : "🎙️̸"}
+                      </span>
+                    )}
+                    {/* Announced only for the person themselves; narrating every
+                        speaker in a busy channel would be unusable. */}
+                    {user.clientId === selfId && (
+                      <span className="visually-hidden" role="status" aria-live="polite">
+                        {talking ? "Transmitting" : "Not transmitting"}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
           </ul>
         </div>
       ))}
@@ -477,7 +505,9 @@ function VoiceControls({
 
   return (
     <aside className="voice">
-      <LevelMeter />
+      {/* No status text here: the channel list carries it against your own
+          name, alongside everyone else's. */}
+      <LevelMeter showStatus={false} />
       <button className={muted ? "toggled" : undefined} onClick={toggleMute}>
         {muted ? "Unmute" : "Mute"}
       </button>

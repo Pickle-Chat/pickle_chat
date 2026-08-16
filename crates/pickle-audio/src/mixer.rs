@@ -87,9 +87,16 @@ impl VoiceMixer {
     pub fn render(&mut self, out: &mut [f32]) -> usize {
         out.iter_mut().for_each(|s| *s = 0.0);
 
-        if out.len() != SAMPLES_PER_FRAME || self.deafened {
+        if out.len() != SAMPLES_PER_FRAME {
             return 0;
         }
+
+        // Deafening silences the output but does not skip the work below.
+        // Returning here would freeze every `speaking` flag at whatever it held
+        // at the moment of deafening — leaving someone lit up permanently, or
+        // the whole channel looking silent — and would stop draining the jitter
+        // buffers this claims to keep flowing.
+        let deafened = self.deafened;
 
         let mut contributors = 0;
         let mut finished: Vec<ClientId> = Vec::new();
@@ -116,7 +123,7 @@ impl VoiceMixer {
             stream.speaking = true;
             stream.idle_frames = 0;
 
-            if stream.muted {
+            if stream.muted || deafened {
                 continue;
             }
 
@@ -344,6 +351,22 @@ mod tests {
             1,
             "the stream should survive so undeafening resumes instantly"
         );
+    }
+
+    #[test]
+    fn deafening_still_tracks_who_is_speaking() {
+        // The channel list shows who is talking whether or not you can hear
+        // them. Skipping the render loop while deafened would freeze every
+        // indicator at the instant of deafening.
+        let mut mixer = VoiceMixer::new();
+        prime(&mut mixer, 7);
+        mixer.set_deafened(true);
+
+        let mut out = vec![0.0f32; SAMPLES_PER_FRAME];
+        mixer.render(&mut out);
+
+        assert_eq!(mixer.speaking(), vec![7], "still audible to everyone else");
+        assert!(out.iter().all(|&s| s == 0.0), "but not to us");
     }
 
     #[test]

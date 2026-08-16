@@ -22,9 +22,16 @@ export function LevelMeter({
   /// opens, but nothing leaves the machine, so the indicator must not claim it
   /// does.
   connected = true,
+  /// Whether to spell the state out in words.
+  ///
+  /// Off where the channel list is already showing the same thing against the
+  /// user's own name, which is the more useful place for it — there it sits
+  /// among everyone else's, so who is talking reads at a glance.
+  showStatus = true,
 }: {
   label?: string;
   connected?: boolean;
+  showStatus?: boolean;
 }) {
   const [level, setLevel] = useState(Number.NEGATIVE_INFINITY);
   const [transmitting, setTransmitting] = useState(false);
@@ -64,12 +71,14 @@ export function LevelMeter({
       >
         <div className={transmitting ? "meter-fill transmitting" : "meter-fill"} style={{ width: `${filled}%` }} />
       </div>
-      {/* Announced politely so a screen reader says when transmission starts
-          and stops without interrupting whatever else is being read. */}
-      <span className={`transmit ${status.className}`} role="status" aria-live="polite">
-        <span className="transmit-dot" aria-hidden="true" />
-        {status.text}
-      </span>
+      {showStatus && (
+        /* Announced politely so a screen reader says when transmission starts
+           and stops without interrupting whatever else is being read. */
+        <span className={`transmit ${status.className}`} role="status" aria-live="polite">
+          <span className="transmit-dot" aria-hidden="true" />
+          {status.text}
+        </span>
+      )}
     </div>
   );
 }

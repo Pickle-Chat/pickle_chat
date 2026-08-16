@@ -403,14 +403,28 @@ pub fn input_activity(state: State<'_, AppState>) -> InputActivity {
     }
 }
 
-/// Who is currently audible, for the speaking indicator.
+/// Who is currently audible, for the speaking indicator — ourselves included.
+///
+/// The mixer only knows about voices arriving from the network, and the server
+/// relays ours to everyone else rather than back to us, so we would never
+/// appear in our own channel list. Folding our transmit state in here rather
+/// than special-casing it in the UI keeps this meaning one thing: everyone the
+/// channel can currently hear.
 #[tauri::command]
 pub fn speaking(state: State<'_, AppState>) -> Vec<u32> {
-    state
-        .engine
-        .current()
-        .map(|engine| engine.speaking())
-        .unwrap_or_default()
+    let Some(engine) = state.engine.current() else {
+        return Vec::new();
+    };
+
+    let mut speaking = engine.speaking();
+
+    if engine.is_transmitting() {
+        if let Some(session) = state.session.lock().as_ref() {
+            speaking.push(session.client.session().client_id);
+        }
+    }
+
+    speaking
 }
 
 #[derive(Serialize)]

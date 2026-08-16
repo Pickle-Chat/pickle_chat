@@ -191,9 +191,49 @@ code.fingerprint {
 }
 
 /* The speaking indicator — the single most useful signal in a voice app. */
+.occupants li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0;
+}
+
 .occupants li.speaking {
   color: var(--accent);
   font-weight: 600;
+}
+
+.occupant-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Always present, so a name does not shift sideways when someone starts
+   talking. Only its fill changes. */
+.talk-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--line);
+}
+
+.talk-dot.on {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+
+/* Available to a screen reader, absent from the visual layout. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .chat {
