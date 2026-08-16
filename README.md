@@ -72,7 +72,7 @@ granted you.
 
 | Crate | What it does |
 | --- | --- |
-| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, on-disk keystore |
+| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, single-key keystore and multi-identity vault |
 | [`pickle-proto`](crates/pickle-proto) | Wire protocol: control messages, framing, voice datagram encoding |
 | [`pickle-audio`](crates/pickle-audio) | Opus encode/decode, jitter buffering, voice gating, mixing |
 | [`pickle-server`](crates/pickle-server) | The server: QUIC, authentication, channels, voice relay |
@@ -90,10 +90,13 @@ Working:
 
 - Server hosting, configuration, channels (including nesting), server passwords
 - Identity generation, mining, keystore, fingerprints
+- Several identities per user, switchable, with the active one signing the login
 - Authentication with proof-of-work enforcement and certificate binding
 - Trust-on-first-use server pinning
 - Voice: capture, gating, Opus, relay, jitter buffering, mixing, mute/deafen
 - Text messages delivered live to a channel
+- Settings: identities, saved servers, audio devices, and keybinds, all persisted
+- Push to talk, bound to a key and grabbed globally where the platform allows
 - Desktop client covering all of the above
 
 Not yet built:
@@ -116,6 +119,11 @@ Known issues:
   also resolve it.
 - The encoder overshoots its bitrate target by roughly a third.
 - Audio devices must support 48 kHz natively; there is no resampling.
+- **Global keys are not guaranteed.** The grab goes through X11, so a key your
+  layout cannot produce is refused, and a Wayland session may not deliver the
+  key while another window has focus. The settings tab marks any binding the
+  system refused, and push to talk falls back to working while Pickle is
+  focused, so it is never silently dead.
 - The keystore is unencrypted. Treat it like an SSH private key — and back it
   up, because losing it means losing every permission every server granted you.
 

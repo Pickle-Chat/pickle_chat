@@ -7,7 +7,7 @@
 
 use pickle_audio::DeviceInfo;
 use pickle_client::{ClientEvent, SessionInfo};
-use pickle_identity::Identity;
+use pickle_identity::{Identity, VaultEntry};
 use pickle_proto::{Channel, ChatMessage, UserInfo};
 use serde::Serialize;
 
@@ -31,6 +31,38 @@ impl IdentityDto {
             nickname: nickname.to_string(),
         }
     }
+}
+
+/// One entry in the identity picker.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultEntryDto {
+    pub fingerprint: String,
+    pub short: String,
+    pub security_level: u32,
+    pub nickname: String,
+    /// Private note, never sent to a server.
+    pub label: String,
+}
+
+impl VaultEntryDto {
+    pub fn new(entry: &VaultEntry) -> Self {
+        Self {
+            fingerprint: entry.identity.fingerprint().to_string(),
+            short: entry.identity.fingerprint().short(),
+            security_level: entry.identity.security_level(),
+            nickname: entry.nickname.clone(),
+            label: entry.label.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityListDto {
+    /// Fingerprint of the active identity.
+    pub active: String,
+    pub identities: Vec<VaultEntryDto>,
 }
 
 #[derive(Serialize)]

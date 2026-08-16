@@ -1,13 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
+  type Bookmark,
   type Channel,
   type Identity,
   type Message,
   type ServerEvent,
   type Session,
+  type Settings,
   type User,
 } from "./api";
+import { LevelMeter } from "./LevelMeter";
+import { SettingsDialog } from "./settings/SettingsDialog";
+import { usePushToTalk } from "./usePushToTalk";
 
 export function App() {
   const [identity, setIdentity] = useState<Identity | null>(null);
@@ -16,10 +21,20 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeChannel, setActiveChannel] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<Settings | null>(null);
 
   useEffect(() => {
     api.identityInfo().then(setIdentity).catch((e) => setError(String(e)));
+    api.settings().then(setSettings).catch((e) => setError(String(e)));
   }, []);
+
+  // The focus-scoped half of push-to-talk. The global grab lives in Rust; this
+  // covers the platforms that refuse it, and costs nothing where it succeeds.
+  usePushToTalk(
+    settings?.keybinds.pushToTalk ?? null,
+    settings?.audio.gateMode === "pushToTalk",
+  );
 
   // Server events drive the whole UI. Voice never arrives here — it is mixed
   // on the Rust side and goes straight to the speakers.
@@ -94,7 +109,21 @@ export function App() {
           <span className="muted">Not connected</span>
         )}
         {identity && <IdentityBadge identity={identity} onChange={setIdentity} />}
+        <button className="icon" onClick={() => setSettingsOpen(true)} aria-label="Settings">
+          ⚙
+        </button>
       </header>
+
+      {settingsOpen && (
+        <SettingsDialog
+          connected={session !== null}
+          onSettingsChange={setSettings}
+          onIdentityChanged={() => {
+            api.identityInfo().then(setIdentity).catch((e) => setError(String(e)));
+          }}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
 
       {error && (
         <div className="banner error" role="alert">
@@ -205,19 +234,20 @@ function ConnectForm({
 }) {
   const [address, setAddress] = useState("127.0.0.1:42071");
   const [password, setPassword] = useState("");
-  const [pushToTalk, setPushToTalk] = useState(false);
   const [busy, setBusy] = useState(false);
   const [known, setKnown] = useState<{ address: string; name: string; fingerprint: string }[]>([]);
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
 
   useEffect(() => {
     api.knownServers().then(setKnown).catch(() => setKnown([]));
+    api.bookmarks().then(setBookmarks).catch(() => setBookmarks([]));
   }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     try {
-      onConnected(await api.connect({ address, password, pushToTalk }));
+      onConnected(await api.connect({ address, password }));
     } catch (err) {
       onError(String(err));
     } finally {
@@ -241,18 +271,34 @@ function ConnectForm({
           Password <span className="muted">(only if the server has one)</span>
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
         </label>
-        <label className="row">
-          <input
-            type="checkbox"
-            checked={pushToTalk}
-            onChange={(e) => setPushToTalk(e.target.checked)}
-          />
-          Push to talk
-        </label>
         <button type="submit" disabled={busy}>
           {busy ? "Connecting…" : "Connect"}
         </button>
       </form>
+
+      {bookmarks.length > 0 && (
+        <section className="known">
+          <h2>Saved servers</h2>
+          <ul>
+            {bookmarks.map((bookmark) => (
+              <li key={bookmark.id}>
+                <button
+                  className="linklike"
+                  onClick={() => {
+                    setAddress(bookmark.address);
+                    // A saved password is the reason to save one at all; leave
+                    // any typed password alone when the bookmark has none.
+                    if (bookmark.password !== undefined) setPassword(bookmark.password);
+                  }}
+                >
+                  {bookmark.label}
+                </button>
+                <span className="muted">{bookmark.address}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {known.length > 0 && (
         <section className="known">
@@ -407,39 +453,31 @@ function VoiceControls({
   onError: (error: string) => void;
   onDisconnect: () => void;
 }) {
-  const [muted, setMuted] = useState(false);
-  const [deafened, setDeafened] = useState(false);
-  const [level, setLevel] = useState(Number.NEGATIVE_INFINITY);
+  const [{ muted, deafened }, setVoice] = useState({ muted: false, deafened: false });
 
+  // The Rust side is the authority: it is what a global shortcut talks to, and
+  // it applies the rule that deafening implies muting. Following its answer
+  // rather than predicting one keeps the buttons right however the change was
+  // made.
   useEffect(() => {
-    const timer = setInterval(() => {
-      api.inputLevel().then(setLevel).catch(() => {});
-    }, 100);
-    return () => clearInterval(timer);
+    api.voiceState().then(setVoice).catch(() => {});
+    const unlisten = api.onVoiceState(setVoice);
+    return () => {
+      unlisten.then((fn) => fn());
+    };
   }, []);
 
   const toggleMute = () => {
-    const next = !muted;
-    setMuted(next);
-    api.setMuted(next).catch((e) => onError(String(e)));
+    api.setMuted(!muted).then(setVoice).catch((e) => onError(String(e)));
   };
 
   const toggleDeafen = () => {
-    const next = !deafened;
-    setDeafened(next);
-    // Deafening implies muting, which is what the server enforces too.
-    if (next) setMuted(true);
-    api.setDeafened(next).catch((e) => onError(String(e)));
+    api.setDeafened(!deafened).then(setVoice).catch((e) => onError(String(e)));
   };
-
-  // Map dBFS onto a 0-100 bar. -60 dB is effectively silence.
-  const meter = Number.isFinite(level) ? Math.max(0, Math.min(100, ((level + 60) / 60) * 100)) : 0;
 
   return (
     <aside className="voice">
-      <div className="meter" aria-label="Microphone level">
-        <div className="meter-fill" style={{ width: `${meter}%` }} />
-      </div>
+      <LevelMeter />
       <button className={muted ? "toggled" : undefined} onClick={toggleMute}>
         {muted ? "Unmute" : "Mute"}
       </button>

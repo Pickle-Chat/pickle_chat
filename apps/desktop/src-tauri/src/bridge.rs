@@ -15,7 +15,7 @@
 //!   no reason.
 
 use crate::dto::EventDto;
-use pickle_audio::AudioEngine;
+use crate::state::EngineSlot;
 use pickle_client::{Client, ClientEvent};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -28,9 +28,14 @@ pub const EVENT_CHANNEL: &str = "pickle:event";
 /// Forward encoded microphone frames to the server until the engine stops.
 ///
 /// Returns the thread handle; dropping the engine closes the channel, which
-/// ends the loop and lets the thread exit on its own.
+/// ends the loop and lets the thread exit on its own. That is also how a device
+/// change retires the pump belonging to the engine it replaced.
+///
+/// With no client the frames are drained and dropped. The engine still has to
+/// be pumped in that case — its channel is unbounded, so leaving it unread while
+/// the settings dialog drives the input meter would grow without limit.
 pub fn spawn_capture_pump(
-    client: Arc<Client>,
+    client: Option<Arc<Client>>,
     frames: std::sync::mpsc::Receiver<pickle_audio::engine::CapturedFrame>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -38,7 +43,9 @@ pub fn spawn_capture_pump(
         .spawn(move || {
             // Ends when the engine is dropped and the sender disconnects.
             while let Ok(frame) = frames.recv() {
-                client.send_voice(frame.seq, frame.flags, frame.payload);
+                if let Some(client) = &client {
+                    client.send_voice(frame.seq, frame.flags, frame.payload);
+                }
             }
             debug!("capture pump finished");
         })
@@ -46,16 +53,24 @@ pub fn spawn_capture_pump(
 }
 
 /// Route incoming events: voice to the mixer, everything else to the UI.
+///
+/// Takes the engine slot rather than an engine, so that a device change swapping
+/// the engine underneath does not require tearing this task down and losing the
+/// event stream with it.
 pub fn spawn_event_pump(
     app: AppHandle,
-    engine: Arc<AudioEngine>,
+    engine: EngineSlot,
     mut events: mpsc::UnboundedReceiver<ClientEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             // Voice never reaches JavaScript — straight into the mixer.
             if let ClientEvent::Voice(packet) = event {
-                engine.accept(packet);
+                // Absent only in the gap while devices are being reopened;
+                // dropping a 20 ms frame there is the right outcome.
+                if let Some(engine) = engine.current() {
+                    engine.accept(packet);
+                }
                 continue;
             }
 
