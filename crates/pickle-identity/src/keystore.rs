@@ -1,10 +1,33 @@
 //! On-disk storage for an [`Identity`](crate::Identity).
 //!
 //! The file holds an unencrypted Ed25519 secret key, so it is written `0600`
-//! and refuses to load if the permissions have been widened. Passphrase
-//! encryption is a planned addition; until then the file is exactly as
-//! sensitive as an SSH private key and should be backed up like one — losing it
+//! and refuses to load if the permissions have been widened. It is exactly as
+//! sensitive as an SSH host key and should be backed up like one — losing it
 //! means losing every permission every server granted to that key.
+//!
+//! # Why this one is not encrypted
+//!
+//! This is the *server's* store, and a server boots unattended: there is nobody
+//! at the console to type a passphrase when systemd restarts it at four in the
+//! morning. The only ways to encrypt it and still start automatically are to put
+//! the passphrase in an environment variable, a unit file, or a second file
+//! beside the key — and all three live inside the same trust boundary as the key
+//! itself. Anyone who can read `identity.json` can read the unit file that
+//! unlocks it, or `/proc/<pid>/environ`, or the sibling file. That is not
+//! encryption; it is obfuscation that reports itself as encryption, which is
+//! worse than being plainly unencrypted, because an operator would relax the
+//! protections that actually work in exchange for it.
+//!
+//! The protections that actually work for a server are: the data directory is
+//! `0600`/`0700` and owned by the service user; and, where an operator wants
+//! more, the platform's own facilities — full-disk encryption, `systemd`
+//! credentials, a KMS — which sit outside this crate and outside the process.
+//! Nothing is gained by pretending here.
+//!
+//! The client's store is a different problem and gets a different answer: a
+//! human is present to type a passphrase, and the threat — a stolen laptop, a
+//! synced folder, a backup — is one that encryption at rest genuinely addresses.
+//! See [`crate::Vault`], which is encrypted, optionally, at the user's choice.
 
 use crate::Identity;
 use data_encoding::BASE64;
@@ -12,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const KEYSTORE_VERSION: u32 = 1;
 
@@ -47,7 +71,12 @@ pub struct LoadedIdentity {
     pub nickname: String,
 }
 
-#[derive(Serialize, Deserialize)]
+/// The file's shape.
+///
+/// `ZeroizeOnDrop` because `secret_key` is the whole identity in printable form.
+/// A `String` that long-lived would otherwise be handed back to the allocator
+/// with the key still legible in it.
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredIdentity {
     version: u32,
     /// Base64 of the 32-byte Ed25519 secret scalar seed.
@@ -85,10 +114,13 @@ impl Keystore {
     }
 
     pub fn load(path: &Path) -> Result<LoadedIdentity, KeystoreError> {
-        let raw = fs::read_to_string(path).map_err(|source| KeystoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        // Zeroizing: the raw text is the secret key in base64.
+        let raw = Zeroizing::new(
+            fs::read_to_string(path).map_err(|source| KeystoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?,
+        );
 
         // Only meaningful once the file exists — hence after the read.
         check_permissions(path)?;
@@ -104,15 +136,19 @@ impl Keystore {
             });
         }
 
-        let secret = BASE64
-            .decode(stored.secret_key.as_bytes())
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-            .ok_or_else(|| KeystoreError::BadKey(path.to_path_buf()))?;
+        let secret = Zeroizing::new(
+            BASE64
+                .decode(stored.secret_key.as_bytes())
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .ok_or_else(|| KeystoreError::BadKey(path.to_path_buf()))?,
+        );
 
         Ok(LoadedIdentity {
             identity: Identity::from_secret_bytes(&secret, stored.counter),
-            nickname: stored.nickname,
+            // Cloned rather than moved: `StoredIdentity` wipes itself on drop,
+            // and a type with a `Drop` cannot be taken apart field by field.
+            nickname: stored.nickname.clone(),
         })
     }
 
@@ -134,12 +170,16 @@ impl Keystore {
 
         let stored = StoredIdentity {
             version: KEYSTORE_VERSION,
-            secret_key: BASE64.encode(&identity.secret_bytes()),
+            secret_key: BASE64.encode(identity.secret_bytes().as_slice()),
             counter: identity.counter(),
             nickname: nickname.to_string(),
         };
-        let json =
-            serde_json::to_string_pretty(&stored).expect("StoredIdentity is always serializable");
+        // Zeroizing: this is the same key material again, in a third
+        // representation. `stored` wipes itself; the rendered JSON has to be
+        // told to.
+        let json = Zeroizing::new(
+            serde_json::to_string_pretty(&stored).expect("StoredIdentity is always serializable"),
+        );
 
         let tmp = path.with_extension("tmp");
         let mut file = create_private(&tmp).map_err(io_err)?;

@@ -33,7 +33,15 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"]
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 rand = "0.8"
 sha2 = "0.10"
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] }
+
+# Passphrase encryption for the identity vault. Both are pure Rust, which is the
+# same constraint that picked `ring` above: no cmake, no nasm, no C toolchain.
+# `default-features = false` drops argon2's PHC-string parser, which we do not
+# want — the KDF parameters live in the vault's own JSON header instead, so they
+# can be raised without inventing a new file format.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 
 # --- serialization ---------------------------------------------------------
 serde = { version = "1", features = ["derive"] }
@@ -88,4 +96,13 @@ opt-level = 3
 [profile.dev.package.ed25519-dalek]
 opt-level = 3
 [profile.dev.package.sha2]
+opt-level = 3
+
+# Argon2 is *deliberately* slow, and its cost is tuned against optimised code. An
+# unoptimised build makes unlocking the vault take tens of seconds and the tests
+# that exercise it unbearable, so the KDF and its hash are built optimised even
+# in a debug build.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
 opt-level = 3
