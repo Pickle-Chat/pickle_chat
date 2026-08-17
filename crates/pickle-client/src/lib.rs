@@ -153,6 +153,19 @@ pub struct ConnectOptions {
     pub nickname: String,
     pub password: Option<String>,
     pub trust: TrustPolicy,
+    /// What to file the server's identity under, normally the address the user
+    /// typed.
+    ///
+    /// Kept separate from `address` because pinning an identity to a resolved
+    /// `SocketAddr` pins it to a value an attacker can influence: change what
+    /// the name resolves to and the new address is simply unknown, so
+    /// trust-on-first-use pins the impostor without a word. Keying on what the
+    /// user asked for means a substituted address still has to present the
+    /// identity already recorded for that name.
+    ///
+    /// Defaults to the address, which keeps a caller that passes a literal IP
+    /// behaving exactly as before.
+    pub server_key: Option<String>,
 }
 
 impl ConnectOptions {
@@ -162,7 +175,15 @@ impl ConnectOptions {
             nickname: nickname.into(),
             password: None,
             trust: TrustPolicy::default(),
+            server_key: None,
         }
+    }
+
+    /// File the server's identity under the address the user typed, rather than
+    /// whatever it resolved to.
+    pub fn with_server_key(mut self, key: impl Into<String>) -> Self {
+        self.server_key = Some(normalise_server_key(&key.into()));
+        self
     }
 
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
@@ -425,11 +446,15 @@ pub async fn connect(
         })?;
 
     let fingerprint = hello.server_identity.fingerprint();
-    let address_key = address.to_string();
+    let address_key = options
+        .server_key
+        .clone()
+        .unwrap_or_else(|| address.to_string());
     apply_trust_policy(
         trust_store,
         options.trust,
         &address_key,
+        &address.to_string(),
         fingerprint,
         &hello.server_name,
     )?;
@@ -535,10 +560,17 @@ pub async fn connect(
     ))
 }
 
+/// Lowercase and trim, so `Chat.Example.com:42071` and `chat.example.com:42071`
+/// are the same pin rather than two.
+fn normalise_server_key(key: &str) -> String {
+    key.trim().to_ascii_lowercase()
+}
+
 fn apply_trust_policy(
     store: &mut TrustStore,
     policy: TrustPolicy,
     address: &str,
+    legacy_key: &str,
     fingerprint: Fingerprint,
     server_name: &str,
 ) -> Result<(), ConnectError> {
@@ -550,6 +582,29 @@ fn apply_trust_policy(
         TrustDecision::Recognised => Ok(()),
 
         TrustDecision::FirstContact { fingerprint } => {
+            // Pins used to be filed under the resolved address. One recorded
+            // that way, for this same identity, is a pin this user already
+            // made — adopt it under the new key rather than calling it first
+            // contact, which would otherwise quietly re-pin on upgrade and
+            // throw away the very decision being migrated.
+            //
+            // A legacy entry with a *different* fingerprint is not adopted: an
+            // address can legitimately be reused by another server, so that
+            // case falls through to the normal first-contact rules.
+            if legacy_key != address
+                && matches!(
+                    store.check(legacy_key, fingerprint),
+                    TrustDecision::Recognised
+                )
+            {
+                store.trust(address, fingerprint, server_name);
+                store.forget(legacy_key);
+                if let Err(e) = store.save() {
+                    debug!(error = %e, "could not persist the migrated server pin");
+                }
+                return Ok(());
+            }
+
             if policy == TrustPolicy::Strict {
                 return Err(ConnectError::NotTrusted {
                     address: address.to_string(),
@@ -671,6 +726,7 @@ mod tests {
             &mut store,
             TrustPolicy::Strict,
             "1.2.3.4:42071",
+            "1.2.3.4:42071",
             fingerprint,
             "Server",
         );
@@ -684,6 +740,7 @@ mod tests {
         apply_trust_policy(
             &mut store,
             TrustPolicy::OnFirstUse,
+            "1.2.3.4:42071",
             "1.2.3.4:42071",
             fingerprint,
             "Server",
@@ -703,8 +760,14 @@ mod tests {
             let impostor = Identity::generate().fingerprint();
             store.trust("1.2.3.4:42071", original, "Server");
 
-            let result =
-                apply_trust_policy(&mut store, policy, "1.2.3.4:42071", impostor, "Server");
+            let result = apply_trust_policy(
+                &mut store,
+                policy,
+                "1.2.3.4:42071",
+                "1.2.3.4:42071",
+                impostor,
+                "Server",
+            );
             assert!(
                 matches!(result, Err(ConnectError::IdentityChanged { .. })),
                 "{policy:?} must not silently accept a new identity"
@@ -719,6 +782,7 @@ mod tests {
         apply_trust_policy(
             &mut store,
             TrustPolicy::Insecure,
+            "1.2.3.4:42071",
             "1.2.3.4:42071",
             fingerprint,
             "Server",

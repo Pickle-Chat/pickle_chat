@@ -278,7 +278,15 @@ pub async fn connect(
     let (identity, nickname, fingerprint) = state.identity_for(identity.as_deref())?;
     let mut trust = state.trust_store()?;
 
-    let mut options = ConnectOptions::new(target, nickname).with_trust(TrustPolicy::OnFirstUse);
+    // Pin against what the user typed, not what it resolved to. Keying on the
+    // resolved address would key on a value an attacker can influence: change
+    // what the name resolves to and the new address is simply unknown, so
+    // trust-on-first-use would pin the impostor silently. It also stops a
+    // server with a dynamic IP from looking like a new server every time it
+    // moves, which trains people to accept changed fingerprints.
+    let mut options = ConnectOptions::new(target, nickname)
+        .with_server_key(canonical_address(&address))
+        .with_trust(TrustPolicy::OnFirstUse);
     if let Some(password) = password.filter(|p| !p.is_empty()) {
         options = options.with_password(password);
     }
@@ -659,6 +667,20 @@ pub fn stop_audio_preview(state: State<'_, AppState>) {
 ///
 /// Accepts a hostname, an IPv4 address, or a bracketed IPv6 address, with or
 /// without a port.
+/// The address as typed, with the default port made explicit.
+///
+/// Used as the trust-store key, so `example.com` and `example.com:42071` are one
+/// pin rather than two — otherwise adding the port later would look like an
+/// unknown server.
+fn canonical_address(input: &str) -> String {
+    let trimmed = input.trim();
+    if has_port(trimmed) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}:{DEFAULT_PORT}")
+    }
+}
+
 fn resolve(input: &str) -> Result<SocketAddr, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

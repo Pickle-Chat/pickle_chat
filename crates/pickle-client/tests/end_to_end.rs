@@ -618,3 +618,120 @@ async fn history_is_scoped_to_the_channel_asked_about() {
 
     assert!(messages.is_empty(), "nothing was said in that channel");
 }
+
+/// Pinning must key on the address the user typed, not on what it resolved to.
+///
+/// Keying on the resolved address keys on a value an attacker can influence:
+/// change what the name resolves to and the new address is simply unknown, so
+/// trust-on-first-use pins the impostor without a word. This drives the same
+/// name at two different `SocketAddr`s and requires the identity to carry.
+#[tokio::test]
+async fn a_pin_follows_the_typed_address_not_the_resolved_one() {
+    let first = TestServer::default().await;
+    let second = TestServer::default().await;
+    assert_ne!(
+        first.fingerprint, second.fingerprint,
+        "two servers, two identities — the whole point of the test",
+    );
+
+    let identity = Identity::generate();
+    let mut trust = TrustStore::ephemeral();
+
+    // The user types one name. It resolves to the first server today.
+    pickle_client::connect(
+        ConnectOptions::new(first.address, "alice").with_server_key("chat.example.com:42071"),
+        &identity,
+        &mut trust,
+    )
+    .await
+    .unwrap();
+
+    // Tomorrow the same name resolves elsewhere. Under the old behaviour this
+    // was an unknown key and would have been pinned silently.
+    let result = pickle_client::connect(
+        ConnectOptions::new(second.address, "alice").with_server_key("chat.example.com:42071"),
+        &identity,
+        &mut trust,
+    )
+    .await;
+
+    match result {
+        Err(ConnectError::IdentityChanged {
+            expected, actual, ..
+        }) => {
+            assert_eq!(expected, first.fingerprint);
+            assert_eq!(actual, second.fingerprint);
+        }
+        other => panic!(
+            "a substituted address must be refused, got {:?}",
+            other.map(|_| "a silently accepted connection"),
+        ),
+    }
+}
+
+/// A pin recorded under the old resolved-address scheme is adopted, not
+/// re-pinned.
+///
+/// Migrating by treating it as first contact would throw away the decision
+/// being migrated — the user would silently re-trust whatever answered.
+#[tokio::test]
+async fn a_pin_from_the_old_scheme_is_carried_over() {
+    let server = TestServer::default().await;
+    let identity = Identity::generate();
+    let mut trust = TrustStore::ephemeral();
+
+    // What an older build wrote: keyed by the resolved address.
+    trust.trust(
+        &server.address.to_string(),
+        server.fingerprint,
+        "Test Server",
+    );
+
+    pickle_client::connect(
+        ConnectOptions::new(server.address, "alice")
+            .with_server_key("chat.example.com:42071")
+            .with_trust(TrustPolicy::Strict),
+        &identity,
+        &mut trust,
+    )
+    .await
+    .expect("the existing pin should be honoured, not treated as a new server");
+
+    assert!(
+        trust.get("chat.example.com:42071").is_some(),
+        "re-keyed under what the user typed",
+    );
+    assert!(
+        trust.get(&server.address.to_string()).is_none(),
+        "and the old entry retired rather than left to rot",
+    );
+}
+
+/// A legacy entry for a *different* identity is not adopted.
+///
+/// An address can legitimately be reused by another server, so that case has to
+/// fall through to the ordinary rules rather than inheriting someone else's pin.
+#[tokio::test]
+async fn a_legacy_pin_for_another_identity_is_not_inherited() {
+    let server = TestServer::default().await;
+    let identity = Identity::generate();
+    let mut trust = TrustStore::ephemeral();
+
+    // Some unrelated server was once pinned at this address.
+    let stranger = Identity::generate().fingerprint();
+    trust.trust(&server.address.to_string(), stranger, "Someone Else");
+
+    let result = pickle_client::connect(
+        ConnectOptions::new(server.address, "alice")
+            .with_server_key("chat.example.com:42071")
+            .with_trust(TrustPolicy::Strict),
+        &identity,
+        &mut trust,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(ConnectError::NotTrusted { .. })),
+        "a stranger's pin must not be inherited",
+    );
+}

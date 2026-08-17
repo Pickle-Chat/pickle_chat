@@ -94,7 +94,7 @@ struct Session {
     info: UserInfo,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-    control_rx: mpsc::UnboundedReceiver<ServerControl>,
+    control_rx: crate::state::ControlReceiver,
 }
 
 /// Returns `Ok(None)` when the client was cleanly refused, `Err` on a protocol
@@ -153,7 +153,7 @@ async fn handshake(
         return Ok(None);
     }
 
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::channel(crate::state::CONTROL_QUEUE_DEPTH);
     let info = match shared.admit(
         auth.identity,
         auth.nickname.clone(),
@@ -167,6 +167,18 @@ async fn handshake(
             tokio::time::sleep(Duration::from_millis(50)).await;
             return Ok(None);
         }
+    };
+
+    // From here the client occupies a slot in shared state, so every failure
+    // path has to give it back. `?` alone would not: the caller only cleans up
+    // after a session that *started*, so a client that authenticates and then
+    // vanishes before `AuthOk` is written would stay in the roster forever,
+    // counting against `max_users` and appearing as a phantom to everyone who
+    // connects afterwards. Repeating that a few dozen times would wedge the
+    // server at capacity until it was restarted.
+    let admitted = Admitted {
+        shared: Arc::clone(shared),
+        client_id: info.client_id,
     };
 
     let ok = AuthOk {
@@ -191,12 +203,43 @@ async fn handshake(
         Some(info.client_id),
     );
 
+    // Handed over to a running session, which owns the cleanup from here.
+    admitted.disarm();
+
     Ok(Some(Session {
         info,
         send,
         recv,
         control_rx,
     }))
+}
+
+/// Removes an admitted client on drop, unless the session actually started.
+///
+/// A guard rather than a `remove` on each error path, because the failure being
+/// guarded against is precisely *forgetting* one — and `?` makes every fallible
+/// call between admission and handover an exit.
+struct Admitted {
+    shared: Arc<Shared>,
+    client_id: ClientId,
+}
+
+impl Admitted {
+    /// The session took ownership; stop guarding.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        if self.shared.remove(self.client_id).is_some() {
+            debug!(
+                client_id = self.client_id,
+                "released a slot for a client that never finished connecting"
+            );
+        }
+    }
 }
 
 /// Check protocol version, password, and signature. Order matters only in that
