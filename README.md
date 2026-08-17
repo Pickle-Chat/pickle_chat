@@ -92,11 +92,19 @@ level 30 is tens of minutes. Servers can set a minimum. Mining does not change
 the keypair, so raising your level never costs you the permissions a server
 granted you.
 
+Your keys live in `identities.json`, written `0600` and refused if the mode has
+been widened. It can also be sealed with a passphrase: argon2id (19 MiB, 2
+passes) derives a key into XChaCha20-Poly1305, with a fresh salt and nonce and
+the cost parameters recorded in the file so they can be raised later without
+stranding an older vault. Encryption is opt-in and stays off until you ask for
+it, because a passphrase you did not choose to set is a lockout waiting to
+happen. See the [known issues](#what-works-today) for what is not wired up yet.
+
 ## Layout
 
 | Crate | What it does |
 | --- | --- |
-| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, single-key keystore and multi-identity vault |
+| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, single-key keystore and multi-identity vault (optionally passphrase-encrypted) |
 | [`pickle-proto`](crates/pickle-proto) | Wire protocol: control messages, framing, voice datagram encoding |
 | [`pickle-audio`](crates/pickle-audio) | Opus encode/decode, jitter buffering, voice gating, mixing |
 | [`pickle-server`](crates/pickle-server) | The server: QUIC, authentication, channels, voice relay |
@@ -163,8 +171,25 @@ Known issues:
   instead — which works under Wayland and X11 alike, but only if your user can
   open that device. See [Reading a mouse button](#reading-a-mouse-button).
   Without it the button still works while Pickle is focused.
-- The keystore is unencrypted. Treat it like an SSH private key — and back it
-  up, because losing it means losing every permission every server granted you.
+- **The identity vault can be encrypted, but no UI turns it on yet.** The client
+  can seal `identities.json` with a passphrase — argon2id into
+  XChaCha20-Poly1305, parameters recorded in the file — and the library API,
+  `Vault::set_passphrase`, is finished and tested. What is missing is the unlock
+  prompt at startup, and until that exists nothing in the app offers to encrypt
+  the vault: doing so would produce a file the next launch could not open.
+  Existing vaults are unencrypted and keep working untouched; encryption never
+  turns itself on.
+- **Whether encrypted or not, back the vault up.** Losing it means losing every
+  permission every server granted you, and if you do set a passphrase, forgetting
+  it is exactly as final. There is no recovery, by design.
+- **The server's keystore is deliberately unencrypted.** A server starts
+  unattended, so any passphrase it could use would have to sit in a unit file, an
+  environment variable, or a file beside the key — all readable by anyone who can
+  already read the key. That is obfuscation wearing encryption's name. Protect a
+  server key with file permissions (Pickle writes `0600` and refuses to load a
+  wider mode), and with full-disk encryption or `systemd` credentials if you want
+  more. See the module docs in
+  [`keystore.rs`](crates/pickle-identity/src/keystore.rs).
 
 ## Reading a mouse button
 

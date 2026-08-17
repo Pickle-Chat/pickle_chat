@@ -15,10 +15,12 @@
 
 mod keystore;
 mod pow;
+mod sealed;
 mod vault;
 
 pub use keystore::{Keystore, KeystoreError};
 pub use pow::{expected_hashes, mine, security_level, MineProgress, MineReport};
+pub use sealed::SealError;
 pub use vault::{Vault, VaultEntry, VaultError};
 
 use data_encoding::BASE32_NOPAD;
@@ -26,6 +28,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use zeroize::Zeroizing;
 
 /// Domain separator for the client's authentication signature.
 const AUTH_CONTEXT: &[u8] = b"pickle-auth-v1";
@@ -189,8 +192,15 @@ impl Identity {
         }
     }
 
-    pub fn secret_bytes(&self) -> [u8; 32] {
-        self.signing.to_bytes()
+    /// A copy of the 32-byte secret scalar seed.
+    ///
+    /// [`SigningKey`] wipes itself on drop, but a plain `[u8; 32]` taken out of
+    /// it would not — it would sit in freed heap or on a stack that is never
+    /// touched again, for anything reading the process later to find. Handing
+    /// back a [`Zeroizing`] makes the wipe the default and an escape the
+    /// deliberate act. It derefs to `[u8; 32]`, so callers read unchanged.
+    pub fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.signing.to_bytes())
     }
 
     pub fn public(&self) -> PublicIdentity {
