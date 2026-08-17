@@ -13,24 +13,59 @@ use pickle_proto::voice::{CHANNELS, MAX_OPUS_PACKET, SAMPLES_PER_FRAME, SAMPLE_R
 
 /// Default encoder bitrate. Comfortably transparent for speech; Opus varies
 /// below this on its own when the signal is simple.
+///
+/// This is a **VBR target, not a ceiling**. Opus spends above it on hard frames
+/// and below it on easy ones, and over a long take the average lands somewhat
+/// *over* the number — around 1.16x here, measured by
+/// `payload_bitrate_stays_near_its_vbr_target`. That is ordinary Opus VBR
+/// behaviour rather than the encoder ignoring the setting: asking for CBR
+/// instead hits the target to the byte. Budget the wire rate from the measured
+/// figure plus the datagram header, not from this constant.
 pub const DEFAULT_BITRATE: u32 = 32_000;
 
 /// Loss percentage the encoder assumes when choosing how robust to be.
 const ASSUMED_PACKET_LOSS_PERCENT: i32 = 10;
 
-/// In-band forward error correction is **off deliberately**.
+/// In-band forward error correction is **off deliberately**: it is broken in
+/// the codec crate, not in how we drive it.
 ///
 /// FEC would be a natural fit for an unreliable datagram transport — it lets a
-/// decoder rebuild a lost frame from redundancy carried in the next one. But
-/// the pure-Rust codec we use produces badly corrupted audio when it is
-/// enabled: a steady tone decodes with its energy swinging between 0.02x and
-/// 3.4x and clipping to full scale. Every other setting decodes correctly, so
-/// the fault is isolated to this one path.
+/// decoder rebuild a lost frame from redundancy (SILK's LBRR frames) carried in
+/// the next packet. Turning it on here instead corrupts the *ordinary* decode:
+/// measured on rusty-opus 0.9.1, a steady 440 Hz tone comes back with its
+/// energy swinging between 0.02x and 5.2x of the input. It is not a warm-up
+/// artefact and not specific to one coding mode — it reproduces identically in
+/// hybrid fullband (the mode we actually get at 32 kbit/s) and in SILK-only
+/// wideband, and `decode_fec` recovery is equally wrong, so the redundancy
+/// cannot be used even when it is present.
 ///
-/// Loss is therefore handled entirely by the jitter buffer and Opus's
-/// packet-loss concealment, which is adequate but recovers less gracefully from
-/// bursts. `codec_energy_is_stable_across_frames` is the regression test that
-/// will fail if this is ever turned back on before the underlying bug is fixed.
+/// The root cause is an encoder/decoder disagreement inside rusty-opus over how
+/// LBRR frames are coded. The encoder writes them with
+/// `CODE_INDEPENDENTLY_NO_LTP_SCALING` (`src/silk/enc_api.rs:592`), which omits
+/// the LTP-scale symbol; the decoder skips them with `CODE_INDEPENDENTLY`
+/// (`src/silk/dec_api.rs:182`), which reads it. Those two constants differ in
+/// exactly that one symbol (`src/silk/encode_indices.rs:156` versus
+/// `src/silk/decode_indices.rs:103`), so every voiced LBRR frame leaves the
+/// range decoder one symbol out of step. Everything read afterwards — starting
+/// with the real frame's gain indices — is then garbage, which is why the
+/// damage shows up as wild energy swings rather than as a decode error. Real
+/// libopus uses `CODE_INDEPENDENTLY` on both sides, so the encoder is the wrong
+/// half.
+///
+/// Nothing we can pass through the public API avoids this: the mismatch is in
+/// the bitstream the encoder emits, and the only settings that suppress it
+/// (`packet_loss_perc = 0`) suppress the redundancy along with it, which is the
+/// state we are already in. Fixing it properly means patching rusty-opus, and
+/// swapping to C libopus is not an option — the pure-Rust dependency is what
+/// keeps `cargo build` working with no system libopus and no cmake (see the
+/// workspace `Cargo.toml`).
+///
+/// So loss is handled entirely by the jitter buffer and Opus's packet-loss
+/// concealment, which is adequate but recovers less gracefully from bursts.
+/// Two tests guard this: `codec_energy_is_stable_across_frames` fails if the
+/// flag is flipped without the upstream fix, and
+/// `enabling_fec_is_still_broken_upstream` fails once a rusty-opus upgrade
+/// *does* fix it — that is the signal to turn this on.
 const USE_INBAND_FEC: bool = false;
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +115,14 @@ impl VoiceEncoder {
             .encode(pcm, SAMPLES_PER_FRAME, &mut self.scratch)
             .map_err(CodecError::Opus)?;
         Ok(Bytes::copy_from_slice(&self.scratch[..written]))
+    }
+
+    /// Force in-band FEC on regardless of [`USE_INBAND_FEC`], so a test can
+    /// exercise the broken upstream path on purpose. Test-only: the shipping
+    /// encoder must never turn this on while that constant says otherwise.
+    #[cfg(test)]
+    pub(crate) fn force_inband_fec_for_test(&mut self) {
+        self.encoder.use_inband_fec = true;
     }
 
     /// Take the next sequence number. Wraps, which the receiver handles.
@@ -133,6 +176,7 @@ impl VoiceDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pickle_proto::voice::FRAME_MS;
 
     /// A 440 Hz tone — a realistic, compressible signal, unlike noise.
     pub(crate) fn tone(samples: usize, amplitude: f32) -> Vec<f32> {
@@ -232,6 +276,77 @@ mod tests {
                 "steady input should decode to steady energy, got {ratio:.3} in {ratios:?}"
             );
         }
+    }
+
+    #[test]
+    fn enabling_fec_is_still_broken_upstream() {
+        // A canary, not a guard: it asserts the bug documented on
+        // `USE_INBAND_FEC` is STILL present, so it fails the day a rusty-opus
+        // upgrade fixes the LBRR range-coder desync. That failure is the signal
+        // to flip `USE_INBAND_FEC` on and delete this test — read the constant's
+        // docs before touching anything here.
+        let mut encoder = VoiceEncoder::new(DEFAULT_BITRATE).unwrap();
+        encoder.force_inband_fec_for_test();
+        let mut decoder = VoiceDecoder::new().unwrap();
+        let input = tone(SAMPLES_PER_FRAME, 0.25);
+        let input_rms = rms(&input);
+
+        // Same window as `codec_energy_is_stable_across_frames`, so the two
+        // tests are directly comparable: with FEC off every ratio there sits
+        // inside 0.85..1.15.
+        let mut worst = 1.0f64;
+        for frame in 0..40 {
+            let packet = encoder.encode(&input).unwrap();
+            let ratio = rms(decoder.decode(&packet).unwrap()) / input_rms;
+            if frame >= 10 {
+                // Distance from correct, whichever side it falls on.
+                worst = worst.max(ratio).max(1.0 / ratio.max(1e-9));
+            }
+        }
+
+        // Deliberately loose. The measured swing is roughly 0.02x..5.2x, so 2x
+        // is far outside anything a working codec would produce on a steady
+        // tone, yet nowhere near tight enough to be tripped by the SIMD kernel
+        // that happens to be selected on a given CPU.
+        assert!(
+            worst > 2.0,
+            "in-band FEC now decodes cleanly (worst deviation {worst:.2}x) — \
+             rusty-opus appears fixed, so USE_INBAND_FEC can be turned on"
+        );
+    }
+
+    #[test]
+    fn payload_bitrate_stays_near_its_vbr_target() {
+        // Pins the real answer to "does the encoder honour DEFAULT_BITRATE".
+        // It does: this measures the long-run average of the Opus payload alone
+        // against the configured target. Opus VBR runs above target on purpose,
+        // so the bound is one-sided and generous — it is here to catch the
+        // encoder running away entirely, not to police normal VBR headroom.
+        let mut encoder = VoiceEncoder::new(DEFAULT_BITRATE).unwrap();
+
+        // 30 s, long enough for the rate controller to settle. A continuous
+        // tone rather than silence, so the encoder has real work to do every
+        // frame and cannot flatter the average with cheap silent packets.
+        let frames = 1_500;
+        let mut bytes = 0usize;
+        for f in 0..frames {
+            let start = f * SAMPLES_PER_FRAME;
+            let pcm: Vec<f32> = (0..SAMPLES_PER_FRAME)
+                .map(|i| {
+                    let t = (start + i) as f32 / SAMPLE_RATE as f32;
+                    (t * 440.0 * std::f32::consts::TAU).sin() * 0.25
+                })
+                .collect();
+            bytes += encoder.encode(&pcm).unwrap().len();
+        }
+
+        let seconds = frames as f64 * FRAME_MS as f64 / 1000.0;
+        let measured = bytes as f64 * 8.0 / seconds;
+        let ratio = measured / DEFAULT_BITRATE as f64;
+        assert!(
+            (0.5..1.4).contains(&ratio),
+            "payload averaged {measured:.0} bit/s against a {DEFAULT_BITRATE} target ({ratio:.2}x)"
+        );
     }
 
     #[test]
