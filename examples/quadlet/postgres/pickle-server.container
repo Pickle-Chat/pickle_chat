@@ -1,0 +1,60 @@
+# Pickle server, Postgres backend.
+#
+# Worth it if you already run Postgres or want its backup and replication
+# tooling. Otherwise prefer the sqlite quadlet next door — one fewer moving part
+# for the same behaviour.
+#
+#   openssl rand -base64 32 | podman secret create pickle-db-password -
+#   cp examples/quadlet/postgres/* ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start pickle-server
+
+[Unit]
+Description=Pickle voice and chat server
+Documentation=https://github.com/Pickle-Chat/pickle_chat
+# Quadlet generates pickle-db.service from pickle-db.container. Combined with
+# Notify=healthy there, this waits for a database that answers.
+Requires=pickle-db.service
+After=pickle-db.service
+
+[Container]
+Image=ghcr.io/pickle-chat/pickle-server:latest
+Network=pickle.network
+
+# QUIC is UDP. See ../README.md.
+PublishPort=42071:42071/udp
+
+# Identity, certificate, and configuration. History is in Postgres; this is not,
+# and backing up only the database is not enough.
+Volume=pickle-data.volume:/data
+UserNS=keep-id
+
+Environment="PICKLE_NAME=My Pickle Server"
+
+# The whole URL is one secret, not a template.
+#
+# Unlike compose, quadlet does not interpolate: an `Environment=` value
+# containing ${POSTGRES_PASSWORD} would arrive at the container verbatim, and
+# this image has no shell to expand it. So the assembled URL is the secret.
+#
+# `pickle-db` is the container name quadlet derives from pickle-db.container,
+# resolved on the shared network. sqlx picks Postgres from the URL scheme.
+#
+# Create both secrets from one password, keeping it URL-safe so it needs no
+# percent-encoding:
+#
+#   PW=$(openssl rand -base64 32 | tr -d '/+=')
+#   printf '%s' "$PW" | podman secret create pickle-db-password -
+#   printf 'postgres://pickle:%s@pickle-db:5432/pickle' "$PW" \
+#     | podman secret create pickle-database-url -
+Secret=pickle-database-url,type=env,target=PICKLE_DATABASE_URL
+
+#Environment=PICKLE_OWNER=xxxx-xxxx-xxxx-...
+
+AutoUpdate=registry
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

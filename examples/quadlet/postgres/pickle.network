@@ -1,0 +1,3 @@
+# A dedicated network so the server reaches Postgres by name and Postgres is
+# reachable from nothing else. It is deliberately never published.
+[Network]

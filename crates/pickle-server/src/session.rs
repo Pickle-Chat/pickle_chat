@@ -15,7 +15,7 @@ use pickle_proto::codec::{self, CodecError};
 use pickle_proto::voice::VoiceUpstream;
 use pickle_proto::{
     AuthFailure, AuthOk, ClientAuth, ClientControl, ClientId, DisconnectReason, ErrorCode,
-    ServerControl, ServerHello, UserInfo, PROTOCOL_VERSION,
+    ServerControl, ServerHello, ServerLimits, UserInfo, PROTOCOL_VERSION,
 };
 use rand::RngCore;
 use std::sync::Arc;
@@ -94,7 +94,7 @@ struct Session {
     info: UserInfo,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-    control_rx: mpsc::UnboundedReceiver<ServerControl>,
+    control_rx: crate::state::ControlReceiver,
 }
 
 /// Returns `Ok(None)` when the client was cleanly refused, `Err` on a protocol
@@ -153,7 +153,7 @@ async fn handshake(
         return Ok(None);
     }
 
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::channel(crate::state::CONTROL_QUEUE_DEPTH);
     let info = match shared.admit(
         auth.identity,
         auth.nickname.clone(),
@@ -169,6 +169,18 @@ async fn handshake(
         }
     };
 
+    // From here the client occupies a slot in shared state, so every failure
+    // path has to give it back. `?` alone would not: the caller only cleans up
+    // after a session that *started*, so a client that authenticates and then
+    // vanishes before `AuthOk` is written would stay in the roster forever,
+    // counting against `max_users` and appearing as a phantom to everyone who
+    // connects afterwards. Repeating that a few dozen times would wedge the
+    // server at capacity until it was restarted.
+    let admitted = Admitted {
+        shared: Arc::clone(shared),
+        client_id: info.client_id,
+    };
+
     let ok = AuthOk {
         client_id: info.client_id,
         channels: shared.channels(),
@@ -176,7 +188,13 @@ async fn handshake(
         // and does not need a special case for its own arrival.
         users: shared.users(),
         default_channel: shared.default_channel,
-        limits: shared.limits.clone(),
+        // Reported per connection rather than from the static config, so a
+        // server whose store failed to open says so instead of promising
+        // history it cannot serve.
+        limits: ServerLimits {
+            history_enabled: shared.history_enabled(),
+            ..shared.limits.clone()
+        },
     };
     codec::write_frame(&mut send, &ServerControl::AuthOk(Box::new(ok))).await?;
 
@@ -185,12 +203,43 @@ async fn handshake(
         Some(info.client_id),
     );
 
+    // Handed over to a running session, which owns the cleanup from here.
+    admitted.disarm();
+
     Ok(Some(Session {
         info,
         send,
         recv,
         control_rx,
     }))
+}
+
+/// Removes an admitted client on drop, unless the session actually started.
+///
+/// A guard rather than a `remove` on each error path, because the failure being
+/// guarded against is precisely *forgetting* one — and `?` makes every fallible
+/// call between admission and handover an exit.
+struct Admitted {
+    shared: Arc<Shared>,
+    client_id: ClientId,
+}
+
+impl Admitted {
+    /// The session took ownership; stop guarding.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        if self.shared.remove(self.client_id).is_some() {
+            debug!(
+                client_id = self.client_id,
+                "released a slot for a client that never finished connecting"
+            );
+        }
+    }
 }
 
 /// Check protocol version, password, and signature. Order matters only in that
@@ -320,11 +369,11 @@ async fn control_loop(
             continue;
         }
 
-        handle_control(shared, client_id, message);
+        handle_control(shared, client_id, message).await;
     }
 }
 
-fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientControl) {
+async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientControl) {
     match message {
         // A second Auth on an authenticated stream is meaningless.
         ClientControl::Auth(_) => shared.send(
@@ -394,7 +443,7 @@ fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientCont
             content,
             reply_to,
             nonce,
-        } => send_message(shared, client_id, channel, content, reply_to, nonce),
+        } => send_message(shared, client_id, channel, content, reply_to, nonce).await,
 
         ClientControl::Typing { channel } => {
             shared.broadcast_to_channel(
@@ -407,16 +456,11 @@ fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientCont
             );
         }
 
-        // History needs persistence, which is not built yet. Answering with an
-        // empty, complete page is honest: there is nothing stored to return.
-        ClientControl::FetchHistory { channel, .. } => shared.send(
-            client_id,
-            ServerControl::History {
-                channel,
-                messages: Vec::new(),
-                reached_start: true,
-            },
-        ),
+        ClientControl::FetchHistory {
+            channel,
+            before,
+            limit,
+        } => fetch_history(shared, client_id, channel, before, limit).await,
 
         ClientControl::EditMessage { .. }
         | ClientControl::DeleteMessage { .. }
@@ -430,7 +474,72 @@ fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientCont
     }
 }
 
-fn send_message(
+/// Answer a request for past messages.
+///
+/// A server with history switched off, or with no store, answers with an empty
+/// page marked as the start rather than staying silent — a client waiting on a
+/// reply that never comes is worse than one told there is nothing.
+async fn fetch_history(
+    shared: &Arc<Shared>,
+    client_id: ClientId,
+    channel: pickle_proto::ChannelId,
+    before: Option<pickle_proto::MessageId>,
+    limit: u16,
+) {
+    let empty = |shared: &Arc<Shared>| {
+        shared.send(
+            client_id,
+            ServerControl::History {
+                channel,
+                messages: Vec::new(),
+                reached_start: true,
+            },
+        );
+    };
+
+    if !shared.history_enabled() {
+        empty(shared);
+        return;
+    }
+
+    // Reading another channel's history is reading a room you may not be in, so
+    // the channel has to exist and carry text at all.
+    match shared.channel(channel) {
+        Some(c) if c.kind.has_text() => {}
+        _ => {
+            empty(shared);
+            return;
+        }
+    }
+
+    let Some(store) = shared.store() else {
+        empty(shared);
+        return;
+    };
+
+    match store.history(channel, before, limit).await {
+        Ok(page) => shared.send(
+            client_id,
+            ServerControl::History {
+                channel,
+                messages: page.messages,
+                reached_start: page.reached_start,
+            },
+        ),
+        Err(error) => {
+            warn!(%error, channel, "could not read history");
+            shared.send(
+                client_id,
+                ServerControl::Error {
+                    code: ErrorCode::Internal,
+                    detail: "the server could not read history".into(),
+                },
+            );
+        }
+    }
+}
+
+async fn send_message(
     shared: &Arc<Shared>,
     client_id: ClientId,
     channel: pickle_proto::ChannelId,
@@ -485,6 +594,24 @@ fn send_message(
     }
 
     let message = shared.build_message(&author, channel, content, reply_to);
+
+    // Stored before anyone is told about it. The other order is faster, but it
+    // means a message everyone saw can vanish on restart — history that
+    // disagrees with what people remember reading is the worse failure, and a
+    // write error has to reach the sender rather than being swallowed.
+    if let Some(store) = shared.store() {
+        if let Err(error) = store.insert_message(&message).await {
+            warn!(%error, "could not store a message");
+            shared.send(
+                client_id,
+                ServerControl::Error {
+                    code: ErrorCode::Internal,
+                    detail: "the server could not save that message, so it was not sent".into(),
+                },
+            );
+            return;
+        }
+    }
 
     // The author gets the nonce back so an optimistic local echo can be
     // reconciled with the server's authoritative copy.

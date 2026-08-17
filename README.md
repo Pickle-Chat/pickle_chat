@@ -22,6 +22,23 @@ It prints the address to share and its identity fingerprint, writing its
 configuration and keys to a per-user data directory on first run. Share the
 address; anyone outside your network will need UDP forwarded to that port.
 
+Or with Docker:
+
+```bash
+docker run -d --name pickle -p 42071:42071/udp -v pickle-data:/data \
+  ghcr.io/pickle-chat/pickle-server:latest
+```
+
+The port must be published as **UDP** — Pickle speaks QUIC — and the volume
+holds the server's identity, so deleting it makes every client that pinned the
+old one refuse to reconnect. `docker run --rm -v pickle-data:/data
+ghcr.io/pickle-chat/pickle-server identity` prints the fingerprint to share.
+Worked SQLite and Postgres setups are in
+[`examples/compose`](examples/compose), or as podman
+[quadlets](examples/quadlet) if you would rather systemd supervised it.
+Configuration can come from `PICKLE_*` environment variables instead of the
+config file.
+
 Run the desktop client:
 
 ```bash
@@ -43,6 +60,13 @@ hole and one congestion controller for both kinds of traffic:
 The server relays voice rather than mixing it. That costs a little bandwidth and
 buys per-speaker volume, independent jitter buffering, and room for positional
 audio later.
+
+A client may hold several connections at once, but voice lives on one of them at
+a time. Speaker ids are assigned per server, so audio from two servers would
+collide in a single mixer — and talking into several rooms at once is not
+something anyone asks for. Switching tabs deliberately does not move the
+microphone; reading one server should not cut you out of a conversation on
+another.
 
 ### Identity and trust
 
@@ -72,7 +96,7 @@ granted you.
 
 | Crate | What it does |
 | --- | --- |
-| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, on-disk keystore |
+| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, single-key keystore and multi-identity vault |
 | [`pickle-proto`](crates/pickle-proto) | Wire protocol: control messages, framing, voice datagram encoding |
 | [`pickle-audio`](crates/pickle-audio) | Opus encode/decode, jitter buffering, voice gating, mixing |
 | [`pickle-server`](crates/pickle-server) | The server: QUIC, authentication, channels, voice relay |
@@ -90,10 +114,14 @@ Working:
 
 - Server hosting, configuration, channels (including nesting), server passwords
 - Identity generation, mining, keystore, fingerprints
+- Several identities per user, switchable, with a chosen one signing each login
+- Several servers connected at once, a tab each, reopened on the next launch
 - Authentication with proof-of-work enforcement and certificate binding
 - Trust-on-first-use server pinning
 - Voice: capture, gating, Opus, relay, jitter buffering, mixing, mute/deafen
 - Text messages delivered live to a channel
+- Settings: identities, saved servers, audio devices, and keybinds, all persisted
+- Push to talk, bound to a key and grabbed globally where the platform allows
 - Desktop client covering all of the above
 
 Not yet built:
@@ -116,6 +144,24 @@ Known issues:
   also resolve it.
 - The encoder overshoots its bitrate target by roughly a third.
 - Audio devices must support 48 kHz natively; there is no resampling.
+- **Global keys are not guaranteed.** The keyboard grab goes through X11, so a
+  key your layout cannot produce is refused, and a Wayland session may not
+  deliver the key while another window has focus. The settings tab marks any
+  binding the system refused, and push to talk falls back to working while
+  Pickle is focused, so it is never silently dead.
+- **Global mouse buttons need the `input` group.** The keyboard grab cannot see
+  mouse buttons at all, so a bound button is read from the mouse's input device
+  instead — which works under Wayland and X11 alike, but only if your user can
+  open it:
+
+  ```bash
+  sudo usermod -aG input $USER
+  ```
+
+  Log out and back in afterwards. Without it the button still works while
+  Pickle is focused. Pickle opens mouse devices only, never keyboards, watches
+  only the button you bound, and does not take that button away from anything
+  else using it.
 - The keystore is unencrypted. Treat it like an SSH private key — and back it
   up, because losing it means losing every permission every server granted you.
 
@@ -125,6 +171,13 @@ Known issues:
 cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
+
+CI also audits dependencies against the [RUSTSEC](https://rustsec.org) advisory
+database — vulnerabilities fail the build, unmaintained and unsound advisories
+are reported in the run summary without blocking it — and fuzzes the code that
+parses bytes off the network: the Opus decoder and the voice datagram parsers.
+Both run weekly as well as per push, since a new advisory needs no commit to
+become relevant. See [`fuzz/`](fuzz) for running the fuzzers locally.
 
 ## Licence
 

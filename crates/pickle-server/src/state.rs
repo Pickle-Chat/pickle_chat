@@ -2,25 +2,47 @@
 //! messages reach them.
 //!
 //! Guarded by a single `RwLock`. Fan-out and voice relay only take the read
-//! lock and never block inside it — sends go to unbounded channels or to
-//! quinn's datagram queue, both of which return immediately. A slow client
-//! therefore cannot stall the relay for everyone else.
+//! lock and never block inside it — sends are `try_send` into a bounded queue,
+//! or into quinn's datagram queue, both of which return immediately. A slow
+//! client therefore cannot stall the relay for everyone else.
+//!
+//! A client whose queue fills has stopped reading, and is disconnected rather
+//! than allowed to grow the server's memory without limit. That reaping happens
+//! after the lock is released, since removing needs the write lock.
 
 use crate::config::ServerConfig;
+use crate::roles::{RoleError, Roles};
+use crate::store::Store;
 use parking_lot::RwLock;
 use pickle_identity::{Fingerprint, Identity, PublicIdentity};
 use pickle_proto::voice::VoiceUpstream;
 use pickle_proto::{
     AuthFailure, Channel, ChannelId, ChatMessage, ClientId, DisconnectReason, ErrorCode,
-    ServerControl, ServerLimits, UserInfo, VoiceState,
+    Permissions, Role, ServerControl, ServerLimits, UserInfo, VoiceState,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 /// Control frames queued for one client.
-pub type ControlSender = mpsc::UnboundedSender<ServerControl>;
-pub type ControlReceiver = mpsc::UnboundedReceiver<ServerControl>;
+///
+/// Bounded. An unbounded queue lets a client that simply stops reading commit
+/// the server to unlimited memory: the writer task stalls on QUIC flow control
+/// while the queue keeps growing, and one `FetchHistory` frame of a few dozen
+/// bytes can queue a page of up to `MAX_HISTORY_LIMIT` messages behind it. The
+/// rate limiter caps how many requests arrive, not how many bytes they commit.
+pub type ControlSender = mpsc::Sender<ServerControl>;
+pub type ControlReceiver = mpsc::Receiver<ServerControl>;
+
+/// How many control frames may be queued for one client before it is dropped.
+///
+/// Deep enough that a burst of state changes during a busy moment is absorbed,
+/// shallow enough that a client which has stopped reading is noticed quickly.
+/// Byte accounting would bound this more tightly than a message count — the
+/// largest single frame is a history page — but a count already replaces an
+/// unbounded ceiling with a finite one.
+pub const CONTROL_QUEUE_DEPTH: usize = 64;
 
 /// The transport a client's voice datagrams go out over.
 ///
@@ -44,6 +66,20 @@ struct ConnectedClient {
     datagrams: Box<dyn DatagramSink>,
 }
 
+/// Queue a frame, naming the client if its queue is full.
+///
+/// `try_send` rather than an await: every caller holds the state read lock, and
+/// blocking there would stall the voice relay for everyone on one slow client —
+/// the exact thing the lock discipline in this module exists to prevent.
+fn try_queue(entry: &ConnectedClient, message: ServerControl) -> Option<ClientId> {
+    match entry.control.try_send(message) {
+        Ok(()) => None,
+        // Already gone; the session is tearing down and will be reaped there.
+        Err(mpsc::error::TrySendError::Closed(_)) => None,
+        Err(mpsc::error::TrySendError::Full(_)) => Some(entry.info.client_id),
+    }
+}
+
 struct Inner {
     next_client_id: ClientId,
     clients: HashMap<ClientId, ConnectedClient>,
@@ -58,11 +94,27 @@ pub struct Shared {
     pub cert_hash: [u8; 32],
     pub limits: ServerLimits,
     pub default_channel: ChannelId,
+    /// Who holds which role. Behind its own lock rather than inside `Inner`, so
+    /// resolving permissions on every administrative command does not contend
+    /// with the client and channel maps that voice relay reads.
+    roles: RwLock<Roles>,
+    /// Parsed once from the config. `None` when unset or unparseable — an
+    /// operator who mistypes their fingerprint gets a server with no owner,
+    /// which is recoverable, rather than one that refuses to start.
+    owner: Option<Fingerprint>,
+    /// The durable store, attached after construction so `Shared::new` stays
+    /// synchronous and usable in tests that need no database.
+    store: RwLock<Option<Store>>,
     inner: RwLock<Inner>,
 }
 
 impl Shared {
-    pub fn new(config: ServerConfig, identity: Identity, cert_hash: [u8; 32]) -> Self {
+    pub fn new(
+        config: ServerConfig,
+        identity: Identity,
+        cert_hash: [u8; 32],
+        roles: Roles,
+    ) -> Self {
         let channels = build_channels(&config);
         let default_channel = channels
             .values()
@@ -76,12 +128,26 @@ impl Shared {
             ..ServerLimits::default()
         };
 
+        let owner = config.owner.as_deref().and_then(|raw| {
+            Fingerprint::parse(raw)
+                .inspect_err(|_| {
+                    warn!(
+                        fingerprint = raw,
+                        "owner fingerprint is not readable; nobody owns this server"
+                    )
+                })
+                .ok()
+        });
+
         Self {
             config,
             identity,
             cert_hash,
             limits,
             default_channel,
+            roles: RwLock::new(roles),
+            owner,
+            store: RwLock::new(None),
             inner: RwLock::new(Inner {
                 next_client_id: 1,
                 clients: HashMap::new(),
@@ -89,6 +155,32 @@ impl Shared {
                 next_message_id: 1,
             }),
         }
+    }
+
+    /// What this fingerprint may do here.
+    ///
+    /// The single place ownership and roles are combined, so no caller can
+    /// accidentally consult one without the other.
+    pub fn permissions(&self, fingerprint: Fingerprint) -> Permissions {
+        let owner = self.owner == Some(fingerprint);
+        self.roles.read().permissions(fingerprint, owner)
+    }
+
+    /// Grant or revoke a role, persisting the result.
+    ///
+    /// The capability and rank checks belong to the caller; this is the store.
+    pub fn assign_role(
+        &self,
+        fingerprint: Fingerprint,
+        role: Option<&str>,
+    ) -> Result<(), RoleError> {
+        let mut roles = self.roles.write();
+        roles.assign(fingerprint, role)?;
+        roles.save()
+    }
+
+    pub fn roles(&self) -> Vec<Role> {
+        self.roles.read().list().to_vec()
     }
 
     pub fn channels(&self) -> Vec<Channel> {
@@ -140,6 +232,10 @@ impl Shared {
                 reason: "nickname must contain at least one printable character".into(),
             })?;
 
+        // Resolved before taking the client lock, since it takes the role lock
+        // and holding both at once invites an ordering bug later.
+        let permissions = self.permissions(identity.fingerprint());
+
         let mut inner = self.inner.write();
         if inner.clients.len() >= self.config.max_users as usize {
             return Err(AuthFailure::ServerFull);
@@ -155,6 +251,7 @@ impl Shared {
             channel: Some(self.default_channel),
             voice: VoiceState::default(),
             connected_at_unix_ms: now_unix_ms(),
+            permissions,
         };
 
         inner.clients.insert(
@@ -249,22 +346,59 @@ impl Shared {
         id
     }
 
+    /// Continue numbering after the highest id already on disk.
+    ///
+    /// The counter starts at 1 on every boot, which was harmless while nothing
+    /// was stored. Against a database it would hand out ids that collide with
+    /// existing rows on the first restart, so startup seeds it from what the
+    /// store already holds.
+    pub fn resume_message_ids_after(&self, highest: u64) {
+        let mut inner = self.inner.write();
+        inner.next_message_id = inner.next_message_id.max(highest + 1);
+    }
+
+    /// Attach the durable store.
+    ///
+    /// Held here for reach, but deliberately never used *inside* a state lock:
+    /// the store is async, and awaiting while holding this lock would stall the
+    /// voice relay for everyone.
+    pub fn attach_store(&self, store: Store) {
+        *self.store.write() = Some(store);
+    }
+
+    pub fn store(&self) -> Option<Store> {
+        self.store.read().clone()
+    }
+
+    /// Whether this server keeps history, as reported to clients.
+    pub fn history_enabled(&self) -> bool {
+        self.config.history_enabled && self.store().is_some()
+    }
+
     /// Queue a control frame for one client.
     pub fn send(&self, client: ClientId, message: ServerControl) {
-        if let Some(entry) = self.inner.read().clients.get(&client) {
-            let _ = entry.control.send(message);
-        }
+        let overflowed = {
+            let inner = self.inner.read();
+            match inner.clients.get(&client) {
+                Some(entry) => try_queue(entry, message),
+                None => None,
+            }
+        };
+        self.drop_overflowed(overflowed.into_iter());
     }
 
     /// Queue a control frame for everyone, optionally skipping one client.
     pub fn broadcast(&self, message: ServerControl, except: Option<ClientId>) {
-        let inner = self.inner.read();
-        for (id, entry) in inner.clients.iter() {
-            if Some(*id) == except {
-                continue;
-            }
-            let _ = entry.control.send(message.clone());
-        }
+        let overflowed: Vec<ClientId> = {
+            let inner = self.inner.read();
+            inner
+                .clients
+                .iter()
+                .filter(|(id, _)| Some(**id) != except)
+                .filter_map(|(_, entry)| try_queue(entry, message.clone()))
+                .collect()
+        };
+        self.drop_overflowed(overflowed.into_iter());
     }
 
     /// Queue a control frame for everyone currently in `channel`.
@@ -274,12 +408,45 @@ impl Shared {
         message: ServerControl,
         except: Option<ClientId>,
     ) {
-        let inner = self.inner.read();
-        for (id, entry) in inner.clients.iter() {
-            if Some(*id) == except || entry.info.channel != Some(channel) {
-                continue;
+        let overflowed: Vec<ClientId> = {
+            let inner = self.inner.read();
+            inner
+                .clients
+                .iter()
+                .filter(|(id, entry)| Some(**id) != except && entry.info.channel == Some(channel))
+                .filter_map(|(_, entry)| try_queue(entry, message.clone()))
+                .collect()
+        };
+        self.drop_overflowed(overflowed.into_iter());
+    }
+
+    /// Disconnect clients whose queue filled up.
+    ///
+    /// Their control stream has gaps by definition, so continuing would leave
+    /// them acting on a view of the server that no longer matches it. Dropping
+    /// the entry drops its sender, which ends the session's writer task and
+    /// tears the connection down through the ordinary path.
+    ///
+    /// Called only after the state lock is released: removing needs the write
+    /// lock, and taking it while the read guard is alive would deadlock.
+    fn drop_overflowed(&self, ids: impl Iterator<Item = ClientId>) {
+        for id in ids {
+            if self.remove(id).is_some() {
+                warn!(
+                    client_id = id,
+                    "dropping a client that stopped reading its control stream"
+                );
+                // Best effort, and deliberately not recursive: anyone who
+                // overflows on *this* frame is caught by the next one instead
+                // of nesting a disconnect inside a disconnect.
+                let inner = self.inner.read();
+                for entry in inner.clients.values() {
+                    let _ = entry.control.try_send(ServerControl::UserLeft {
+                        client: id,
+                        reason: DisconnectReason::Kicked,
+                    });
+                }
             }
-            let _ = entry.control.send(message.clone());
         }
     }
 
@@ -353,7 +520,11 @@ impl Shared {
     pub fn disconnect_all(&self, reason: DisconnectReason) {
         let inner = self.inner.read();
         for (id, entry) in inner.clients.iter() {
-            let _ = entry.control.send(ServerControl::UserLeft {
+            // `try_send`, not `send`: the queue is bounded now, so `send` is a
+            // future and discarding it would deliver nothing at all. Shutdown
+            // is also the one moment a full queue does not matter — the
+            // connection is closing regardless.
+            let _ = entry.control.try_send(ServerControl::UserLeft {
                 client: *id,
                 reason,
             });
@@ -447,6 +618,13 @@ mod tests {
         }
     }
 
+    /// A role store backed by a path that does not exist, so it starts from the
+    /// default ladder and never writes. Tests that need persistence open their
+    /// own store against a `tempdir`.
+    fn test_roles() -> Roles {
+        Roles::open(std::path::Path::new("/nonexistent/pickle-test/roles.json")).unwrap()
+    }
+
     fn test_config() -> ServerConfig {
         ServerConfig {
             min_security_level: 0,
@@ -461,7 +639,7 @@ mod tests {
     }
 
     fn join(shared: &Shared, nickname: &str) -> TestClient {
-        let (tx, control) = mpsc::unbounded_channel();
+        let (tx, control) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         let sink = RecordingSink::default();
         let info = shared
             .admit(
@@ -479,7 +657,7 @@ mod tests {
     }
 
     fn shared() -> Shared {
-        Shared::new(test_config(), Identity::generate(), [0u8; 32])
+        Shared::new(test_config(), Identity::generate(), [0u8; 32], test_roles())
     }
 
     fn voice_frame(seq: u32) -> VoiceUpstream {
@@ -510,9 +688,9 @@ mod tests {
     fn an_identity_below_the_minimum_level_is_refused() {
         let mut config = test_config();
         config.min_security_level = 200; // unreachable
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         let result = shared.admit(
             Identity::generate().public(),
             "alice".into(),
@@ -529,10 +707,10 @@ mod tests {
     fn the_server_stops_admitting_at_capacity() {
         let mut config = test_config();
         config.max_users = 1;
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         join(&shared, "alice");
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         assert!(matches!(
             shared.admit(
                 Identity::generate().public(),
@@ -547,7 +725,7 @@ mod tests {
     #[test]
     fn nicknames_are_stripped_of_control_characters() {
         let shared = shared();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         let info = shared
             .admit(
                 Identity::generate().public(),
@@ -562,7 +740,7 @@ mod tests {
     #[test]
     fn a_blank_nickname_is_refused() {
         let shared = shared();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         assert!(matches!(
             shared.admit(
                 Identity::generate().public(),
@@ -640,7 +818,7 @@ mod tests {
     fn voice_is_dropped_in_a_text_only_channel() {
         let mut config = test_config();
         config.channels[0].kind = ChannelKind::Text;
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
@@ -725,7 +903,7 @@ mod tests {
     fn a_full_channel_refuses_new_arrivals() {
         let mut config = test_config();
         config.channels[1].max_users = Some(1);
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
@@ -742,7 +920,7 @@ mod tests {
         // The occupant count must exclude the joiner, or a re-join would fail.
         let mut config = test_config();
         config.channels[1].max_users = Some(1);
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
         shared.join_channel(alice.info.client_id, 2).unwrap();
@@ -769,7 +947,7 @@ mod tests {
             max_users: None,
             order: 0,
         });
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let channels = shared.channels();
         let lobby = channels.iter().find(|c| c.name == "Lobby").unwrap();
@@ -800,7 +978,7 @@ mod tests {
         let shared = shared();
         let identity = Identity::generate().public();
         for _ in 0..2 {
-            let (tx, _rx) = mpsc::unbounded_channel();
+            let (tx, _rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
             shared
                 .admit(
                     identity,

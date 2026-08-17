@@ -15,9 +15,11 @@
 
 mod keystore;
 mod pow;
+mod vault;
 
 pub use keystore::{Keystore, KeystoreError};
 pub use pow::{expected_hashes, mine, security_level, MineProgress, MineReport};
+pub use vault::{Vault, VaultEntry, VaultError};
 
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};

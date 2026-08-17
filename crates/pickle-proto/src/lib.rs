@@ -166,6 +166,104 @@ pub struct VoiceState {
     pub speaking: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+/// One thing a user may be allowed to do.
+///
+/// Explicit rather than implied by rank, so "may mute but not kick" is
+/// expressible. Rank answers a different question — see [`Role::rank`].
+///
+/// New variants must be **appended**. postcard encodes an enum by variant
+/// index, so inserting one silently reinterprets every message a older peer
+/// sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Capability {
+    KickUsers,
+    BanUsers,
+    /// Silence someone without disconnecting them.
+    MuteUsers,
+    MoveUsers,
+    ManageChannels,
+    /// Grant and revoke roles.
+    ManageRoles,
+    /// Change server-wide settings.
+    ManageServer,
+}
+
+impl Capability {
+    /// Every capability, for granting a role everything short of ownership.
+    pub const ALL: [Capability; 7] = [
+        Capability::KickUsers,
+        Capability::BanUsers,
+        Capability::MuteUsers,
+        Capability::MoveUsers,
+        Capability::ManageChannels,
+        Capability::ManageRoles,
+        Capability::ManageServer,
+    ];
+}
+
+/// A named bundle of capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Role {
+    pub name: String,
+    /// Governs who may act on whom, and nothing else.
+    ///
+    /// Capabilities say what an action *is*; rank says whether the target is
+    /// above you. Acting on an equal or higher rank is refused however many
+    /// capabilities you hold, so two moderators cannot kick each other and an
+    /// admin cannot kick the owner.
+    pub rank: u32,
+    pub capabilities: Vec<Capability>,
+}
+
+impl Role {
+    pub fn allows(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+}
+
+/// What a user may do here, as resolved by the server.
+///
+/// Sent with [`UserInfo`] so a client can enable and disable its own controls
+/// without a second round trip. It is a courtesy for rendering only: the server
+/// checks every action regardless of what the client believed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Permissions {
+    /// `None` for a user with no role assigned.
+    pub role: Option<String>,
+    pub rank: u32,
+    pub capabilities: Vec<Capability>,
+    /// The server operator, who passes every check regardless of role.
+    pub owner: bool,
+}
+
+impl Permissions {
+    /// A user with no role: may do nothing administrative.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn allows(&self, capability: Capability) -> bool {
+        self.owner || self.capabilities.contains(&capability)
+    }
+
+    /// Whether this user may act on `target`.
+    ///
+    /// Rank alone; the caller still has to hold the capability for whatever it
+    /// is doing. The owner outranks everyone, and is never outranked — losing
+    /// control of your own server to someone you promoted would be a poor
+    /// reward for promoting them.
+    pub fn outranks(&self, target: &Permissions) -> bool {
+        if target.owner {
+            return false;
+        }
+        self.owner || self.rank > target.rank
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
     pub client_id: ClientId,
@@ -174,6 +272,7 @@ pub struct UserInfo {
     pub channel: Option<ChannelId>,
     pub voice: VoiceState,
     pub connected_at_unix_ms: u64,
+    pub permissions: Permissions,
 }
 
 impl UserInfo {
@@ -505,5 +604,79 @@ mod tests {
         assert!(ChannelKind::Voice.has_voice() && !ChannelKind::Voice.has_text());
         assert!(ChannelKind::Text.has_text() && !ChannelKind::Text.has_voice());
         assert!(ChannelKind::VoiceAndText.has_voice() && ChannelKind::VoiceAndText.has_text());
+    }
+
+    fn role_at(rank: u32, capabilities: Vec<Capability>) -> Permissions {
+        Permissions {
+            role: Some("test".into()),
+            rank,
+            capabilities,
+            owner: false,
+        }
+    }
+
+    #[test]
+    fn capabilities_are_explicit_not_implied_by_rank() {
+        // The reason capabilities exist separately from rank: "may mute but not
+        // kick" has to be expressible.
+        let muter = role_at(50, vec![Capability::MuteUsers]);
+        assert!(muter.allows(Capability::MuteUsers));
+        assert!(!muter.allows(Capability::KickUsers));
+    }
+
+    #[test]
+    fn an_equal_rank_cannot_be_acted_on() {
+        // Two moderators must not be able to kick each other.
+        let one = role_at(50, Capability::ALL.to_vec());
+        let two = role_at(50, Capability::ALL.to_vec());
+        assert!(!one.outranks(&two));
+        assert!(!two.outranks(&one));
+    }
+
+    #[test]
+    fn a_higher_rank_may_act_on_a_lower_one_but_not_the_reverse() {
+        let admin = role_at(100, Capability::ALL.to_vec());
+        let moderator = role_at(50, Capability::ALL.to_vec());
+        assert!(admin.outranks(&moderator));
+        assert!(!moderator.outranks(&admin));
+    }
+
+    #[test]
+    fn the_owner_outranks_everyone_and_is_never_outranked() {
+        // Promoting someone must not be a way to lose your own server.
+        let owner = Permissions {
+            role: None,
+            rank: 0,
+            capabilities: Vec::new(),
+            owner: true,
+        };
+        let admin = role_at(u32::MAX, Capability::ALL.to_vec());
+
+        assert!(owner.outranks(&admin), "despite holding rank 0");
+        assert!(!admin.outranks(&owner), "despite holding the highest rank");
+        for capability in Capability::ALL {
+            assert!(owner.allows(capability), "{capability:?}");
+        }
+    }
+
+    #[test]
+    fn a_user_without_a_role_may_do_nothing() {
+        let nobody = Permissions::none();
+        for capability in Capability::ALL {
+            assert!(!nobody.allows(capability), "{capability:?}");
+        }
+        assert!(!nobody.outranks(&Permissions::none()));
+    }
+
+    #[test]
+    fn control_message_variants_keep_their_wire_positions() {
+        // postcard encodes an enum by variant index, so inserting a variant
+        // rather than appending would silently reinterpret every message an
+        // older peer sends. This pins the first byte of a few known messages.
+        let encoded = postcard::to_stdvec(&ClientControl::LeaveChannel).unwrap();
+        assert_eq!(encoded[0], 2, "LeaveChannel must stay at index 2");
+
+        let encoded = postcard::to_stdvec(&ClientControl::Ping { nonce: 0 }).unwrap();
+        assert_eq!(encoded[0], 11, "Ping must stay at index 11");
     }
 }

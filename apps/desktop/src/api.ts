@@ -13,6 +13,21 @@ export interface Identity {
   nickname: string;
 }
 
+export interface VaultEntry {
+  fingerprint: string;
+  short: string;
+  securityLevel: number;
+  nickname: string;
+  /// Private note, never sent to a server.
+  label: string;
+}
+
+export interface IdentityList {
+  /// Fingerprint of the active identity.
+  active: string;
+  identities: VaultEntry[];
+}
+
 export interface Channel {
   id: number;
   parent: number | null;
@@ -51,6 +66,31 @@ export interface Session {
   users: User[];
 }
 
+/// Identifies one connection for the lifetime of the process. Never reused, so
+/// a stale id from a closed tab fails rather than addressing another server.
+export type SessionId = number;
+
+export interface Connection {
+  session: SessionId;
+  info: Session;
+  /// Fingerprint of the identity this connection signed in with, which need not
+  /// be the currently active one.
+  identity: string;
+}
+
+export interface SessionList {
+  sessions: Connection[];
+  /// Which connection the microphone feeds, if any.
+  voice: SessionId | null;
+}
+
+/// Who is audible, and where. Speaker ids only mean something within one
+/// server, so the session is part of the answer rather than assumed.
+export interface Speaking {
+  session: SessionId | null;
+  clients: number[];
+}
+
 export interface AudioDevice {
   name: string;
   isDefault: boolean;
@@ -78,15 +118,91 @@ export type ServerEvent =
   | { type: "serverError"; detail: string }
   | { type: "disconnected"; reason: string };
 
+export type GateMode = "voiceActivity" | "pushToTalk" | "continuous";
+
+export interface AudioSettings {
+  // Undefined means the system default device.
+  inputDevice: string | null;
+  outputDevice: string | null;
+  bitrate: number;
+  gateMode: GateMode;
+}
+
+/// Accelerators in Tauri's syntax, or null when unbound.
+export interface Keybinds {
+  pushToTalk: string | null;
+  toggleMute: string | null;
+  toggleDeafen: string | null;
+}
+
+/// A connection that was open when the app last recorded its state.
+///
+/// No password: bookmarks hold those, matched by address when reconnecting.
+export interface OpenConnection {
+  address: string;
+  /// Fingerprint of the identity it signed in with, so a restore returns as the
+  /// same person rather than as whoever happens to be active.
+  identity: string;
+}
+
+export interface Settings {
+  audio: AudioSettings;
+  keybinds: Keybinds;
+  connections: OpenConnection[];
+}
+
+export interface Bookmark {
+  id: number;
+  label: string;
+  address: string;
+  password?: string;
+  /// Fingerprint of the identity to connect with, when a particular one is
+  /// wanted for this server.
+  identity?: string;
+}
+
+export interface BookmarkInput {
+  [key: string]: unknown;
+  label: string;
+  address: string;
+  password?: string;
+  identity?: string;
+}
+
+export type KeybindAction = "pushToTalk" | "toggleMute" | "toggleDeafen";
+
+/// Whether the system actually let us grab a key. Not every platform allows it
+/// — see the note in the Rust `shortcuts` module.
+export interface BindingStatus {
+  action: KeybindAction;
+  accelerator: string;
+  registered: boolean;
+  error: string | null;
+}
+
+export interface VoiceState {
+  muted: boolean;
+  deafened: boolean;
+}
+
+export interface InputActivity {
+  levelDbfs: number;
+  /// Whether audio is actually going out, which the level alone cannot say: a
+  /// loud room with the gate shut moves the meter and sends nothing.
+  transmitting: boolean;
+}
+
 // The index signature is what `invoke` requires of its argument object; the
 // named fields are what actually keeps call sites honest.
+//
+// Audio is deliberately absent: devices and gate mode live in settings, which
+// can change them while connected.
 export interface ConnectRequest {
   [key: string]: unknown;
   address: string;
   password?: string;
-  inputDevice?: string;
-  outputDevice?: string;
-  pushToTalk: boolean;
+  /// Fingerprint of the identity to sign in with. Omitted means the active one.
+  identity?: string;
 }
 
 export const api = {
@@ -94,29 +210,75 @@ export const api = {
   setNickname: (nickname: string) => invoke<Identity>("set_nickname", { nickname }),
   mineIdentity: (targetLevel: number) => invoke<void>("mine_identity", { targetLevel }),
 
+  identities: () => invoke<IdentityList>("identities"),
+  addIdentity: (nickname: string, label: string) =>
+    invoke<IdentityList>("add_identity", { nickname, label }),
+  setActiveIdentity: (fingerprint: string) =>
+    invoke<IdentityList>("set_active_identity", { fingerprint }),
+  setIdentityLabel: (fingerprint: string, label: string) =>
+    invoke<IdentityList>("set_identity_label", { fingerprint, label }),
+  removeIdentity: (fingerprint: string) =>
+    invoke<IdentityList>("remove_identity", { fingerprint }),
+
   audioDevices: () => invoke<AudioDevices>("audio_devices"),
 
-  connect: (request: ConnectRequest) => invoke<Session>("connect", request),
-  disconnect: () => invoke<void>("disconnect"),
+  settings: () => invoke<Settings>("settings"),
+  setAudioSettings: (audio: AudioSettings) => invoke<void>("set_audio_settings", { audio }),
+  setKeybinds: (keybinds: Keybinds) => invoke<BindingStatus[]>("set_keybinds", { keybinds }),
+  keybindStatus: () => invoke<BindingStatus[]>("keybind_status"),
 
-  joinChannel: (channel: number) => invoke<void>("join_channel", { channel }),
-  sendMessage: (channel: number, content: string) =>
-    invoke<void>("send_message", { channel, content }),
+  // Runs the engine while disconnected so the audio tab has a live meter.
+  startAudioPreview: () => invoke<void>("start_audio_preview"),
+  stopAudioPreview: () => invoke<void>("stop_audio_preview"),
 
-  setMuted: (muted: boolean) => invoke<void>("set_muted", { muted }),
-  setDeafened: (deafened: boolean) => invoke<void>("set_deafened", { deafened }),
+  connect: (request: ConnectRequest) => invoke<Connection>("connect", request),
+  disconnect: (session: SessionId) => invoke<void>("disconnect", { session }),
+  sessions: () => invoke<SessionList>("sessions"),
+
+  // Voice lives on one connection at a time; this is the explicit move. Not
+  // called on tab switch — reading one server should not cut you out of a
+  // conversation on another.
+  setVoiceSession: (session: SessionId) => invoke<void>("set_voice_session", { session }),
+
+  joinChannel: (session: SessionId, channel: number) =>
+    invoke<void>("join_channel", { session, channel }),
+  sendMessage: (session: SessionId, channel: number, content: string) =>
+    invoke<void>("send_message", { session, channel, content }),
+
+  setMuted: (muted: boolean) => invoke<VoiceState>("set_muted", { muted }),
+  setDeafened: (deafened: boolean) => invoke<VoiceState>("set_deafened", { deafened }),
   setPushToTalkHeld: (held: boolean) => invoke<void>("set_push_to_talk_held", { held }),
+  voiceState: () => invoke<VoiceState>("voice_state"),
 
-  inputLevel: () => invoke<number>("input_level"),
-  speaking: () => invoke<number[]>("speaking"),
+  inputActivity: () => invoke<InputActivity>("input_activity"),
+  speaking: () => invoke<Speaking>("speaking"),
 
   knownServers: () =>
     invoke<{ address: string; name: string; fingerprint: string }[]>("known_servers"),
   forgetServer: (address: string) => invoke<void>("forget_server", { address }),
 
-  onServerEvent: (handler: (event: ServerEvent) => void): Promise<UnlistenFn> =>
-    listen<ServerEvent>("pickle:event", (e) => handler(e.payload)),
+  // Bookmarks are organisational; known servers above are security state. The
+  // two are deliberately separate — see the Rust `bookmarks` module.
+  bookmarks: () => invoke<Bookmark[]>("bookmarks"),
+  addBookmark: (bookmark: BookmarkInput) => invoke<Bookmark[]>("add_bookmark", { bookmark }),
+  updateBookmark: (id: number, bookmark: BookmarkInput) =>
+    invoke<Bookmark[]>("update_bookmark", { id, bookmark }),
+  removeBookmark: (id: number) => invoke<Bookmark[]>("remove_bookmark", { id }),
+
+  // Every event names the connection it came from, so the app can route it to
+  // the right tab rather than assuming there is only one.
+  onServerEvent: (
+    handler: (session: SessionId, event: ServerEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ session: SessionId; event: ServerEvent }>("pickle:event", (e) =>
+      handler(e.payload.session, e.payload.event),
+    ),
 
   onMiningProgress: (handler: (progress: MiningProgress) => void): Promise<UnlistenFn> =>
     listen<MiningProgress>("pickle:mining", (e) => handler(e.payload)),
+
+  // Voice state is pushed rather than tracked optimistically: a global shortcut
+  // can change it while this window is not even focused.
+  onVoiceState: (handler: (voice: VoiceState) => void): Promise<UnlistenFn> =>
+    listen<VoiceState>("pickle:voice-state", (e) => handler(e.payload)),
 };

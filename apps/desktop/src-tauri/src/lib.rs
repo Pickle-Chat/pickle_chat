@@ -9,13 +9,18 @@
 //! between the sound card and the network without going anywhere near
 //! JavaScript.
 
+mod bookmarks;
 mod bridge;
 mod commands;
 mod dto;
+mod mouse_grab;
+mod settings;
+mod shortcuts;
 mod state;
 
 pub use state::AppState;
 
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 pub fn run() {
@@ -29,22 +34,64 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(AppState::load().expect("could not open the local identity"))
+        .manage(shortcuts::Registry::default())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    shortcuts::handle(app, shortcut, event.state());
+                })
+                .build(),
+        )
+        .setup(|app| {
+            // Grab whatever was bound last time. A failure here is reported in
+            // the settings tab rather than stopping startup: the app is still
+            // perfectly usable with the in-window fallback.
+            for status in shortcuts::apply(app.handle()) {
+                if !status.registered {
+                    warn!(
+                        action = %status.action,
+                        accelerator = %status.accelerator,
+                        error = status.error.as_deref().unwrap_or("unknown"),
+                        "a saved shortcut could not be grabbed",
+                    );
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::identity_info,
+            commands::identities,
             commands::set_nickname,
+            commands::add_identity,
+            commands::set_active_identity,
+            commands::set_identity_label,
+            commands::remove_identity,
             commands::mine_identity,
             commands::audio_devices,
+            commands::settings,
+            commands::set_audio_settings,
+            commands::set_keybinds,
+            commands::start_audio_preview,
+            commands::stop_audio_preview,
             commands::connect,
             commands::disconnect,
+            commands::sessions,
+            commands::set_voice_session,
             commands::join_channel,
             commands::send_message,
             commands::set_muted,
             commands::set_deafened,
             commands::set_push_to_talk_held,
-            commands::input_level,
+            commands::voice_state,
+            commands::keybind_status,
+            commands::input_activity,
             commands::speaking,
             commands::known_servers,
             commands::forget_server,
+            commands::bookmarks,
+            commands::add_bookmark,
+            commands::update_bookmark,
+            commands::remove_bookmark,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Pickle desktop app");
