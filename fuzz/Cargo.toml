@@ -1,0 +1,58 @@
+[package]
+name = "pickle-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+# This crate is its own workspace root, deliberately.
+#
+# It lives inside the main repo but must not be a member of the root workspace:
+# `cargo test --workspace` and `cargo clippy --workspace --all-targets` would
+# otherwise try to build it on stable, where `libfuzzer-sys` links a sanitizer
+# runtime that is only available under nightly's `-Z sanitizer`. An empty
+# `[workspace]` table detaches it, so the root manifest needs no `exclude` entry
+# and the main build is unaffected.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.pickle-audio]
+path = "../crates/pickle-audio"
+
+[dependencies.pickle-proto]
+path = "../crates/pickle-proto"
+
+# cargo-fuzz builds the release profile. Assertions and overflow checks stay on:
+# the whole point is to trip an invariant before it becomes a silent wrong
+# answer, and line-level debug info makes the crash reports readable.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "voice_decode"
+path = "fuzz_targets/voice_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_decode_stream"
+path = "fuzz_targets/voice_decode_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_datagram"
+path = "fuzz_targets/voice_datagram.rs"
+test = false
+doc = false
+bench = false

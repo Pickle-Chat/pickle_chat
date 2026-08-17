@@ -155,6 +155,13 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+CI also audits dependencies against the [RUSTSEC](https://rustsec.org) advisory
+database — vulnerabilities fail the build, unmaintained and unsound advisories
+are reported in the run summary without blocking it — and fuzzes the code that
+parses bytes off the network: the Opus decoder and the voice datagram parsers.
+Both run weekly as well as per push, since a new advisory needs no commit to
+become relevant. See [`fuzz/`](fuzz) for running the fuzzers locally.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

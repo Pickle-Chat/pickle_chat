@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # New advisories are published against code that has not changed, so the
+  # audit has to run on a clock rather than only on a push. The scheduled run
+  # skips the build jobs (see the `if:` on each) and gives the fuzz targets a
+  # longer budget than a PR can afford to wait for.
+  schedule:
+    - cron: "17 4 * * 1"
 
 # A new push to a PR makes the previous run irrelevant.
 concurrency:
@@ -18,6 +24,7 @@ jobs:
   rustfmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,10 +32,17 @@ jobs:
           components: rustfmt
       # No compilation needed, so this fails fast and cheaply.
       - run: cargo fmt --all --check
+      # The fuzz crate is its own workspace, so `--all` above does not reach it.
+      # Checked here on stable rather than in the fuzz job, where nightly
+      # rustfmt would answer a slightly different question.
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
 
   test:
     name: build and test
     runs-on: ubuntu-latest
+    # The weekly run exists for the advisory database and the fuzzers; nothing
+    # about the build changes when nobody has pushed.
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
 
@@ -66,3 +80,156 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-audit reads Cargo.lock only: no toolchain pin, no system
+      # libraries, no compilation. Keep it that way — it is the one job that
+      # still answers on a tree that does not build.
+      #
+      # Why the binary rather than `rustsec/audit-check`: that action wraps the
+      # same tool but needs `checks: write` on GITHUB_TOKEN (which PRs from
+      # forks do not get), and it decides for itself what counts as a failure.
+      # Running the binary keeps the policy below explicit and, more usefully,
+      # makes it identical to what a developer runs locally.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Policy, part 1 — vulnerabilities block the build.
+      #
+      # Bare `cargo audit` exits non-zero for an advisory with a security
+      # impact and only warns for the informational classes (unmaintained,
+      # unsound, notice, yanked). That split is deliberate: a crate going
+      # unmaintained is not a reason to stop shipping today, and a policy that
+      # turns every such announcement into a red build teaches people to ignore
+      # red builds.
+      #
+      # An exception for a specific vulnerability goes here as
+      # `--ignore RUSTSEC-0000-0000`, with a comment saying why it does not
+      # reach us and what would let us drop it. Exactly one today:
+      #
+      # RUSTSEC-2023-0071 — Marvin attack, a timing sidechannel in `rsa`.
+      #   `rsa` is in Cargo.lock but in no build: it belongs to `sqlx-mysql`,
+      #   which sqlx lists as an optional dependency of the `any` driver and
+      #   which we never enable (we take `sqlite` and `postgres` only).
+      #   `cargo tree -i rsa --target all -e all` finds nothing, so no Pickle
+      #   binary contains this code. There is no fixed release to upgrade to.
+      #   Drop this the moment the MySQL driver is enabled, or when `rsa`
+      #   publishes a fix.
+      #
+      # The reporting step below runs *without* the ignore, so an advisory
+      # parked here still shows up in the run summary every time.
+      - name: Vulnerabilities
+        run: cargo audit --color always --ignore RUSTSEC-2023-0071
+
+      # Policy, part 2 — informational advisories are surfaced, not swallowed.
+      #
+      # `--deny warnings` promotes unmaintained/unsound/yanked to failures, and
+      # the absence of `--ignore` here means a parked vulnerability is listed
+      # again too. The step is allowed to fail so the findings land in the run
+      # summary and as an annotation instead of blocking the merge.
+      - name: Advisory warnings
+        id: warnings
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo audit --color never --deny warnings 2>&1 | tee "$RUNNER_TEMP/audit.txt"
+
+      - name: Report advisory warnings
+        if: steps.warnings.outcome == 'failure'
+        run: |
+          {
+            echo "### cargo audit: informational advisories"
+            echo
+            echo "Not blocking, but worth a look. Fix by updating the dependency,"
+            echo "or record a decision in the \`audit\` job of this workflow."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/audit.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=cargo audit::Informational advisories reported; see the job summary."
+
+  fuzz:
+    # A smoke run, not a campaign: enough to catch a regression that panics on
+    # the first mutation of a real packet, not enough to find anything deep.
+    # The weekly scheduled run gets a longer budget.
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # cargo-fuzz needs nightly for `-Z sanitizer`. Scoping that to this one job
+    # leaves the pinned stable toolchain in charge everywhere else, and
+    # RUSTUP_TOOLCHAIN is what actually makes it stick: rust-toolchain.toml at
+    # the repo root outranks `rustup default`, and this outranks the file.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `max_len` matches what the transport will actually deliver: a
+          # payload above MAX_OPUS_PACKET is rejected before the codec sees it,
+          # so generating longer inputs for the decoder targets only wastes
+          # budget. The datagram parser sees the header on top of that.
+          - target: voice_decode
+            max_len: 1275
+          - target: voice_decode_stream
+            max_len: 4096
+          - target: voice_datagram
+            max_len: 1285
+    steps:
+      - uses: actions/checkout@v4
+
+      # pickle-audio pulls in cpal, which needs ALSA headers. None of the
+      # WebKitGTK stack is needed: the fuzz crate depends on pickle-audio and
+      # pickle-proto only, never on the Tauri crate, so there is no frontend to
+      # build here either.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz-${{ matrix.target }}
+      # Built from source rather than fetched: cargo-fuzz publishes no prebuilt
+      # binaries, so an installer action would only fall back to compiling it
+      # anyway. `--locked` keeps the build reproducible, and rust-cache
+      # restores ~/.cargo/bin so this is a one-off cost per cache key.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/fuzz/corpus/${{ matrix.target }}"
+          # First path is where libFuzzer writes newly discovered inputs
+          # (thrown away with the runner); the second is the committed seed
+          # corpus of real encoder output, read-only. Without those seeds a
+          # cold fuzzer spends its whole budget guessing the Opus
+          # table-of-contents byte and never reaches the decoder proper.
+          # Absolute, because cargo-fuzz does not promise the target runs with
+          # this step's working directory.
+          cargo fuzz run "${{ matrix.target }}" \
+            "$GITHUB_WORKSPACE/fuzz/corpus/${{ matrix.target }}" \
+            "$GITHUB_WORKSPACE/fuzz/seeds/${{ matrix.target }}" \
+            -- \
+            -max_total_time=${{ github.event_name == 'schedule' && '600' || '60' }} \
+            -max_len=${{ matrix.max_len }} \
+            -timeout=10 \
+            -print_final_stats=1
+
+      # The crashing input is the whole bug report; without it the log says
+      # only that something panicked.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
