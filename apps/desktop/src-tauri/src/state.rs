@@ -159,6 +159,9 @@ pub struct AppState {
     /// and is deliberately not `Clone`. Long operations copy the key out instead
     /// of holding this — see `mine_identity`.
     pub vault: Mutex<Vault>,
+    /// Kept so the app can ask whether the vault is encrypted without holding
+    /// the lock, and before it has anything to unlock.
+    pub vault_path: PathBuf,
     pub trust_path: PathBuf,
     pub bookmarks_path: PathBuf,
     pub settings_path: PathBuf,
@@ -176,18 +179,31 @@ impl AppState {
     /// Open the vault, migrating a single-identity keystore or generating a
     /// first identity as needed.
     pub fn load() -> Result<Self, String> {
+        Self::load_with_passphrase(None)
+    }
+
+    /// Open a vault that may be encrypted.
+    ///
+    /// Separated from [`AppState::load`] so the passphrase has exactly one way
+    /// in. Nothing in the shipped UI calls this with a passphrase yet — see
+    /// [`AppState::set_vault_passphrase`] for why encryption cannot be offered
+    /// until there is a prompt to unlock with.
+    pub fn load_with_passphrase(passphrase: Option<&str>) -> Result<Self, String> {
         let dir = data_dir();
         let settings_path = dir.join(SETTINGS_FILE);
+        let vault_path = dir.join(VAULT_FILE);
 
-        let vault = Vault::open(
-            &dir.join(VAULT_FILE),
+        let vault = Vault::open_with_passphrase(
+            &vault_path,
             &dir.join(IDENTITY_FILE),
             &default_nickname(),
+            passphrase,
         )
         .map_err(|e| e.to_string())?;
 
         Ok(Self {
             vault: Mutex::new(vault),
+            vault_path,
             trust_path: dir.join(TRUST_FILE),
             bookmarks_path: dir.join(BOOKMARKS_FILE),
             settings: Mutex::new(Settings::load(&settings_path)),
@@ -216,6 +232,34 @@ impl AppState {
 
     pub fn persist_vault(&self) -> Result<(), String> {
         self.vault.lock().save().map_err(|e| e.to_string())
+    }
+
+    /// Whether the identity file is encrypted at rest.
+    pub fn vault_is_encrypted(&self) -> bool {
+        self.vault.lock().is_encrypted()
+    }
+
+    /// Turn passphrase protection on, change it, or (with `None`) turn it off.
+    ///
+    /// The vault verifies the new file decrypts before it replaces the old one,
+    /// so a failure here leaves the user's identities exactly as they were.
+    ///
+    /// # Not yet reachable from the UI, on purpose
+    ///
+    /// There is no unlock prompt at startup. Until there is, calling this with a
+    /// passphrase would produce a vault the next launch cannot open — the exact
+    /// lockout this whole feature is supposed to be careful about. The command
+    /// layer therefore does not expose it, and the remaining work is a window
+    /// shown before [`AppState::load_with_passphrase`] that collects the
+    /// passphrase, retries on [`pickle_identity::VaultError::Locked`], and
+    /// offers "forget it and start over" as an explicit, warned-about choice.
+    pub fn set_vault_passphrase(&self, passphrase: Option<&str>) -> Result<(), String> {
+        let mut vault = self.vault.lock();
+        match passphrase {
+            Some(passphrase) => vault.set_passphrase(passphrase),
+            None => vault.remove_passphrase(),
+        }
+        .map_err(|e| e.to_string())
     }
 
     /// A copy of the active identity, for signing a login.
