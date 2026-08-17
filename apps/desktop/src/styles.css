@@ -481,6 +481,22 @@ code.fingerprint {
   font-size: 13px;
 }
 
+/* A udev rule is long, and every character of it matters, so it is shown
+   verbatim and scrolled rather than wrapped. */
+.udev-rule {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  user-select: text;
+}
+
 .settings-pane p {
   margin: 0;
   font-size: 12px;
