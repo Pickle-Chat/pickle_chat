@@ -24,7 +24,20 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all"
+    "active": true,
+    "targets": ["deb", "dmg"],
+    "icon": ["icons/icon.png"],
+    "category": "Network",
+    "shortDescription": "Self-hosted voice and text chat",
+    "longDescription": "Self-hosted voice and text chat. You run the server, you own the data, and a user is an Ed25519 keypair rather than an account.",
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libasound2"
+        ]
+      }
+    }
   }
 }

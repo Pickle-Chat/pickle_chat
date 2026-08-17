@@ -1,0 +1,86 @@
+# Pickle server backed by Postgres.
+#
+# Worth it if you already run Postgres, want history on separate storage, or
+# want the backup and replication tooling. Otherwise prefer the SQLite example
+# next door — it is one fewer moving part for the same behaviour.
+#
+#   cp .env.example .env     # then edit it
+#   docker compose up -d
+#   docker compose run --rm pickle identity     # the fingerprint to share
+#
+# The same two warnings as the SQLite example apply, and are repeated below
+# because both are ways to lose a server.
+
+services:
+  pickle:
+    image: ghcr.io/pickle-chat/pickle-server:latest
+    restart: unless-stopped
+
+    depends_on:
+      db:
+        # Waits for Postgres to actually answer, not merely to have started.
+        # Without this the server loses the startup race, fails to open the
+        # database, and exits — which `restart` papers over as a crash loop that
+        # eventually succeeds, while filling the logs with errors that look
+        # like a real fault.
+        condition: service_healthy
+
+    ports:
+      # ── UDP, not TCP ──────────────────────────────────────────────────────
+      # QUIC is UDP. Without `/udp` this publishes a TCP port nothing connects
+      # to, and it presents as a timeout rather than a misconfiguration.
+      - "42071:42071/udp"
+
+    volumes:
+      # ── Still required, even with Postgres ────────────────────────────────
+      # History lives in Postgres, but the server's Ed25519 identity, its
+      # certificate, and its configuration do not — they stay here.
+      #
+      # Delete this volume and the server returns as a different server: every
+      # client that pinned the old identity refuses to reconnect and reports a
+      # possible impersonation. Backing up Postgres alone is not enough.
+      - pickle-data:/data
+
+    environment:
+      PICKLE_NAME: "My Pickle Server"
+      # The `db` hostname is the service name below, resolved on the compose
+      # network. sqlx picks Postgres over SQLite from the URL scheme.
+      PICKLE_DATABASE_URL: "postgres://pickle:${POSTGRES_PASSWORD}@db:5432/pickle"
+      # PICKLE_OWNER: "xxxx-xxxx-xxxx-..."
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: pickle
+      POSTGRES_DB: pickle
+      # From .env, never inline. Anything that can read this container's
+      # environment can read the password — `docker inspect` is enough — so
+      # keeping it out of a file committed to a repository is the least that
+      # should be done. A secrets manager is better still.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pickle -d pickle"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      # Generous, because a first run initialises the cluster before it answers.
+      start_period: 30s
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    # Not published. Nothing outside the compose network needs to reach
+    # Postgres, and exposing it is how a database ends up on the internet.
+
+volumes:
+  pickle-data:
+  postgres-data:
+
+# Do not put the Pickle service behind a reverse proxy.
+#
+# The certificate is self-signed by design, and authentication is bound to a
+# hash of that exact certificate, so a proxy terminating TLS breaks the check
+# that makes the connection trustworthy. Publish the UDP port directly.

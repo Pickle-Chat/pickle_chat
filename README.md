@@ -22,6 +22,21 @@ It prints the address to share and its identity fingerprint, writing its
 configuration and keys to a per-user data directory on first run. Share the
 address; anyone outside your network will need UDP forwarded to that port.
 
+Or with Docker:
+
+```bash
+docker run -d --name pickle -p 42071:42071/udp -v pickle-data:/data \
+  ghcr.io/pickle-chat/pickle-server:latest
+```
+
+The port must be published as **UDP** — Pickle speaks QUIC — and the volume
+holds the server's identity, so deleting it makes every client that pinned the
+old one refuse to reconnect. `docker run --rm -v pickle-data:/data
+ghcr.io/pickle-chat/pickle-server identity` prints the fingerprint to share.
+Worked SQLite and Postgres setups are in
+[`examples/compose`](examples/compose), and configuration can come from
+`PICKLE_*` environment variables instead of the config file.
+
 Run the desktop client:
 
 ```bash

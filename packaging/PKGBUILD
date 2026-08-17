@@ -1,0 +1,76 @@
+# Maintainer: Pickle-Chat <https://github.com/Pickle-Chat/pickle_chat>
+#
+# Tauri's bundler has no pacman backend — it produces deb, rpm, appimage, dmg,
+# app, msi and nsis — so Arch packaging is done here by hand rather than falling
+# out of `tauri build`.
+#
+# This builds from source. A `-bin` variant repackaging the released .deb would
+# install faster, but building from source is the AUR norm for a project this
+# size and avoids shipping Debian's library expectations onto Arch.
+#
+# Publishing to the AUR is a separate, deliberate step against the AUR git
+# repository. It is not automated: pushing a package to a public registry is not
+# something CI should do on a tag without someone deciding to.
+
+pkgname=pickle-chat
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Self-hosted voice and text chat with a TeamSpeak model and Discord-style text"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Pickle-Chat/pickle_chat"
+license=('MIT')
+
+# webkit2gtk-4.1 rather than 4.0: Tauri v2 links the newer API.
+depends=('webkit2gtk-4.1' 'gtk3' 'alsa-lib' 'libxdo' 'librsvg')
+makedepends=('rust' 'cargo' 'bun' 'pkgconf')
+
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # Replaced with the real checksum when a tag is published.
+
+prepare() {
+  cd "pickle_chat-$pkgver/apps/desktop"
+  bun install --frozen-lockfile
+}
+
+build() {
+  cd "pickle_chat-$pkgver"
+
+  # The frontend must exist before the Rust build: the Tauri crate's
+  # generate_context! embeds the built assets, so without dist/ the build fails
+  # during macro expansion rather than at link time.
+  cd apps/desktop
+  bun run build
+  cd ../..
+
+  cargo build --release --locked -p pickle-server
+  cargo build --release --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+}
+
+check() {
+  cd "pickle_chat-$pkgver"
+  # The desktop crate's tests need no display; the audio tests open no device.
+  cargo test --release --locked --workspace
+}
+
+package() {
+  cd "pickle_chat-$pkgver"
+
+  install -Dm755 target/release/pickle-server "$pkgdir/usr/bin/pickle-server"
+  install -Dm755 target/release/pickle-desktop "$pkgdir/usr/bin/pickle"
+
+  install -Dm644 apps/desktop/src-tauri/icons/icon.png \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/pickle.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/pickle.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Pickle
+Comment=Self-hosted voice and text chat
+Exec=pickle
+Icon=pickle
+Terminal=false
+Categories=Network;InstantMessaging;
+DESKTOP
+}
