@@ -57,6 +57,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub password: Option<String>,
 
+    /// Fingerprint of the server operator, who passes every permission check.
+    ///
+    /// Deliberately here rather than in the role store: a malformed or emptied
+    /// `roles.json` must not be able to lock someone out of their own server.
+    /// It is also not a race — unlike claiming ownership on first connection,
+    /// nobody can take it by reaching the port before you do.
+    ///
+    /// Accepts the hyphenated form the client shows in its titlebar.
+    #[serde(default)]
+    pub owner: Option<String>,
+
     #[serde(default = "default_max_users")]
     pub max_users: u32,
 
@@ -124,6 +135,7 @@ impl Default for ServerConfig {
             name: default_name(),
             min_security_level: default_min_security_level(),
             password: None,
+            owner: None,
             max_users: default_max_users(),
             channels: default_channels(),
         }

@@ -6,6 +6,7 @@
 //! machines to move a server without users noticing.
 
 pub mod config;
+pub mod roles;
 pub mod session;
 pub mod state;
 pub mod tls;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 const IDENTITY_FILE: &str = "identity.json";
+const ROLES_FILE: &str = "roles.json";
 
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -49,7 +51,10 @@ impl Server {
         let endpoint = quinn::Endpoint::server(quinn_config, config.bind)
             .with_context(|| format!("binding {}", config.bind))?;
 
-        let shared = Arc::new(Shared::new(config, loaded.identity, tls.cert_hash));
+        let roles = roles::Roles::open(&data_dir.join(ROLES_FILE))
+            .context("loading roles; fix or remove the file to start with none")?;
+
+        let shared = Arc::new(Shared::new(config, loaded.identity, tls.cert_hash, roles));
 
         Ok(Self { endpoint, shared })
     }

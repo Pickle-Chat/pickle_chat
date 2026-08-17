@@ -7,16 +7,18 @@
 //! therefore cannot stall the relay for everyone else.
 
 use crate::config::ServerConfig;
+use crate::roles::{RoleError, Roles};
 use parking_lot::RwLock;
 use pickle_identity::{Fingerprint, Identity, PublicIdentity};
 use pickle_proto::voice::VoiceUpstream;
 use pickle_proto::{
     AuthFailure, Channel, ChannelId, ChatMessage, ClientId, DisconnectReason, ErrorCode,
-    ServerControl, ServerLimits, UserInfo, VoiceState,
+    Permissions, Role, ServerControl, ServerLimits, UserInfo, VoiceState,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 /// Control frames queued for one client.
 pub type ControlSender = mpsc::UnboundedSender<ServerControl>;
@@ -58,11 +60,24 @@ pub struct Shared {
     pub cert_hash: [u8; 32],
     pub limits: ServerLimits,
     pub default_channel: ChannelId,
+    /// Who holds which role. Behind its own lock rather than inside `Inner`, so
+    /// resolving permissions on every administrative command does not contend
+    /// with the client and channel maps that voice relay reads.
+    roles: RwLock<Roles>,
+    /// Parsed once from the config. `None` when unset or unparseable — an
+    /// operator who mistypes their fingerprint gets a server with no owner,
+    /// which is recoverable, rather than one that refuses to start.
+    owner: Option<Fingerprint>,
     inner: RwLock<Inner>,
 }
 
 impl Shared {
-    pub fn new(config: ServerConfig, identity: Identity, cert_hash: [u8; 32]) -> Self {
+    pub fn new(
+        config: ServerConfig,
+        identity: Identity,
+        cert_hash: [u8; 32],
+        roles: Roles,
+    ) -> Self {
         let channels = build_channels(&config);
         let default_channel = channels
             .values()
@@ -76,12 +91,25 @@ impl Shared {
             ..ServerLimits::default()
         };
 
+        let owner = config.owner.as_deref().and_then(|raw| {
+            Fingerprint::parse(raw)
+                .inspect_err(|_| {
+                    warn!(
+                        fingerprint = raw,
+                        "owner fingerprint is not readable; nobody owns this server"
+                    )
+                })
+                .ok()
+        });
+
         Self {
             config,
             identity,
             cert_hash,
             limits,
             default_channel,
+            roles: RwLock::new(roles),
+            owner,
             inner: RwLock::new(Inner {
                 next_client_id: 1,
                 clients: HashMap::new(),
@@ -89,6 +117,32 @@ impl Shared {
                 next_message_id: 1,
             }),
         }
+    }
+
+    /// What this fingerprint may do here.
+    ///
+    /// The single place ownership and roles are combined, so no caller can
+    /// accidentally consult one without the other.
+    pub fn permissions(&self, fingerprint: Fingerprint) -> Permissions {
+        let owner = self.owner == Some(fingerprint);
+        self.roles.read().permissions(fingerprint, owner)
+    }
+
+    /// Grant or revoke a role, persisting the result.
+    ///
+    /// The capability and rank checks belong to the caller; this is the store.
+    pub fn assign_role(
+        &self,
+        fingerprint: Fingerprint,
+        role: Option<&str>,
+    ) -> Result<(), RoleError> {
+        let mut roles = self.roles.write();
+        roles.assign(fingerprint, role)?;
+        roles.save()
+    }
+
+    pub fn roles(&self) -> Vec<Role> {
+        self.roles.read().list().to_vec()
     }
 
     pub fn channels(&self) -> Vec<Channel> {
@@ -140,6 +194,10 @@ impl Shared {
                 reason: "nickname must contain at least one printable character".into(),
             })?;
 
+        // Resolved before taking the client lock, since it takes the role lock
+        // and holding both at once invites an ordering bug later.
+        let permissions = self.permissions(identity.fingerprint());
+
         let mut inner = self.inner.write();
         if inner.clients.len() >= self.config.max_users as usize {
             return Err(AuthFailure::ServerFull);
@@ -155,6 +213,7 @@ impl Shared {
             channel: Some(self.default_channel),
             voice: VoiceState::default(),
             connected_at_unix_ms: now_unix_ms(),
+            permissions,
         };
 
         inner.clients.insert(
@@ -447,6 +506,13 @@ mod tests {
         }
     }
 
+    /// A role store backed by a path that does not exist, so it starts from the
+    /// default ladder and never writes. Tests that need persistence open their
+    /// own store against a `tempdir`.
+    fn test_roles() -> Roles {
+        Roles::open(std::path::Path::new("/nonexistent/pickle-test/roles.json")).unwrap()
+    }
+
     fn test_config() -> ServerConfig {
         ServerConfig {
             min_security_level: 0,
@@ -479,7 +545,7 @@ mod tests {
     }
 
     fn shared() -> Shared {
-        Shared::new(test_config(), Identity::generate(), [0u8; 32])
+        Shared::new(test_config(), Identity::generate(), [0u8; 32], test_roles())
     }
 
     fn voice_frame(seq: u32) -> VoiceUpstream {
@@ -510,7 +576,7 @@ mod tests {
     fn an_identity_below_the_minimum_level_is_refused() {
         let mut config = test_config();
         config.min_security_level = 200; // unreachable
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let result = shared.admit(
@@ -529,7 +595,7 @@ mod tests {
     fn the_server_stops_admitting_at_capacity() {
         let mut config = test_config();
         config.max_users = 1;
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         join(&shared, "alice");
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -640,7 +706,7 @@ mod tests {
     fn voice_is_dropped_in_a_text_only_channel() {
         let mut config = test_config();
         config.channels[0].kind = ChannelKind::Text;
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
@@ -725,7 +791,7 @@ mod tests {
     fn a_full_channel_refuses_new_arrivals() {
         let mut config = test_config();
         config.channels[1].max_users = Some(1);
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
@@ -742,7 +808,7 @@ mod tests {
         // The occupant count must exclude the joiner, or a re-join would fail.
         let mut config = test_config();
         config.channels[1].max_users = Some(1);
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
         shared.join_channel(alice.info.client_id, 2).unwrap();
@@ -769,7 +835,7 @@ mod tests {
             max_users: None,
             order: 0,
         });
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32]);
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let channels = shared.channels();
         let lobby = channels.iter().find(|c| c.name == "Lobby").unwrap();
