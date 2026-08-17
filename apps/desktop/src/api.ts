@@ -180,6 +180,24 @@ export interface BindingStatus {
   error: string | null;
 }
 
+/// One mouse, identified the way a udev rule identifies it.
+export interface MouseDevice {
+  name: string;
+  vendor: string;
+  product: string;
+}
+
+/// A udev rule granting access to the mice Pickle cannot currently read.
+///
+/// The point of shipping this rather than telling people to join the `input`
+/// group: the group would hand every process they run a permanent read on every
+/// keyboard on the machine, where this grants one mouse to one session.
+export interface MouseAccess {
+  path: string;
+  rule: string;
+  devices: MouseDevice[];
+}
+
 export interface VoiceState {
   muted: boolean;
   deafened: boolean;
@@ -226,6 +244,7 @@ export const api = {
   setAudioSettings: (audio: AudioSettings) => invoke<void>("set_audio_settings", { audio }),
   setKeybinds: (keybinds: Keybinds) => invoke<BindingStatus[]>("set_keybinds", { keybinds }),
   keybindStatus: () => invoke<BindingStatus[]>("keybind_status"),
+  mouseUdevRule: () => invoke<MouseAccess | null>("mouse_udev_rule"),
 
   // Runs the engine while disconnected so the audio tab has a live meter.
   startAudioPreview: () => invoke<void>("start_audio_preview"),

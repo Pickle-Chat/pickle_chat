@@ -18,11 +18,12 @@
 //! the platform decides about the grab, which is the behaviour this whole module
 //! exists to guarantee.
 //!
-//! Mouse buttons are keyboard-only territory here: the shortcut layer has no
-//! notion of them, so a `Mouse4` binding is passed straight through as
-//! unregistered and the frontend is its whole implementation. Reaching a mouse
-//! button globally on Linux would mean reading the evdev device directly, which
-//! needs the user in the `input` group and is not attempted.
+//! Mouse buttons are outside this layer entirely: it has no notion of them, so
+//! a `Mouse4` binding is never handed to it. Reaching a mouse button globally
+//! on Linux means reading the evdev device, which [`crate::mouse_grab`] does —
+//! under a filter narrow enough that no device it opens can report a keystroke,
+//! and behind a udev rule scoped to the one mouse rather than the `input`
+//! group. Mouse bindings are collected here and passed to it.
 
 use crate::mouse_grab::{self, MouseGrab};
 use crate::state::{AppState, VoiceState};
