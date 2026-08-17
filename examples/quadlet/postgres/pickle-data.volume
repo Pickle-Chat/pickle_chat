@@ -1,0 +1,7 @@
+# Still required with Postgres. History lives in the database, but the server's
+# identity, certificate, and configuration do not — they stay here, and this is
+# the volume whose loss changes who the server is.
+[Volume]
+# Without this the volume is created as `systemd-pickle-data`, and every
+# documented `podman run -v pickle-data:...` command would address the wrong one.
+VolumeName=pickle-data

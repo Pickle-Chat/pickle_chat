@@ -153,8 +153,10 @@ impl Keystore {
     }
 }
 
+/// Shared with [`crate::vault`], which stores the same kind of secret material
+/// and must protect it identically.
 #[cfg(unix)]
-fn create_private(path: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn create_private(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
         .write(true)
@@ -165,14 +167,14 @@ fn create_private(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn create_private(path: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn create_private(path: &Path) -> std::io::Result<fs::File> {
     // Windows inherits the parent directory's ACL, which for a per-user app
     // data directory is already user-only.
     fs::File::create(path)
 }
 
 #[cfg(unix)]
-fn check_permissions(path: &Path) -> Result<(), KeystoreError> {
+pub(crate) fn check_permissions(path: &Path) -> Result<(), KeystoreError> {
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(path)
         .map_err(|source| KeystoreError::Io {
@@ -193,7 +195,7 @@ fn check_permissions(path: &Path) -> Result<(), KeystoreError> {
 }
 
 #[cfg(not(unix))]
-fn check_permissions(_path: &Path) -> Result<(), KeystoreError> {
+pub(crate) fn check_permissions(_path: &Path) -> Result<(), KeystoreError> {
     Ok(())
 }
 

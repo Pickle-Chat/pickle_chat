@@ -15,9 +15,9 @@
 //!   no reason.
 
 use crate::dto::EventDto;
-use pickle_audio::AudioEngine;
-use pickle_client::{Client, ClientEvent};
-use std::sync::Arc;
+use crate::state::{EngineSlot, SessionId, VoiceRoute};
+use pickle_client::ClientEvent;
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -28,9 +28,18 @@ pub const EVENT_CHANNEL: &str = "pickle:event";
 /// Forward encoded microphone frames to the server until the engine stops.
 ///
 /// Returns the thread handle; dropping the engine closes the channel, which
-/// ends the loop and lets the thread exit on its own.
+/// ends the loop and lets the thread exit on its own. That is also how a device
+/// change retires the pump belonging to the engine it replaced.
+///
+/// The route is consulted per frame rather than captured, so voice moving to
+/// another server — or the server holding it disconnecting — redirects the
+/// microphone without this thread being torn down and respawned.
+///
+/// With the route empty the frames are drained and dropped. The engine still
+/// has to be pumped in that case: its channel is unbounded, so leaving it unread
+/// while the settings dialog drives the input meter would grow without limit.
 pub fn spawn_capture_pump(
-    client: Arc<Client>,
+    voice: VoiceRoute,
     frames: std::sync::mpsc::Receiver<pickle_audio::engine::CapturedFrame>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -38,7 +47,9 @@ pub fn spawn_capture_pump(
         .spawn(move || {
             // Ends when the engine is dropped and the sender disconnects.
             while let Ok(frame) = frames.recv() {
-                client.send_voice(frame.seq, frame.flags, frame.payload);
+                if let Some(client) = voice.client() {
+                    client.send_voice(frame.seq, frame.flags, frame.payload);
+                }
             }
             debug!("capture pump finished");
         })
@@ -46,31 +57,69 @@ pub fn spawn_capture_pump(
 }
 
 /// Route incoming events: voice to the mixer, everything else to the UI.
+///
+/// Takes the engine slot rather than an engine, so that a device change swapping
+/// the engine underneath does not require tearing this task down and losing the
+/// event stream with it.
+///
+/// One pump runs per connection, and every event it emits is stamped with the
+/// session it came from — without that the frontend could not tell which tab a
+/// message belongs to.
 pub fn spawn_event_pump(
     app: AppHandle,
-    engine: Arc<AudioEngine>,
+    session: SessionId,
+    engine: EngineSlot,
+    voice: VoiceRoute,
     mut events: mpsc::UnboundedReceiver<ClientEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             // Voice never reaches JavaScript — straight into the mixer.
             if let ClientEvent::Voice(packet) = event {
-                engine.accept(packet);
+                // Only from the server holding voice. Another server's packets
+                // would land in the same mixer under ids that mean something
+                // else there, mixing two different people together.
+                if voice.session() != Some(session) {
+                    continue;
+                }
+                // Absent only in the gap while devices are being reopened;
+                // dropping a 20 ms frame there is the right outcome.
+                if let Some(engine) = engine.current() {
+                    engine.accept(packet);
+                }
                 continue;
             }
 
             let terminal = matches!(event, ClientEvent::Disconnected { .. });
 
-            if let Some(payload) = EventDto::from_event(&event) {
-                if let Err(e) = app.emit(EVENT_CHANNEL, payload) {
+            if let Some(event) = EventDto::from_event(&event) {
+                if let Err(e) = app.emit(EVENT_CHANNEL, SessionEvent { session, event }) {
                     debug!(error = %e, "could not emit an event to the frontend");
                 }
             }
 
             if terminal {
+                // Dropped by the server rather than by us, so nothing has
+                // released voice. Left alone, the microphone would keep feeding
+                // a dead connection and push to talk would look broken until
+                // the tab was closed by hand.
+                if voice.clear_if(session) {
+                    if let Some(engine) = engine.current() {
+                        engine.clear_speakers();
+                    }
+                    debug!(session, "voice released by a dropped connection");
+                }
                 break;
             }
         }
-        debug!("event pump finished");
+        debug!(session, "event pump finished");
     })
+}
+
+/// An event and the connection it came from.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvent {
+    pub session: SessionId,
+    pub event: EventDto,
 }

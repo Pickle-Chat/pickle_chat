@@ -191,9 +191,49 @@ code.fingerprint {
 }
 
 /* The speaking indicator — the single most useful signal in a voice app. */
+.occupants li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0;
+}
+
 .occupants li.speaking {
   color: var(--accent);
   font-weight: 600;
+}
+
+.occupant-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Always present, so a name does not shift sideways when someone starts
+   talking. Only its fill changes. */
+.talk-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--line);
+}
+
+.talk-dot.on {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+
+/* Available to a screen reader, absent from the visual layout. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .chat {
@@ -329,4 +369,349 @@ code.fingerprint {
   align-items: baseline;
   padding: 4px 0;
   border-bottom: 1px solid var(--line);
+}
+
+/* --- settings ------------------------------------------------------------ */
+
+.titlebar .icon {
+  background: none;
+  border: none;
+  font-size: 16px;
+  padding: 2px 6px;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.titlebar .icon:hover {
+  color: var(--text);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 55%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 45%);
+  display: flex;
+  flex-direction: column;
+  max-height: 80vh;
+}
+
+.modal > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings {
+  width: 620px;
+}
+
+.settings-body {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  min-height: 0;
+}
+
+.settings-tabs {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--line);
+  padding: 8px 0;
+}
+
+.settings-tabs button {
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  text-align: left;
+  padding: 8px 14px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.settings-tabs button.active {
+  color: var(--text);
+  border-left-color: var(--accent);
+  background: var(--panel-2);
+}
+
+.settings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.settings-pane label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-pane label.row {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+.settings-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.settings-pane p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.settings-pane select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+
+.keybind-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.keybind-row > button:first-child {
+  min-width: 200px;
+  text-align: left;
+  font-family: ui-monospace, monospace;
+}
+
+.keybind-row button.capturing {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.bookmark-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.bookmark-list li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.bookmark-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.bookmark-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.bookmark-form .row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.identity-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.identity-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.identity-row.active {
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+}
+
+.identity-row button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.settings-pane button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* --- transmit indicator --------------------------------------------------- */
+
+.level-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meter-fill.transmitting {
+  background: var(--accent);
+}
+
+.transmit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.transmit-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--line);
+  flex: none;
+}
+
+.transmit.live {
+  color: var(--accent);
+}
+
+.transmit.live .transmit-dot {
+  background: var(--accent);
+  /* A steady dot reads as a status light rather than an alert; the colour
+     change is the signal, so no animation is needed to notice it. */
+  box-shadow: 0 0 6px var(--accent);
+}
+
+/* Open but going nowhere — worth distinguishing from actually being heard. */
+.transmit.open .transmit-dot {
+  background: transparent;
+  border: 2px solid var(--accent);
+  width: 10px;
+  height: 10px;
+}
+
+/* --- connection tabs ------------------------------------------------------ */
+
+.tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 8px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+}
+
+.tab > button {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 8px 4px 8px 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* A connection the server dropped. Kept so the reason stays readable. */
+.tab.dead > button {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.tab-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 8px 8px 8px 2px;
+  font-size: 14px;
+}
+
+.tab-close:hover {
+  color: var(--danger);
+}
+
+.tab-unread {
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 9px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.tab-voice {
+  font-size: 11px;
+}
+
+.tab.add {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 16px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.tab.add.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.tab-note {
+  align-self: center;
+  font-size: 12px;
+  padding-left: 8px;
+}
+
+.voice p {
+  font-size: 12px;
+  margin: 0;
 }

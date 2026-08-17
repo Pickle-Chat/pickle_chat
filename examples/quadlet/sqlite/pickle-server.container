@@ -1,0 +1,52 @@
+# Pickle server, SQLite backend. One container, one volume, no database to run.
+#
+#   cp examples/quadlet/sqlite/* ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start pickle-server
+#
+# See ../README.md — in particular `loginctl enable-linger`, without which this
+# stops when you log out.
+
+[Unit]
+Description=Pickle voice and chat server
+Documentation=https://github.com/Pickle-Chat/pickle_chat
+
+[Container]
+Image=ghcr.io/pickle-chat/pickle-server:latest
+
+# QUIC is UDP. Without the /udp suffix this publishes a TCP port that nothing
+# connects to, and the failure looks like a firewall rather than a typo.
+PublishPort=42071:42071/udp
+
+# Identity, certificate, configuration, and the SQLite database. Losing this
+# means losing the identity every client has pinned.
+Volume=pickle-data.volume:/data
+
+# The image already runs as its `nonroot` user; this keeps that mapping sane
+# for a rootless service writing the volume.
+UserNS=keep-id
+
+Environment="PICKLE_NAME=My Pickle Server"
+
+# Raising this makes throwaway identities expensive. 8 is a fraction of a
+# second; 20 or more is worth it for a server anyone can reach.
+Environment=PICKLE_MIN_SECURITY_LEVEL=8
+
+# Your own fingerprint, from the desktop client's titlebar. The owner passes
+# every permission check.
+#Environment=PICKLE_OWNER=xxxx-xxxx-xxxx-...
+
+# A server password is a secret, so it comes from podman rather than from this
+# file, which is world-readable in your home directory:
+#   podman secret create pickle-password -
+#Secret=pickle-password,type=env,target=PICKLE_PASSWORD
+
+# Pull a newer image when one is published:
+#   systemctl --user start podman-auto-update.timer
+AutoUpdate=registry
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

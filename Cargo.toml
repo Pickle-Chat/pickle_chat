@@ -38,6 +38,23 @@ zeroize = "1"
 # --- serialization ---------------------------------------------------------
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# --- storage ----------------------------------------------------------------
+# The `any` driver so one code path serves SQLite and Postgres, chosen at
+# runtime from the connection URL. `tls-rustls-ring` rather than the default
+# backend for the same reason quinn uses ring above: aws-lc-rs wants cmake and
+# nasm at build time.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "any",
+    "sqlite",
+    "postgres",
+    "migrate",
+    # For `migrate!` only. The `query!` family is unusable here anyway, since it
+    # checks against a single backend at compile time.
+    "macros",
+] }
 postcard = { version = "1", features = ["alloc", "use-std"] }
 toml = "0.8"
 data-encoding = "2"

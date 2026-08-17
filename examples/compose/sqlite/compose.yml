@@ -1,0 +1,66 @@
+# Pickle server with the default SQLite backend.
+#
+# One container, one volume, no database to run. This is what most self-hosted
+# servers want: SQLite handles a chat server's write volume comfortably, and it
+# is one less thing to back up, upgrade, or lose.
+#
+#   docker compose up -d
+#   docker compose run --rm pickle identity     # the fingerprint to share
+#
+# Two things are easy to get wrong and expensive to get wrong. Both are marked
+# below.
+
+services:
+  pickle:
+    image: ghcr.io/pickle-chat/pickle-server:latest
+    restart: unless-stopped
+
+    ports:
+      # ── UDP, not TCP ──────────────────────────────────────────────────────
+      # Pickle speaks QUIC, which is UDP. Without the `/udp` suffix Docker
+      # publishes a TCP port that nothing ever connects to, and the symptom is
+      # a client that times out as though a firewall were in the way.
+      - "42071:42071/udp"
+
+    volumes:
+      # ── This volume is the server's identity ──────────────────────────────
+      # It holds the Ed25519 keypair clients pin on first contact, alongside the
+      # certificate, configuration, and message history.
+      #
+      # Delete it and the server comes back as a different server. Every client
+      # that connected before will refuse to reconnect and report that the
+      # identity changed — which is correct, and is exactly what would happen if
+      # someone were impersonating you. Recovering means every user verifying
+      # the new fingerprint out of band.
+      #
+      # Back it up.
+      - pickle-data:/data
+
+    environment:
+      # Everything here is optional; the server writes a working config.toml on
+      # first run. These override it without editing the file.
+      PICKLE_NAME: "My Pickle Server"
+
+      # Raising this makes throwaway identities expensive. 8 is a fraction of a
+      # second; 20 or more is worth it for a server anyone can reach.
+      PICKLE_MIN_SECURITY_LEVEL: "8"
+
+      # Your own fingerprint, from the desktop client's titlebar. The owner
+      # passes every permission check, and is deliberately set here rather than
+      # in the role store so a broken roles file cannot lock you out.
+      # PICKLE_OWNER: "xxxx-xxxx-xxxx-..."
+
+      # A shared secret gating the whole server, separate from identity. Prefer
+      # a `.env` file over writing it here — see the postgres example.
+      # PICKLE_PASSWORD: "..."
+
+volumes:
+  pickle-data:
+
+# Do not put this behind nginx, Caddy, or any reverse proxy.
+#
+# There is no TLS for a proxy to usefully terminate. The certificate is
+# self-signed by design — a self-hosted server has no domain a public CA would
+# vouch for — and authentication is bound to a hash of that exact certificate.
+# A proxy presenting its own certificate breaks the check that makes the
+# connection trustworthy in the first place. Publish the UDP port directly.

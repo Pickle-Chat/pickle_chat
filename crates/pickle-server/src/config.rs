@@ -29,6 +29,12 @@ pub enum ConfigError {
     },
     #[error("configuration is invalid: {0}")]
     Invalid(String),
+    #[error("{key}={value:?} is not valid: {detail}")]
+    Env {
+        key: String,
+        value: String,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,8 +63,49 @@ pub struct ServerConfig {
     #[serde(default)]
     pub password: Option<String>,
 
+    /// Fingerprint of the server operator, who passes every permission check.
+    ///
+    /// Deliberately here rather than in the role store: a malformed or emptied
+    /// `roles.json` must not be able to lock someone out of their own server.
+    /// It is also not a race — unlike claiming ownership on first connection,
+    /// nobody can take it by reaching the port before you do.
+    ///
+    /// Accepts the hyphenated form the client shows in its titlebar.
+    #[serde(default)]
+    pub owner: Option<String>,
+
     #[serde(default = "default_max_users")]
     pub max_users: u32,
+
+    /// Where durable state lives.
+    ///
+    /// Unset means a SQLite file in the data directory, which is what a
+    /// self-hosted server wants by default. Set it to a `postgres://` URL to
+    /// use Postgres instead.
+    #[serde(default)]
+    pub database_url: Option<String>,
+
+    /// Whether the server keeps chat history at all.
+    ///
+    /// Reported to clients through `ServerLimits`, so one that keeps nothing
+    /// can say so rather than answering every history request with silence.
+    #[serde(default = "default_history_enabled")]
+    pub history_enabled: bool,
+
+    /// Discard messages older than this many days. Unset keeps them forever.
+    ///
+    /// Unlimited by default: a self-hosted operator should decide what their
+    /// own disk keeps, and quietly discarding what people assume is kept is the
+    /// worse surprise.
+    #[serde(default)]
+    pub history_retention_days: Option<u32>,
+
+    /// Keep at most this many messages in each channel. Unset is unlimited.
+    ///
+    /// Per channel rather than server-wide, so a busy channel cannot evict a
+    /// quiet one's entire history.
+    #[serde(default)]
+    pub history_max_messages_per_channel: Option<u32>,
 
     #[serde(default = "default_channels")]
     pub channels: Vec<ChannelConfig>,
@@ -90,6 +137,10 @@ fn default_name() -> String {
 fn default_min_security_level() -> u32 {
     8
 }
+fn default_history_enabled() -> bool {
+    true
+}
+
 fn default_max_users() -> u32 {
     64
 }
@@ -124,7 +175,12 @@ impl Default for ServerConfig {
             name: default_name(),
             min_security_level: default_min_security_level(),
             password: None,
+            owner: None,
             max_users: default_max_users(),
+            database_url: None,
+            history_enabled: default_history_enabled(),
+            history_retention_days: None,
+            history_max_messages_per_channel: None,
             channels: default_channels(),
         }
     }
@@ -144,18 +200,92 @@ impl ServerConfig {
         Ok(config)
     }
 
-    /// Load, or write out the defaults and use those.
+    /// Load, or write out the defaults and use those, then apply the
+    /// environment.
+    ///
+    /// The environment is applied *after* any save, deliberately. Writing it
+    /// into the file would bake a one-off `PICKLE_NAME` from a single container
+    /// run into the server's permanent configuration, where it would keep
+    /// applying long after the variable was gone.
     pub fn load_or_create(path: &Path) -> Result<Self, ConfigError> {
-        match Self::load(path) {
+        let mut config = match Self::load(path) {
             Err(ConfigError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 let config = Self::default();
                 config.save(path)?;
-                Ok(config)
+                config
             }
-            other => other,
+            other => other?,
+        };
+
+        config.apply_env_from(|key| std::env::var(key).ok())?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Overlay `PICKLE_*` variables onto the configuration.
+    ///
+    /// Takes a lookup rather than reading the process environment directly, so
+    /// the precedence rules can be tested without mutating global state that
+    /// every other test in the binary shares.
+    ///
+    /// An unparseable value is an error rather than a fallback: a mistyped
+    /// `PICKLE_BIND` in a compose file should stop the server, not leave it
+    /// quietly listening somewhere nobody expects. An *empty* value is treated
+    /// as absent, because an unset `${VAR}` in a compose file expands to one and
+    /// almost never means "set this to nothing".
+    pub fn apply_env_from(
+        &mut self,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
+        let read = |name: &str| -> Option<(String, String)> {
+            let key = format!("PICKLE_{name}");
+            get(&key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| (key, value))
+        };
+
+        let invalid =
+            |key: String, value: String, detail: &dyn std::fmt::Display| ConfigError::Env {
+                key,
+                value,
+                detail: detail.to_string(),
+            };
+
+        if let Some((key, value)) = read("BIND") {
+            self.bind = value.parse().map_err(|e| invalid(key, value.clone(), &e))?;
         }
+
+        if let Some((_, value)) = read("NAME") {
+            self.name = value;
+        }
+
+        if let Some((key, value)) = read("MIN_SECURITY_LEVEL") {
+            self.min_security_level = value.parse().map_err(|e| invalid(key, value.clone(), &e))?;
+        }
+
+        if let Some((_, value)) = read("PASSWORD") {
+            self.password = Some(value);
+        }
+
+        if let Some((key, value)) = read("OWNER") {
+            // Checked here even though a bad owner in the *file* only warns.
+            // A file may be hand-edited and refusing to start would be a poor
+            // trade, but an environment variable is set deliberately by whoever
+            // deployed this, and a typo silently leaving the server with no
+            // owner is worse than a loud failure.
+            pickle_identity::Fingerprint::parse(&value)
+                .map_err(|e| invalid(key, value.clone(), &e))?;
+            self.owner = Some(value);
+        }
+
+        if let Some((_, value)) = read("DATABASE_URL") {
+            self.database_url = Some(value);
+        }
+
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
@@ -325,5 +455,116 @@ mod tests {
         assert_eq!(config.name, default_name());
         // Second call must read the file rather than overwrite it.
         assert!(ServerConfig::load_or_create(&path).is_ok());
+    }
+
+    /// A lookup over a fixed set of pairs, standing in for the process
+    /// environment so these tests do not race each other through it.
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_environment_overrides_the_file() {
+        let mut config = ServerConfig {
+            name: "From File".into(),
+            ..ServerConfig::default()
+        };
+
+        config
+            .apply_env_from(env(&[
+                ("PICKLE_NAME", "From Env"),
+                ("PICKLE_BIND", "127.0.0.1:9999"),
+                ("PICKLE_DATABASE_URL", "postgres://db/pickle"),
+                ("PICKLE_MIN_SECURITY_LEVEL", "20"),
+            ]))
+            .unwrap();
+
+        assert_eq!(config.name, "From Env");
+        assert_eq!(config.bind.to_string(), "127.0.0.1:9999");
+        assert_eq!(config.database_url.as_deref(), Some("postgres://db/pickle"));
+        assert_eq!(config.min_security_level, 20);
+    }
+
+    #[test]
+    fn the_file_wins_where_no_variable_is_set() {
+        let mut config = ServerConfig {
+            name: "From File".into(),
+            min_security_level: 12,
+            ..ServerConfig::default()
+        };
+
+        config.apply_env_from(env(&[])).unwrap();
+
+        assert_eq!(config.name, "From File");
+        assert_eq!(config.min_security_level, 12);
+        assert_eq!(config.database_url, None);
+    }
+
+    #[test]
+    fn an_unparseable_value_stops_the_server_rather_than_falling_back() {
+        // A mistyped bind address in a compose file must not leave the server
+        // quietly listening somewhere nobody expects.
+        let mut config = ServerConfig::default();
+        let original = config.bind;
+
+        let error = config
+            .apply_env_from(env(&[("PICKLE_BIND", "not-an-address")]))
+            .expect_err("a bad address must be refused");
+
+        assert!(matches!(error, ConfigError::Env { .. }));
+        assert!(
+            error.to_string().contains("PICKLE_BIND"),
+            "the message must name the variable: {error}",
+        );
+        assert_eq!(config.bind, original, "and must not half-apply");
+    }
+
+    #[test]
+    fn an_empty_value_is_treated_as_absent() {
+        // An unset ${VAR} in a compose file expands to an empty string, which
+        // almost never means "set this to nothing".
+        let mut config = ServerConfig {
+            name: "From File".into(),
+            ..ServerConfig::default()
+        };
+
+        config
+            .apply_env_from(env(&[("PICKLE_NAME", ""), ("PICKLE_PASSWORD", "   ")]))
+            .unwrap();
+
+        assert_eq!(config.name, "From File");
+        assert_eq!(config.password, None);
+    }
+
+    #[test]
+    fn a_malformed_owner_fingerprint_is_refused() {
+        let mut config = ServerConfig::default();
+        let error = config
+            .apply_env_from(env(&[("PICKLE_OWNER", "not-a-fingerprint")]))
+            .expect_err("a typo here would silently leave the server ownerless");
+        assert!(matches!(error, ConfigError::Env { .. }));
+    }
+
+    #[test]
+    fn load_or_create_does_not_write_the_environment_into_the_file() {
+        // Otherwise a one-off variable from a single container run would be
+        // baked in permanently, still applying long after it was gone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        ServerConfig::load_or_create(&path).unwrap();
+        let written: ServerConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(
+            written.name,
+            ServerConfig::default().name,
+            "the saved file holds defaults, not whatever the environment said",
+        );
     }
 }

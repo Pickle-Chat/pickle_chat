@@ -21,6 +21,9 @@ pickle-client.workspace = true
 pickle-audio.workspace = true
 
 tauri = { version = "2", features = [] }
+# Push-to-talk has to work while a game has focus, which an in-window key
+# listener cannot do.
+tauri-plugin-global-shortcut = "2"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -28,3 +31,13 @@ parking_lot.workspace = true
 directories.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+thiserror.workspace = true
+
+# Reading the mouse's input device directly is the only way to see a thumb
+# button while another application has focus; the shortcut layer is
+# keyboard-only. Linux-only, so other platforms do not carry the dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
