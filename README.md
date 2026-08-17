@@ -106,7 +106,7 @@ happen. See the [known issues](#what-works-today) for what is not wired up yet.
 | --- | --- |
 | [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, single-key keystore and multi-identity vault (optionally passphrase-encrypted) |
 | [`pickle-proto`](crates/pickle-proto) | Wire protocol: control messages, framing, voice datagram encoding |
-| [`pickle-audio`](crates/pickle-audio) | Opus encode/decode, jitter buffering, voice gating, mixing |
+| [`pickle-audio`](crates/pickle-audio) | Opus encode/decode, jitter buffering, voice gating, mixing, device resampling |
 | [`pickle-server`](crates/pickle-server) | The server: QUIC, authentication, channels, voice relay |
 | [`pickle-client`](crates/pickle-client) | Client core: connection, identity pinning, event stream |
 | [`apps/desktop`](apps/desktop) | Tauri desktop client (Rust + React) |
@@ -160,7 +160,13 @@ Known issues:
   configured number on the wire. The encoder is not ignoring the setting: Opus
   bitrate is a VBR target rather than a ceiling, and asking for CBR instead hits
   it exactly. Budget from the measured rate, not from `DEFAULT_BITRATE`.
-- Audio devices must support 48 kHz natively; there is no resampling.
+- **Resampling is unverified on real hardware.** Devices that do not run at
+  48 kHz are converted at the device boundary by
+  [`resample.rs`](crates/pickle-audio/src/resample.rs), so they are no longer
+  refused. The converter is tested thoroughly on synthetic signals, and the
+  playback path is tested end to end against the native path — but every
+  machine it has run on so far had a 48 kHz device, so the code that opens a
+  44.1 kHz stream has never actually opened one.
 - **Global keys are not guaranteed.** The keyboard grab goes through X11, so a
   key your layout cannot produce is refused, and a Wayland session may not
   deliver the key while another window has focus. The settings tab marks any
