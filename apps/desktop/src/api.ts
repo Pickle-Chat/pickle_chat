@@ -94,7 +94,12 @@ export interface Speaking {
 export interface AudioDevice {
   name: string;
   isDefault: boolean;
+  /// False only when the device offers no sample format Pickle can read. A
+  /// device running at some rate other than 48 kHz is converted, not refused.
   usable: boolean;
+  /// The rate the device would be opened at, or null if it could not be
+  /// queried. Anything but 48000 means a conversion sits in the path.
+  sampleRate: number | null;
 }
 
 export interface AudioDevices {

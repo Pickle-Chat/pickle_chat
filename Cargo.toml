@@ -91,6 +91,11 @@ codegen-units = 1
 # path drops frames without this.
 [profile.dev.package.rusty-opus]
 opt-level = 3
+# Same reason: the resampler is a tight multiply-add loop over the sinc kernel,
+# and an unoptimised build of it costs around ten times what it should inside a
+# real-time callback.
+[profile.dev.package.pickle-audio]
+opt-level = 3
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
 [profile.dev.package.ed25519-dalek]
