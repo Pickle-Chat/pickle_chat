@@ -135,14 +135,23 @@ Not yet built:
 
 Known issues:
 
-- **Opus FEC is disabled.** The pure-Rust codec produces badly corrupted audio
-  with in-band forward error correction enabled — a steady tone decodes with its
-  energy swinging between 0.02× and 3.4×. Every other configuration is correct.
-  Loss is handled by the jitter buffer and concealment alone, which recovers
-  less gracefully from bursts. See `USE_INBAND_FEC` in
-  [`codec.rs`](crates/pickle-audio/src/codec.rs); switching to C libopus would
-  also resolve it.
-- The encoder overshoots its bitrate target by roughly a third.
+- **Opus FEC is disabled, because of an upstream bug.** Enabling in-band forward
+  error correction corrupts the *ordinary* decode: a steady tone comes back with
+  its energy swinging between 0.02× and 5.2×. The cause is in rusty-opus 0.9.1,
+  not in how Pickle configures it — its SILK encoder writes the redundant LBRR
+  frames without the LTP-scale symbol that its own decoder reads back, so the
+  range decoder ends up one symbol out of step and everything after it, starting
+  with the real frame's gains, decodes as garbage. It reproduces in both hybrid
+  and SILK-only mode, and FEC recovery is equally wrong, so no encoder setting
+  works around it. Loss is handled by the jitter buffer and concealment alone,
+  which recovers less gracefully from bursts. See `USE_INBAND_FEC` in
+  [`codec.rs`](crates/pickle-audio/src/codec.rs) for the full trace; the fix
+  belongs upstream, and switching to C libopus would give up the pure-Rust build.
+- **Voice uses more bandwidth than the configured bitrate**, by about 16% for the
+  Opus payload plus a 10-byte header on every 20 ms datagram — roughly 1.3× the
+  configured number on the wire. The encoder is not ignoring the setting: Opus
+  bitrate is a VBR target rather than a ceiling, and asking for CBR instead hits
+  it exactly. Budget from the measured rate, not from `DEFAULT_BITRATE`.
 - Audio devices must support 48 kHz natively; there is no resampling.
 - **Global keys are not guaranteed.** The keyboard grab goes through X11, so a
   key your layout cannot produce is refused, and a Wayland session may not
