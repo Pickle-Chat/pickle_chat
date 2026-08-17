@@ -34,8 +34,10 @@ holds the server's identity, so deleting it makes every client that pinned the
 old one refuse to reconnect. `docker run --rm -v pickle-data:/data
 ghcr.io/pickle-chat/pickle-server identity` prints the fingerprint to share.
 Worked SQLite and Postgres setups are in
-[`examples/compose`](examples/compose), and configuration can come from
-`PICKLE_*` environment variables instead of the config file.
+[`examples/compose`](examples/compose), or as podman
+[quadlets](examples/quadlet) if you would rather systemd supervised it.
+Configuration can come from `PICKLE_*` environment variables instead of the
+config file.
 
 Run the desktop client:
 

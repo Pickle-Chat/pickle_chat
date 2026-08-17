@@ -1,0 +1,45 @@
+# Postgres for the Pickle server. Not published: nothing outside this network
+# needs to reach it, and publishing it is how a database ends up on the
+# internet.
+#
+# Create the password as a podman secret before starting, so it is not sitting
+# in a world-readable file in your home directory:
+#
+#   PW=$(openssl rand -base64 32 | tr -d '/+=')
+#   printf '%s' "$PW" | podman secret create pickle-db-password -
+#
+# The server needs the same password inside a connection URL; see
+# pickle-server.container, which keeps the assembled URL as its own secret.
+
+[Unit]
+Description=Postgres for the Pickle server
+
+[Container]
+Image=docker.io/library/postgres:16-alpine
+# Fixed, because the connection URL names this host. Left to quadlet it would
+# be `systemd-pickle-db` and the server could not resolve it.
+ContainerName=pickle-db
+Network=pickle.network
+Volume=pickle-db.volume:/var/lib/postgresql/data
+
+Environment=POSTGRES_USER=pickle
+Environment=POSTGRES_DB=pickle
+Secret=pickle-db-password,type=env,target=POSTGRES_PASSWORD
+
+# `Notify=healthy` is what makes the ordering real: systemd treats this unit as
+# started only once the healthcheck passes, so the server's After=/Requires=
+# waits for a database that actually answers rather than one that has merely
+# been launched. Without it the server loses the race and exits, and the restart
+# policy turns that into a crash loop that eventually succeeds while filling the
+# journal with errors that look like a fault.
+HealthCmd=pg_isready -U pickle -d pickle
+HealthInterval=5s
+HealthRetries=10
+HealthStartPeriod=30s
+Notify=healthy
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

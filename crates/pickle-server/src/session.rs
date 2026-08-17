@@ -456,8 +456,6 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
             );
         }
 
-        // History needs persistence, which is not built yet. Answering with an
-        // empty, complete page is honest: there is nothing stored to return.
         ClientControl::FetchHistory {
             channel,
             before,

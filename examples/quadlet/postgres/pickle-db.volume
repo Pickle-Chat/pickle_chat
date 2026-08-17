@@ -1,0 +1,5 @@
+# Postgres data directory.
+[Volume]
+# Without this the volume is created as `systemd-pickle-db`, and every
+# documented `podman run -v pickle-db:...` command would address the wrong one.
+VolumeName=pickle-db

@@ -1,0 +1,8 @@
+# Declares the named volume so systemd creates it before the container starts,
+# rather than podman creating it implicitly on first run.
+#
+# This volume is the server's identity. See the README.
+[Volume]
+# Without this the volume is created as `systemd-pickle-data`, and every
+# documented `podman run -v pickle-data:...` command would address the wrong one.
+VolumeName=pickle-data
