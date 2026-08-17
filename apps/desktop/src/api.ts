@@ -176,13 +176,19 @@ export interface BookmarkInput {
 
 export type KeybindAction = "pushToTalk" | "toggleMute" | "toggleDeafen";
 
-/// Whether the system actually let us grab a key. Not every platform allows it
-/// — see the note in the Rust `shortcuts` module.
+/// How far a binding reaches. Deliberately not a boolean: an X11 grab takes the
+/// key away from every other application, while the XWayland grab that a
+/// Wayland session gets instead is delivered to the focused window as well. See
+/// the note in the Rust `shortcuts` module.
+export type Reach = "exclusive" | "shared" | "device" | "focused";
+
 export interface BindingStatus {
   action: KeybindAction;
   accelerator: string;
-  registered: boolean;
-  error: string | null;
+  reach: Reach;
+  /// Why the reach is what it is. Absent only for `exclusive`, the one case
+  /// that needs no explanation.
+  note: string | null;
 }
 
 /// One mouse, identified the way a udev rule identifies it.
