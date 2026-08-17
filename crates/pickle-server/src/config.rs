@@ -71,6 +71,36 @@ pub struct ServerConfig {
     #[serde(default = "default_max_users")]
     pub max_users: u32,
 
+    /// Where durable state lives.
+    ///
+    /// Unset means a SQLite file in the data directory, which is what a
+    /// self-hosted server wants by default. Set it to a `postgres://` URL to
+    /// use Postgres instead.
+    #[serde(default)]
+    pub database_url: Option<String>,
+
+    /// Whether the server keeps chat history at all.
+    ///
+    /// Reported to clients through `ServerLimits`, so one that keeps nothing
+    /// can say so rather than answering every history request with silence.
+    #[serde(default = "default_history_enabled")]
+    pub history_enabled: bool,
+
+    /// Discard messages older than this many days. Unset keeps them forever.
+    ///
+    /// Unlimited by default: a self-hosted operator should decide what their
+    /// own disk keeps, and quietly discarding what people assume is kept is the
+    /// worse surprise.
+    #[serde(default)]
+    pub history_retention_days: Option<u32>,
+
+    /// Keep at most this many messages in each channel. Unset is unlimited.
+    ///
+    /// Per channel rather than server-wide, so a busy channel cannot evict a
+    /// quiet one's entire history.
+    #[serde(default)]
+    pub history_max_messages_per_channel: Option<u32>,
+
     #[serde(default = "default_channels")]
     pub channels: Vec<ChannelConfig>,
 }
@@ -101,6 +131,10 @@ fn default_name() -> String {
 fn default_min_security_level() -> u32 {
     8
 }
+fn default_history_enabled() -> bool {
+    true
+}
+
 fn default_max_users() -> u32 {
     64
 }
@@ -137,6 +171,10 @@ impl Default for ServerConfig {
             password: None,
             owner: None,
             max_users: default_max_users(),
+            database_url: None,
+            history_enabled: default_history_enabled(),
+            history_retention_days: None,
+            history_max_messages_per_channel: None,
             channels: default_channels(),
         }
     }

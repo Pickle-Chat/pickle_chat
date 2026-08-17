@@ -9,6 +9,7 @@ pub mod config;
 pub mod roles;
 pub mod session;
 pub mod state;
+pub mod store;
 pub mod tls;
 
 pub use config::ServerConfig;
@@ -23,6 +24,7 @@ use tracing::{error, info};
 
 const IDENTITY_FILE: &str = "identity.json";
 const ROLES_FILE: &str = "roles.json";
+const DATABASE_FILE: &str = "pickle.db";
 
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -54,7 +56,27 @@ impl Server {
         let roles = roles::Roles::open(&data_dir.join(ROLES_FILE))
             .context("loading roles; fix or remove the file to start with none")?;
 
+        let url = config
+            .database_url
+            .clone()
+            .unwrap_or_else(|| store::Store::sqlite_url(data_dir, DATABASE_FILE));
+        let store = store::Store::open(&url)
+            .await
+            .context("opening the database")?;
+
+        // Message ids come from an in-memory counter. Without resuming it past
+        // what is already stored, the first restart would hand out ids that
+        // collide with existing rows.
+        let highest = store
+            .highest_message_id()
+            .await
+            .context("reading the highest stored message id")?;
+
         let shared = Arc::new(Shared::new(config, loaded.identity, tls.cert_hash, roles));
+        if let Some(highest) = highest {
+            shared.resume_message_ids_after(highest);
+        }
+        shared.attach_store(store);
 
         Ok(Self { endpoint, shared })
     }

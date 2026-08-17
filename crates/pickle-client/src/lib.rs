@@ -310,6 +310,20 @@ impl Client {
         })
     }
 
+    /// Ask for past messages, answered by a [`ClientEvent::History`].
+    ///
+    /// `before` pages backwards: pass the oldest id already held to get the
+    /// page before it, or `None` for the most recent. The server caps `limit`,
+    /// so asking for more than it allows returns what it allows rather than an
+    /// error.
+    pub fn fetch_history(&self, channel: ChannelId, before: Option<MessageId>, limit: u16) -> bool {
+        self.send_control(ClientControl::FetchHistory {
+            channel,
+            before,
+            limit,
+        })
+    }
+
     /// Send one encoded audio frame.
     ///
     /// Best effort and non-blocking: if the datagram cannot be queued the frame

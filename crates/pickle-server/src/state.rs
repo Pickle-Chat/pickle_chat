@@ -8,6 +8,7 @@
 
 use crate::config::ServerConfig;
 use crate::roles::{RoleError, Roles};
+use crate::store::Store;
 use parking_lot::RwLock;
 use pickle_identity::{Fingerprint, Identity, PublicIdentity};
 use pickle_proto::voice::VoiceUpstream;
@@ -68,6 +69,9 @@ pub struct Shared {
     /// operator who mistypes their fingerprint gets a server with no owner,
     /// which is recoverable, rather than one that refuses to start.
     owner: Option<Fingerprint>,
+    /// The durable store, attached after construction so `Shared::new` stays
+    /// synchronous and usable in tests that need no database.
+    store: RwLock<Option<Store>>,
     inner: RwLock<Inner>,
 }
 
@@ -110,6 +114,7 @@ impl Shared {
             default_channel,
             roles: RwLock::new(roles),
             owner,
+            store: RwLock::new(None),
             inner: RwLock::new(Inner {
                 next_client_id: 1,
                 clients: HashMap::new(),
@@ -306,6 +311,35 @@ impl Shared {
         let id = inner.next_message_id;
         inner.next_message_id += 1;
         id
+    }
+
+    /// Continue numbering after the highest id already on disk.
+    ///
+    /// The counter starts at 1 on every boot, which was harmless while nothing
+    /// was stored. Against a database it would hand out ids that collide with
+    /// existing rows on the first restart, so startup seeds it from what the
+    /// store already holds.
+    pub fn resume_message_ids_after(&self, highest: u64) {
+        let mut inner = self.inner.write();
+        inner.next_message_id = inner.next_message_id.max(highest + 1);
+    }
+
+    /// Attach the durable store.
+    ///
+    /// Held here for reach, but deliberately never used *inside* a state lock:
+    /// the store is async, and awaiting while holding this lock would stall the
+    /// voice relay for everyone.
+    pub fn attach_store(&self, store: Store) {
+        *self.store.write() = Some(store);
+    }
+
+    pub fn store(&self) -> Option<Store> {
+        self.store.read().clone()
+    }
+
+    /// Whether this server keeps history, as reported to clients.
+    pub fn history_enabled(&self) -> bool {
+        self.config.history_enabled && self.store().is_some()
     }
 
     /// Queue a control frame for one client.

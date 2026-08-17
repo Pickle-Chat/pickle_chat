@@ -15,7 +15,7 @@ use pickle_proto::codec::{self, CodecError};
 use pickle_proto::voice::VoiceUpstream;
 use pickle_proto::{
     AuthFailure, AuthOk, ClientAuth, ClientControl, ClientId, DisconnectReason, ErrorCode,
-    ServerControl, ServerHello, UserInfo, PROTOCOL_VERSION,
+    ServerControl, ServerHello, ServerLimits, UserInfo, PROTOCOL_VERSION,
 };
 use rand::RngCore;
 use std::sync::Arc;
@@ -176,7 +176,13 @@ async fn handshake(
         // and does not need a special case for its own arrival.
         users: shared.users(),
         default_channel: shared.default_channel,
-        limits: shared.limits.clone(),
+        // Reported per connection rather than from the static config, so a
+        // server whose store failed to open says so instead of promising
+        // history it cannot serve.
+        limits: ServerLimits {
+            history_enabled: shared.history_enabled(),
+            ..shared.limits.clone()
+        },
     };
     codec::write_frame(&mut send, &ServerControl::AuthOk(Box::new(ok))).await?;
 
@@ -320,11 +326,11 @@ async fn control_loop(
             continue;
         }
 
-        handle_control(shared, client_id, message);
+        handle_control(shared, client_id, message).await;
     }
 }
 
-fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientControl) {
+async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientControl) {
     match message {
         // A second Auth on an authenticated stream is meaningless.
         ClientControl::Auth(_) => shared.send(
@@ -394,7 +400,7 @@ fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientCont
             content,
             reply_to,
             nonce,
-        } => send_message(shared, client_id, channel, content, reply_to, nonce),
+        } => send_message(shared, client_id, channel, content, reply_to, nonce).await,
 
         ClientControl::Typing { channel } => {
             shared.broadcast_to_channel(
@@ -409,14 +415,11 @@ fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientCont
 
         // History needs persistence, which is not built yet. Answering with an
         // empty, complete page is honest: there is nothing stored to return.
-        ClientControl::FetchHistory { channel, .. } => shared.send(
-            client_id,
-            ServerControl::History {
-                channel,
-                messages: Vec::new(),
-                reached_start: true,
-            },
-        ),
+        ClientControl::FetchHistory {
+            channel,
+            before,
+            limit,
+        } => fetch_history(shared, client_id, channel, before, limit).await,
 
         ClientControl::EditMessage { .. }
         | ClientControl::DeleteMessage { .. }
@@ -430,7 +433,72 @@ fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: ClientCont
     }
 }
 
-fn send_message(
+/// Answer a request for past messages.
+///
+/// A server with history switched off, or with no store, answers with an empty
+/// page marked as the start rather than staying silent — a client waiting on a
+/// reply that never comes is worse than one told there is nothing.
+async fn fetch_history(
+    shared: &Arc<Shared>,
+    client_id: ClientId,
+    channel: pickle_proto::ChannelId,
+    before: Option<pickle_proto::MessageId>,
+    limit: u16,
+) {
+    let empty = |shared: &Arc<Shared>| {
+        shared.send(
+            client_id,
+            ServerControl::History {
+                channel,
+                messages: Vec::new(),
+                reached_start: true,
+            },
+        );
+    };
+
+    if !shared.history_enabled() {
+        empty(shared);
+        return;
+    }
+
+    // Reading another channel's history is reading a room you may not be in, so
+    // the channel has to exist and carry text at all.
+    match shared.channel(channel) {
+        Some(c) if c.kind.has_text() => {}
+        _ => {
+            empty(shared);
+            return;
+        }
+    }
+
+    let Some(store) = shared.store() else {
+        empty(shared);
+        return;
+    };
+
+    match store.history(channel, before, limit).await {
+        Ok(page) => shared.send(
+            client_id,
+            ServerControl::History {
+                channel,
+                messages: page.messages,
+                reached_start: page.reached_start,
+            },
+        ),
+        Err(error) => {
+            warn!(%error, channel, "could not read history");
+            shared.send(
+                client_id,
+                ServerControl::Error {
+                    code: ErrorCode::Internal,
+                    detail: "the server could not read history".into(),
+                },
+            );
+        }
+    }
+}
+
+async fn send_message(
     shared: &Arc<Shared>,
     client_id: ClientId,
     channel: pickle_proto::ChannelId,
@@ -485,6 +553,24 @@ fn send_message(
     }
 
     let message = shared.build_message(&author, channel, content, reply_to);
+
+    // Stored before anyone is told about it. The other order is faster, but it
+    // means a message everyone saw can vanish on restart — history that
+    // disagrees with what people remember reading is the worse failure, and a
+    // write error has to reach the sender rather than being swallowed.
+    if let Some(store) = shared.store() {
+        if let Err(error) = store.insert_message(&message).await {
+            warn!(%error, "could not store a message");
+            shared.send(
+                client_id,
+                ServerControl::Error {
+                    code: ErrorCode::Internal,
+                    detail: "the server could not save that message, so it was not sent".into(),
+                },
+            );
+            return;
+        }
+    }
 
     // The author gets the nonce back so an optimistic local echo can be
     // reconciled with the server's authoritative copy.

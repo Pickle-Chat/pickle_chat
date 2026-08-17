@@ -540,3 +540,81 @@ async fn client_ids_are_only_meaningful_within_one_server() {
          precisely why a client id cannot be used to tell connections apart",
     );
 }
+
+/// The point of persistence: someone who was not there can read what was said.
+///
+/// Covers the whole path — persist on send, survive the sender leaving, and
+/// come back through `FetchHistory` to a connection that did not exist at the
+/// time.
+#[tokio::test]
+async fn a_later_client_can_read_what_it_missed() {
+    let server = TestServer::default().await;
+
+    let (early, mut early_events) = connect_client(&server, "alice").await.unwrap();
+    let channel = early.session().default_channel;
+    early.send_message(channel, "said while you were away", 1);
+
+    // Wait for the server's echo before leaving. Sending is fire-and-forget, so
+    // disconnecting straight away races the frame reaching the server at all —
+    // and the echo is only sent after the message has been stored.
+    expect_event(&mut early_events, "the message to be accepted", |event| {
+        matches!(event, ClientEvent::MessagePosted { .. }).then_some(())
+    })
+    .await;
+
+    // The sender leaves entirely, so nothing about this can be served from a
+    // live connection's memory.
+    early.disconnect();
+    drop(early);
+
+    let (late, mut late_events) = connect_client(&server, "bob").await.unwrap();
+    late.fetch_history(channel, None, 50);
+
+    let messages = expect_event(&mut late_events, "history", |event| match event {
+        ClientEvent::History { messages, .. } => Some(messages.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(messages.len(), 1, "the message outlived its sender");
+    assert_eq!(messages[0].content, "said while you were away");
+    assert_eq!(
+        messages[0].author_nickname, "alice",
+        "the name it was sent under, not whoever holds it now",
+    );
+}
+
+/// History is per channel, and asking about a channel you are not in does not
+/// hand back another room's conversation.
+#[tokio::test]
+async fn history_is_scoped_to_the_channel_asked_about() {
+    let server = TestServer::default().await;
+    let (client, mut events) = connect_client(&server, "alice").await.unwrap();
+
+    let session = client.session();
+    let default_channel = session.default_channel;
+    let other = session
+        .channels
+        .iter()
+        .find(|c| c.id != default_channel)
+        .map(|c| c.id)
+        .expect("the default config defines more than one channel");
+
+    client.send_message(default_channel, "in the lobby", 1);
+
+    client.fetch_history(other, None, 50);
+
+    let messages = expect_event(
+        &mut events,
+        "history for the other channel",
+        |event| match event {
+            ClientEvent::History {
+                channel, messages, ..
+            } if *channel == other => Some(messages.clone()),
+            _ => None,
+        },
+    )
+    .await;
+
+    assert!(messages.is_empty(), "nothing was said in that channel");
+}
