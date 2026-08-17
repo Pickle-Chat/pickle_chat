@@ -203,7 +203,14 @@ pub struct SessionListDto {
 pub struct AudioDeviceDto {
     pub name: String,
     pub is_default: bool,
+    /// False only for a device offering no sample format Pickle can read. A
+    /// device at some rate other than 48 kHz is converted rather than refused,
+    /// so it is perfectly usable.
     pub usable: bool,
+    /// The rate the device would be opened at, or `None` when it could not be
+    /// queried. Anything other than 48 kHz means a conversion is in the path,
+    /// which the UI says out loud rather than hiding.
+    pub sample_rate: Option<u32>,
 }
 
 impl From<&DeviceInfo> for AudioDeviceDto {
@@ -211,7 +218,8 @@ impl From<&DeviceInfo> for AudioDeviceDto {
         Self {
             name: device.name.clone(),
             is_default: device.is_default,
-            usable: device.supports_native_rate,
+            usable: device.usable,
+            sample_rate: device.sample_rate,
         }
     }
 }
