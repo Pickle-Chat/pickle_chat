@@ -1,0 +1,107 @@
+name: Branch cleanup
+
+# GitHub's own `delete_branch_on_merge` deletes a branch the moment its PR
+# merges, which is too eager for the way this repo lands work. A merged branch
+# is still the base of the next PR in a stack until that one is retargeted, and
+# after a squash it is the only remaining record of the individual commits that
+# were flattened. So the setting stays off and branches are reaped on a delay
+# instead.
+#
+# The cost of that choice is that GitHub never auto-retargets a stacked PR —
+# that only happens when the base branch is deleted — so retargeting is a manual
+# step when a stack advances. That is deliberate: an explicit retarget is easier
+# to notice than a base that silently vanished.
+on:
+  schedule:
+    - cron: "23 5 * * 2"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be deleted, without deleting anything"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: read
+
+# Two of these running at once would race on the same refs.
+concurrency:
+  group: branch-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Delete branches from PRs merged over 90 days ago
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete stale merged branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # A scheduled run always deletes. Only a manual run can ask for a
+          # rehearsal, and it defaults to one.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          cutoff=$(date -u -d '90 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          default_branch=$(gh api "repos/$REPO" --jq .default_branch)
+          echo "cutoff=$cutoff  default=$default_branch  dry_run=$DRY_RUN"
+          echo
+
+          # Any ref an open PR still depends on is off limits regardless of age:
+          # its head (obviously) and its base, which is how a live stack is held
+          # together. This is the guard that stops the job breaking a stack.
+          in_use=$(gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
+                     --jq '.[] | .base.ref, .head.ref' | sort -u)
+
+          deleted=0 kept=0
+          seen=""
+
+          # Only *merged* PRs. A closed-unmerged PR's branch may be work someone
+          # abandoned but still wants; reaping it is not this job's business.
+          while IFS=$'\t' read -r branch merged_at head_repo; do
+            [ -n "$branch" ] || continue
+
+            # The same branch can back more than one merged PR.
+            case " $seen " in *" $branch "*) continue ;; esac
+            seen="$seen $branch"
+
+            # Fork branches are not ours to delete.
+            if [ "$head_repo" != "$REPO" ]; then
+              continue
+            fi
+            if [ "$branch" = "$default_branch" ]; then
+              continue
+            fi
+            if [ "$merged_at" \> "$cutoff" ]; then
+              kept=$((kept + 1)); continue
+            fi
+            if printf '%s\n' "$in_use" | grep -Fxq "$branch"; then
+              echo "skip     $branch  (an open PR still points at it)"
+              kept=$((kept + 1)); continue
+            fi
+
+            # Already gone, or protected.
+            info=$(gh api "repos/$REPO/branches/$branch" 2>/dev/null) || continue
+            if [ "$(printf '%s' "$info" | jq -r .protected)" = "true" ]; then
+              echo "skip     $branch  (protected)"
+              kept=$((kept + 1)); continue
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "would rm $branch  (merged $merged_at)"
+            else
+              gh api -X DELETE "repos/$REPO/git/refs/heads/$branch"
+              echo "deleted  $branch  (merged $merged_at)"
+            fi
+            deleted=$((deleted + 1))
+          done < <(gh api "repos/$REPO/pulls?state=closed&per_page=100" --paginate \
+                     --jq '.[]
+                           | select(.merged_at != null)
+                           | [.head.ref, .merged_at, (.head.repo.full_name // "")]
+                           | @tsv')
+
+          echo
+          echo "$deleted branch(es) eligible, $kept kept"
