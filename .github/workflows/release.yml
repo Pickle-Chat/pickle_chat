@@ -245,9 +245,30 @@ jobs:
       attestations: write
       id-token: write
     steps:
+      # Only the artifacts this job publishes.
+      #
+      # Without a pattern this also pulls the `.dockerbuild` build records that
+      # docker/build-push-action uploads on its own. They are of no use here,
+      # and one of them failing to download failed the whole job — after every
+      # release artifact had already downloaded cleanly.
+      #
+      # They also come from `image`, which this job deliberately does not depend
+      # on, so an unfiltered download races an upload that may still be running.
+      # Naming what we want removes both problems.
+      #
+      # Two steps rather than one brace pattern: `pattern` is a glob, and this
+      # workflow has cost enough already without resting on which glob dialect
+      # the action happens to implement.
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: desktop-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: server-*
           merge-multiple: true
 
       - name: Collect and checksum
