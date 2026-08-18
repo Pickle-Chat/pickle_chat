@@ -7,8 +7,9 @@ chat people expect from Discord.
 There are no accounts. A user *is* an Ed25519 keypair on their own machine, and
 servers recognise returning users by public key. Nothing is registered anywhere.
 
-**Status:** early. Voice works end to end; text chat sends and delivers but is
-not yet persisted. See [What works today](#what-works-today).
+**Status:** early. Voice works end to end, and text chat is stored and served
+back — though the client does not yet render history it fetches. See
+[What works today](#what-works-today).
 
 ## Quick start
 
@@ -127,19 +128,25 @@ Working:
 - Authentication with proof-of-work enforcement and certificate binding
 - Trust-on-first-use server pinning
 - Voice: capture, gating, Opus, relay, jitter buffering, mixing, mute/deafen
-- Text messages delivered live to a channel
+- Text messages delivered live to a channel, and stored for history
 - Settings: identities, saved servers, audio devices, and keybinds, all persisted
 - Push to talk, bound to a key and grabbed globally where the platform allows
 - Desktop client covering all of the above
 
 Not yet built:
 
-- **Message persistence.** History requests return empty, and editing,
-  deletion, and reactions are refused. This is the main gap between "text chat"
-  and "text chat like Discord".
+- **Reading history in the client.** The server stores messages and answers
+  history requests, but the desktop client discards the response and still shows
+  only what arrived while it was connected. The protocol and the store are
+  finished; the UI is not.
+- **Editing, deletion, and reactions.** Still refused by the server, though the
+  message store they were waiting on now exists.
 - **Rich text rendering.** Messages carry markdown; the client renders plain
   text.
-- Attachments, permissions and roles, moderation (kick/ban), LAN discovery.
+- **Moderation.** Roles and capabilities exist as a model, and the server
+  resolves them for every connected user, but no command consumes them yet, so
+  nothing can be kicked, banned, muted or moved.
+- Attachments and LAN discovery.
 
 Known issues:
 
