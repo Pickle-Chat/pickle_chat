@@ -4,7 +4,14 @@
 # tooling. Otherwise prefer the sqlite quadlet next door — one fewer moving part
 # for the same behaviour.
 #
-#   openssl rand -base64 32 | podman secret create pickle-db-password -
+# Both secrets below are required, and the exact form of these commands
+# matters; see the PICKLE_DATABASE_URL comment further down for why.
+#
+#   PW=$(openssl rand -base64 32 | tr -d '/+=')
+#   printf '%s' "$PW" | podman secret create pickle-db-password -
+#   printf 'postgres://pickle:%s@pickle-db:5432/pickle' "$PW" \
+#     | podman secret create pickle-database-url -
+#
 #   cp examples/quadlet/postgres/* ~/.config/containers/systemd/
 #   systemctl --user daemon-reload
 #   systemctl --user start pickle-server
@@ -40,13 +47,10 @@ Environment="PICKLE_NAME=My Pickle Server"
 # `pickle-db` is the container name quadlet derives from pickle-db.container,
 # resolved on the shared network. sqlx picks Postgres from the URL scheme.
 #
-# Create both secrets from one password, keeping it URL-safe so it needs no
-# percent-encoding:
-#
-#   PW=$(openssl rand -base64 32 | tr -d '/+=')
-#   printf '%s' "$PW" | podman secret create pickle-db-password -
-#   printf 'postgres://pickle:%s@pickle-db:5432/pickle' "$PW" \
-#     | podman secret create pickle-database-url -
+# Both secrets come from one password, created at the top of this file. It is
+# kept URL-safe there so it needs no percent-encoding, and written with `printf`
+# so that openssl's trailing newline does not end up inside the password — which
+# would leave the URL disagreeing with what Postgres was initialised with.
 Secret=pickle-database-url,type=env,target=PICKLE_DATABASE_URL
 
 #Environment=PICKLE_OWNER=xxxx-xxxx-xxxx-...

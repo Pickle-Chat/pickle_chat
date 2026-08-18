@@ -19,6 +19,46 @@ systemctl --user daemon-reload
 systemctl --user start pickle-server
 ```
 
+### Postgres needs its secrets created first
+
+The `postgres/` files take the database password from podman secrets rather
+than from a file sitting in your home directory, and **both secrets must exist
+before the units will start**. Skip this and `pickle-db` fails with:
+
+```
+Error: running container create option: no secret with name or id "pickle-db-password": no such secret
+```
+
+which surfaces as the *server* failing to start, because it requires the
+database.
+
+Create both from one password, then copy the files as above:
+
+```bash
+PW=$(openssl rand -base64 32 | tr -d '/+=')
+printf '%s' "$PW" | podman secret create pickle-db-password -
+printf 'postgres://pickle:%s@pickle-db:5432/pickle' "$PW" \
+  | podman secret create pickle-database-url -
+
+cp examples/quadlet/postgres/* ~/.config/containers/systemd/
+systemctl --user daemon-reload
+systemctl --user start pickle-server
+```
+
+Two secrets rather than one because quadlet does not interpolate: the server
+needs the password inside a connection URL, and a `${...}` in an `Environment=`
+line would reach the container verbatim. So the assembled URL is its own secret.
+
+The exact form of those commands is load-bearing. `printf` rather than `echo`
+because podman stores stdin verbatim, so a trailing newline ends up inside the
+password; `tr -d '/+='` because `+`, `/` and `=` would need percent-encoding
+inside the URL. Either mistake gives you a database that starts and a server
+that cannot authenticate against it — a far more confusing failure than a
+missing secret.
+
+Secrets belong to the user that owns the units. Creating them with `sudo
+podman` puts them where a `systemctl --user` service cannot see them.
+
 **Enable lingering, or the server stops when you log out.** Rootless user
 services are tied to your login session unless you say otherwise:
 
