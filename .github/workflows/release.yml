@@ -24,7 +24,6 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ${{ github.repository_owner }}/pickle-server
 
 jobs:
   # One place decides what this run is, so no other job repeats the tag test.
@@ -33,6 +32,7 @@ jobs:
     outputs:
       is_release: ${{ startsWith(github.ref, 'refs/tags/v') }}
       version: ${{ steps.v.outputs.version }}
+      image: ${{ steps.v.outputs.image }}
     steps:
       - id: v
         run: |
@@ -41,6 +41,16 @@ jobs:
           else
             echo "version=edge" >> "$GITHUB_OUTPUT"
           fi
+
+          # Registry references must be lowercase; a GitHub owner need not be,
+          # and ours is not. Interpolating github.repository_owner directly
+          # produced `ghcr.io/Pickle-Chat/pickle-server`, which buildx rejects
+          # outright — so every push to main failed before it built anything.
+          #
+          # `tr` rather than bash's ${var,,} so this does not depend on the
+          # runner shell being bash 4+.
+          owner=$(printf %s "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${owner}/pickle-server" >> "$GITHUB_OUTPUT"
 
   # Built natively per architecture rather than under QEMU. This compiles C for
   # both ring and SQLite, which emulation makes roughly ten times slower.
@@ -82,7 +92,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.plan.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
 
@@ -128,6 +138,8 @@ jobs:
       # A tagged build gets its version and `latest`; main gets `edge` only, so
       # pulling `latest` never lands on an untagged commit.
       - name: Create manifest
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
         run: |
           set -euo pipefail
           if [[ "${{ needs.plan.outputs.is_release }}" == "true" ]]; then
@@ -263,7 +275,7 @@ jobs:
             ## Server
 
             ```bash
-            docker pull ghcr.io/${{ github.repository_owner }}/pickle-server:${{ needs.plan.outputs.version }}
+            docker pull ${{ env.REGISTRY }}/${{ needs.plan.outputs.image }}:${{ needs.plan.outputs.version }}
             ```
 
             Compose examples for SQLite and Postgres are in
