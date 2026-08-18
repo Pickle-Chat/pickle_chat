@@ -35,7 +35,7 @@
         "depends": [
           "libwebkit2gtk-4.1-0",
           "libgtk-3-0",
-          "libasound2"
+          "libasound2t64 | libasound2"
         ]
       }
     }
