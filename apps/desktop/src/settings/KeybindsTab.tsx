@@ -5,6 +5,7 @@ import {
   type KeybindAction,
   type Keybinds,
   type MouseAccess,
+  type Reach,
 } from "../api";
 import {
   captureAccelerator,
@@ -13,6 +14,29 @@ import {
   isMouseAccelerator,
   type CaptureResult,
 } from "../keys";
+
+/// The badge shown beside a binding, one per reach.
+///
+/// Every one of these says what the binding *does*, never merely that a call
+/// succeeded — "registered" was the old wording and it promised more than a
+/// Wayland grab delivers.
+const REACH_BADGE: Record<Reach, { text: string; title: string } | null> = {
+  // Nothing to say: the key is Pickle's alone, wherever focus is.
+  exclusive: null,
+  shared: {
+    text: "global, shared",
+    title:
+      "Reaches Pickle while another window is in front, but the focused window receives it too.",
+  },
+  device: {
+    text: "global",
+    title: "Read from the mouse device directly, without taking the button from anything else.",
+  },
+  focused: {
+    text: "⚠ only while focused",
+    title: "Could not be claimed system-wide.",
+  },
+};
 
 const BINDINGS: { action: KeybindAction; label: string; help: string }[] = [
   {
@@ -107,7 +131,12 @@ export function KeybindsTab({
     };
   }, [capturing, keybinds]);
 
-  const refused = statuses.filter((status) => !status.registered);
+  // Split rather than lumped: a binding that could not be claimed at all is a
+  // problem to fix, while a Wayland grab that works but is also seen by the
+  // focused window is a caveat to understand. Showing them under one heading
+  // would misrepresent both.
+  const refused = statuses.filter((status) => status.reach === "focused");
+  const shared = statuses.filter((status) => status.reach === "shared");
   const anyMouse = BINDINGS.some((binding) => {
     const accelerator = keybinds[binding.action];
     return accelerator !== null && isMouseAccelerator(accelerator);
@@ -145,18 +174,18 @@ export function KeybindsTab({
                 </button>
               )}
               {status &&
-                (status.registered ? (
-                  accelerator &&
-                  isMouseAccelerator(accelerator) && (
-                    <span className="muted" title="Read from the mouse device directly.">
-                      global
+                (() => {
+                  const badge = REACH_BADGE[status.reach];
+                  if (!badge) return null;
+                  // The badge's own one-liner rather than `note`: the full
+                  // explanation is spelled out below the list, and a paragraph
+                  // in a tooltip is a paragraph nobody reads.
+                  return (
+                    <span className="muted" title={badge.title}>
+                      {badge.text}
                     </span>
-                  )
-                ) : (
-                  <span className="muted" title={status.error ?? undefined}>
-                    ⚠ only while focused
-                  </span>
-                ))}
+                  );
+                })()}
             </div>
             {binding.help && <p className="muted">{binding.help}</p>}
           </div>
@@ -180,7 +209,27 @@ export function KeybindsTab({
             {refused.map((status) => (
               <li key={status.action}>
                 <code>{describeAccelerator(status.accelerator)}</code> —{" "}
-                {status.error ?? "the system gave no reason."}
+                {status.note ?? "the system gave no reason."}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {shared.length > 0 && (
+        <div className="settings-field">
+          <p className="muted">
+            A binding marked <strong>global, shared</strong> does work while
+            another window is in front, but Wayland has no way to take a key
+            away from the focused window, so that window receives it too. Pick
+            something you would not otherwise type — a function key, or a
+            combination with Control or Alt.
+          </p>
+          <ul className="muted">
+            {shared.map((status) => (
+              <li key={status.action}>
+                <code>{describeAccelerator(status.accelerator)}</code> —{" "}
+                {status.note}
               </li>
             ))}
           </ul>

@@ -174,11 +174,23 @@ Known issues:
   playback path is tested end to end against the native path — but every
   machine it has run on so far had a 48 kHz device, so the code that opens a
   44.1 kHz stream has never actually opened one.
-- **Global keys are not guaranteed.** The keyboard grab goes through X11, so a
-  key your layout cannot produce is refused, and a Wayland session may not
-  deliver the key while another window has focus. The settings tab marks any
-  binding the system refused, and push to talk falls back to working while
-  Pickle is focused, so it is never silently dead.
+- **A global key means less under Wayland.** The keyboard grab goes through X11,
+  so a key your layout cannot produce — F13 on a keyboard without one — is
+  refused outright. In a Wayland session the grab is made against XWayland,
+  which is weaker than an X11 grab in a way worth knowing about: on KWin the key
+  *does* reach Pickle while another window is in front, but it is delivered to
+  that window as well, because Wayland gives an application no way to take a key
+  away from whatever has focus. Bind something you would not otherwise type. A
+  compositor that does not forward to XWayland at all leaves the grab registered
+  and inert. The settings tab says which of these applies to each binding, and
+  push to talk falls back to working while Pickle is focused, so it is never
+  silently dead.
+
+  The proper Wayland mechanism — the `GlobalShortcuts` desktop portal — is
+  deliberately not used yet, because on KDE releasing *any* key while the
+  shortcut is held ends the shortcut and does not restart it, which cuts the
+  microphone the first time you let go of a movement key. See the note in
+  [`shortcuts.rs`](apps/desktop/src-tauri/src/shortcuts.rs) and KDE bug 484525.
 - **Global mouse buttons need a udev rule.** The keyboard grab cannot see mouse
   buttons at all, so a bound button is read from the mouse's input device
   instead — which works under Wayland and X11 alike, but only if your user can
