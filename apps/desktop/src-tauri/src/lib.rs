@@ -47,12 +47,12 @@ pub fn run() {
             // the settings tab rather than stopping startup: the app is still
             // perfectly usable with the in-window fallback.
             for status in shortcuts::apply(app.handle()) {
-                if !status.registered {
+                if !status.reach.is_global() {
                     warn!(
                         action = %status.action,
                         accelerator = %status.accelerator,
-                        error = status.error.as_deref().unwrap_or("unknown"),
-                        "a saved shortcut could not be grabbed",
+                        reason = status.note.as_deref().unwrap_or("unknown"),
+                        "a saved shortcut only works while Pickle is focused",
                     );
                 }
             }
