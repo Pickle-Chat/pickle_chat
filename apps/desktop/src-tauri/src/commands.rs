@@ -10,6 +10,7 @@ use crate::dto::{
     AudioDeviceDto, ConnectionDto, IdentityDto, IdentityListDto, SessionDto, SessionListDto,
     SpeakingDto, VaultEntryDto,
 };
+use crate::mouse_grab;
 use crate::settings::{AudioSettings, Keybinds, Settings};
 use crate::shortcuts;
 use crate::state::{ActiveSession, AppState, SessionId, VoiceState};
@@ -643,6 +644,19 @@ pub fn set_keybinds(
 #[tauri::command]
 pub fn keybind_status(app: AppHandle) -> Vec<shortcuts::BindingStatus> {
     shortcuts::apply(&app)
+}
+
+/// The udev rule needed to read the mice on this machine, or `None` if they can
+/// already be read.
+///
+/// The alternative — telling everyone to run `usermod -aG input` — grants every
+/// process the user runs a permanent read on every keyboard attached to the
+/// machine. Pickle is already enumerating input devices, so it is in a position
+/// to name the one device it actually needs and hand over a rule for exactly
+/// that, which is a far smaller thing to ask someone to install as root.
+#[tauri::command]
+pub fn mouse_udev_rule() -> Option<mouse_grab::UdevAdvice> {
+    mouse_grab::udev_advice()
 }
 
 /// Run the audio engine while disconnected, so the settings dialog can show a

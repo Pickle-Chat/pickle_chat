@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { api, type AudioDevices, type AudioSettings, type GateMode } from "../api";
+import {
+  api,
+  type AudioDevice,
+  type AudioDevices,
+  type AudioSettings,
+  type GateMode,
+} from "../api";
 import { LevelMeter } from "../LevelMeter";
 
 /// Opus is transparent enough for speech well below its default, so the range
@@ -135,12 +141,23 @@ export function AudioTab({
   );
 }
 
+/// Pickle runs its pipeline at 48 kHz. A device at any other rate works, but
+/// passes through a conversion, and the menu says so rather than pretending the
+/// two are identical.
+const NATIVE_RATE = 48_000;
+
+function deviceNote(device: AudioDevice): string {
+  if (!device.usable) return " — unsupported format";
+  if (device.sampleRate === null || device.sampleRate === NATIVE_RATE) return "";
+  return ` — ${device.sampleRate / 1000} kHz, resampled`;
+}
+
 function DeviceSelect({
   devices,
   value,
   onChange,
 }: {
-  devices: { name: string; isDefault: boolean; usable: boolean }[] | undefined;
+  devices: AudioDevice[] | undefined;
   value: string | null;
   onChange: (device: string | null) => void;
 }) {
@@ -161,7 +178,7 @@ function DeviceSelect({
         <option key={device.name} value={device.name} disabled={!device.usable}>
           {device.name}
           {device.isDefault ? " (default)" : ""}
-          {device.usable ? "" : " — unsupported format"}
+          {deviceNote(device)}
         </option>
       ))}
     </select>

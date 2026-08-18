@@ -7,8 +7,9 @@ chat people expect from Discord.
 There are no accounts. A user *is* an Ed25519 keypair on their own machine, and
 servers recognise returning users by public key. Nothing is registered anywhere.
 
-**Status:** early. Voice works end to end; text chat sends and delivers but is
-not yet persisted. See [What works today](#what-works-today).
+**Status:** early. Voice works end to end, and text chat is stored and served
+back — though the client does not yet render history it fetches. See
+[What works today](#what-works-today).
 
 ## Quick start
 
@@ -92,13 +93,21 @@ level 30 is tens of minutes. Servers can set a minimum. Mining does not change
 the keypair, so raising your level never costs you the permissions a server
 granted you.
 
+Your keys live in `identities.json`, written `0600` and refused if the mode has
+been widened. It can also be sealed with a passphrase: argon2id (19 MiB, 2
+passes) derives a key into XChaCha20-Poly1305, with a fresh salt and nonce and
+the cost parameters recorded in the file so they can be raised later without
+stranding an older vault. Encryption is opt-in and stays off until you ask for
+it, because a passphrase you did not choose to set is a lockout waiting to
+happen. See the [known issues](#what-works-today) for what is not wired up yet.
+
 ## Layout
 
 | Crate | What it does |
 | --- | --- |
-| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, single-key keystore and multi-identity vault |
+| [`pickle-identity`](crates/pickle-identity) | Ed25519 identities, proof-of-work security levels, single-key keystore and multi-identity vault (optionally passphrase-encrypted) |
 | [`pickle-proto`](crates/pickle-proto) | Wire protocol: control messages, framing, voice datagram encoding |
-| [`pickle-audio`](crates/pickle-audio) | Opus encode/decode, jitter buffering, voice gating, mixing |
+| [`pickle-audio`](crates/pickle-audio) | Opus encode/decode, jitter buffering, voice gating, mixing, device resampling |
 | [`pickle-server`](crates/pickle-server) | The server: QUIC, authentication, channels, voice relay |
 | [`pickle-client`](crates/pickle-client) | Client core: connection, identity pinning, event stream |
 | [`apps/desktop`](apps/desktop) | Tauri desktop client (Rust + React) |
@@ -119,19 +128,25 @@ Working:
 - Authentication with proof-of-work enforcement and certificate binding
 - Trust-on-first-use server pinning
 - Voice: capture, gating, Opus, relay, jitter buffering, mixing, mute/deafen
-- Text messages delivered live to a channel
+- Text messages delivered live to a channel, and stored for history
 - Settings: identities, saved servers, audio devices, and keybinds, all persisted
 - Push to talk, bound to a key and grabbed globally where the platform allows
 - Desktop client covering all of the above
 
 Not yet built:
 
-- **Message persistence.** History requests return empty, and editing,
-  deletion, and reactions are refused. This is the main gap between "text chat"
-  and "text chat like Discord".
+- **Reading history in the client.** The server stores messages and answers
+  history requests, but the desktop client discards the response and still shows
+  only what arrived while it was connected. The protocol and the store are
+  finished; the UI is not.
+- **Editing, deletion, and reactions.** Still refused by the server, though the
+  message store they were waiting on now exists.
 - **Rich text rendering.** Messages carry markdown; the client renders plain
   text.
-- Attachments, permissions and roles, moderation (kick/ban), LAN discovery.
+- **Moderation.** Roles and capabilities exist as a model, and the server
+  resolves them for every connected user, but no command consumes them yet, so
+  nothing can be kicked, banned, muted or moved.
+- Attachments and LAN discovery.
 
 Known issues:
 
@@ -152,27 +167,129 @@ Known issues:
   configured number on the wire. The encoder is not ignoring the setting: Opus
   bitrate is a VBR target rather than a ceiling, and asking for CBR instead hits
   it exactly. Budget from the measured rate, not from `DEFAULT_BITRATE`.
-- Audio devices must support 48 kHz natively; there is no resampling.
+- **Resampling is unverified on real hardware.** Devices that do not run at
+  48 kHz are converted at the device boundary by
+  [`resample.rs`](crates/pickle-audio/src/resample.rs), so they are no longer
+  refused. The converter is tested thoroughly on synthetic signals, and the
+  playback path is tested end to end against the native path — but every
+  machine it has run on so far had a 48 kHz device, so the code that opens a
+  44.1 kHz stream has never actually opened one.
 - **Global keys are not guaranteed.** The keyboard grab goes through X11, so a
   key your layout cannot produce is refused, and a Wayland session may not
   deliver the key while another window has focus. The settings tab marks any
   binding the system refused, and push to talk falls back to working while
   Pickle is focused, so it is never silently dead.
-- **Global mouse buttons need the `input` group.** The keyboard grab cannot see
-  mouse buttons at all, so a bound button is read from the mouse's input device
+- **Global mouse buttons need a udev rule.** The keyboard grab cannot see mouse
+  buttons at all, so a bound button is read from the mouse's input device
   instead — which works under Wayland and X11 alike, but only if your user can
-  open it:
+  open that device. See [Reading a mouse button](#reading-a-mouse-button).
+  Without it the button still works while Pickle is focused.
+- **The identity vault can be encrypted, but no UI turns it on yet.** The client
+  can seal `identities.json` with a passphrase — argon2id into
+  XChaCha20-Poly1305, parameters recorded in the file — and the library API,
+  `Vault::set_passphrase`, is finished and tested. What is missing is the unlock
+  prompt at startup, and until that exists nothing in the app offers to encrypt
+  the vault: doing so would produce a file the next launch could not open.
+  Existing vaults are unencrypted and keep working untouched; encryption never
+  turns itself on.
+- **Whether encrypted or not, back the vault up.** Losing it means losing every
+  permission every server granted you, and if you do set a passphrase, forgetting
+  it is exactly as final. There is no recovery, by design.
+- **The server's keystore is deliberately unencrypted.** A server starts
+  unattended, so any passphrase it could use would have to sit in a unit file, an
+  environment variable, or a file beside the key — all readable by anyone who can
+  already read the key. That is obfuscation wearing encryption's name. Protect a
+  server key with file permissions (Pickle writes `0600` and refuses to load a
+  wider mode), and with full-disk encryption or `systemd` credentials if you want
+  more. See the module docs in
+  [`keystore.rs`](crates/pickle-identity/src/keystore.rs).
 
-  ```bash
-  sudo usermod -aG input $USER
-  ```
+## Reading a mouse button
 
-  Log out and back in afterwards. Without it the button still works while
-  Pickle is focused. Pickle opens mouse devices only, never keyboards, watches
-  only the button you bound, and does not take that button away from anything
-  else using it.
-- The keystore is unencrypted. Treat it like an SSH private key — and back it
-  up, because losing it means losing every permission every server granted you.
+Binding push to talk to a thumb button is the ordinary case, and the window
+system will not deliver it: X11 and Wayland both hand pointer buttons to
+whatever is focused, which during a game is not Pickle. The only way to see the
+button is to read the mouse's `/dev/input/event*` node directly.
+
+That node is not readable by default. The usual advice is to join the `input`
+group:
+
+```bash
+sudo usermod -aG input $USER   # don't
+```
+
+Do not do this. `input` group membership grants **every** process you run read
+access to **every** `/dev/input/event*` node on the machine — every keyboard
+included — permanently, for every session. Any other program you run that is
+ever compromised then has a keylogger, granted so that one thumb button could
+be read. It is an enormous trade for a very small feature.
+
+Grant access to the one mouse instead. Open **Settings → Keybinds** with a mouse
+button bound: Pickle enumerates the devices, names the one it needs, and prints
+the exact rule for your hardware, ready to copy. Otherwise, find the ids
+yourself:
+
+```bash
+# Which node is your mouse? The name is at the end of each symlink.
+ls -l /dev/input/by-id/*-event-mouse
+
+# Its vendor and product ids, four hex digits each:
+udevadm info -a -n /dev/input/event3 | grep -m2 -E 'idVendor|idProduct'
+```
+
+Then write `/etc/udev/rules.d/70-pickle-mouse.rules`, substituting your own ids:
+
+```udev
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", \
+  ENV{ID_INPUT_KEYBOARD}!="1", ATTRS{idVendor}=="04a5", \
+  ATTRS{idProduct}=="800a", TAG+="uaccess"
+```
+
+```bash
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=input
+```
+
+then unplug and replug the mouse, or reboot.
+
+Each clause is doing something:
+
+- `TAG+="uaccess"` gives the device to whoever is logged in at this machine's
+  own screen, through an ACL that logind adds and removes with the session. No
+  new group, nothing persistent, and nobody logged in over SSH inherits it. A
+  blanket `MODE="0666"` would instead expose the mouse to every account on the
+  box.
+- `ATTRS{idVendor}`/`ATTRS{idProduct}` name the device itself. Matching a path
+  like `/dev/input/event3` would be useless — that number is assigned in probe
+  order and moves when something else is plugged in first.
+- `ENV{ID_INPUT_MOUSE}=="1", ENV{ID_INPUT_KEYBOARD}!="1"` are what stop the
+  grant widening. The ids belong to the *physical* device, and a keyboard with
+  a built-in mouse node publishes its keyboard on the same pair — which is
+  common in exactly the hardware at issue, since that is often where the bound
+  button lives. Without these two clauses the rule would hand over the keyboard
+  as well and quietly recreate the problem the `input` group had.
+- The filename must sort between `60-input-id.rules`, which sets those two
+  properties, and `73-seat-late.rules`, which acts on the tag. Hence `70-`.
+
+A Bluetooth or I2C mouse has no USB parent and so no `idVendor`; use
+`ATTRS{id/vendor}` and `ATTRS{id/product}` instead. `uaccess` needs logind or
+elogind; without either, fall back to `MODE="0660", GROUP="yourgroup"` on the
+same match.
+
+What Pickle does with the device once it can open it:
+
+- **It opens a device only if that device cannot report typing.** A device
+  qualifies only if it reports `REL_X` and `REL_Y` (it moves a pointer) and
+  `BTN_LEFT` and the button you bound, and reports **no** key in the typing
+  block — `KEY_1` through `KEY_SLASH`, the number row, the letters, and the
+  punctuation between them. That last condition is the one that matters:
+  requiring `BTN_LEFT` alone is not enough, because a laptop keyboard with a
+  trackpoint, a keyboard/mouse combo behind one receiver, and many gaming
+  keyboards report `BTN_LEFT` and the full `KEY_*` range on a single node.
+- **Only the button you bound.** Every other event, pointer motion included, is
+  discarded without being examined, and no event is ever logged.
+- **Passively.** The device is not grabbed with `EVIOCGRAB`, so the button still
+  reaches the game underneath.
 
 ## Development
 
