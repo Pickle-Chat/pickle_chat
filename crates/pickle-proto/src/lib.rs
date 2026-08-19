@@ -154,7 +154,7 @@ impl ChannelKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
     /// `None` for a top-level channel. Nesting gives TeamSpeak-style trees.

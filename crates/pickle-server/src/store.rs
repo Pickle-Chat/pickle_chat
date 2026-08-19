@@ -700,4 +700,166 @@ mod tests {
         Store::open(&url).await.unwrap();
         Store::open(&url).await.unwrap();
     }
+
+    // ---- permission storage round-trips ------------------------------------
+    //
+    // The runtime query API has no compile-time checking with two backends,
+    // so each query's test is its compiler.
+
+    #[tokio::test]
+    async fn roles_round_trip_in_position_order() {
+        let (_dir, store) = store().await;
+        let admin = Role {
+            id: 2,
+            name: "admin".into(),
+            color: Some(0xff8800),
+            position: 2,
+            permissions: Permissions::ADMINISTRATOR,
+        };
+        let everyone = Role {
+            id: 0,
+            name: "everyone".into(),
+            color: None,
+            position: 0,
+            permissions: Permissions::DEFAULT_EVERYONE,
+        };
+        store.insert_role(&admin).await.unwrap();
+        store.insert_role(&everyone).await.unwrap();
+
+        let loaded = store.load_roles().await.unwrap();
+        assert_eq!(
+            loaded,
+            vec![everyone, admin],
+            "ordered by position, not insertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_high_bit_mask_survives_the_signed_column() {
+        // Bit 62 is the highest a mask may ever use; the cast through BIGINT
+        // must bring it back intact.
+        let (_dir, store) = store().await;
+        let role = Role {
+            id: 1,
+            name: "future".into(),
+            color: None,
+            position: 1,
+            permissions: Permissions(1 << 62),
+        };
+        store.insert_role(&role).await.unwrap();
+        assert_eq!(
+            store.load_roles().await.unwrap()[0].permissions,
+            Permissions(1 << 62)
+        );
+    }
+
+    #[tokio::test]
+    async fn channels_round_trip_with_their_config_shapes() {
+        let (_dir, store) = store().await;
+        let channel = Channel {
+            id: 3,
+            parent: Some(1),
+            name: "General".into(),
+            topic: "Hang out".into(),
+            kind: ChannelKind::VoiceAndText,
+            max_users: Some(8),
+            order: 2,
+            overwrites: Vec::new(),
+        };
+        store.insert_channel(&channel).await.unwrap();
+        assert_eq!(store.load_channels().await.unwrap(), vec![channel]);
+    }
+
+    #[tokio::test]
+    async fn overwrites_round_trip_for_both_target_kinds() {
+        let (_dir, store) = store().await;
+        let member = Identity::generate().fingerprint();
+        sqlx::query(
+            "INSERT INTO channel_overwrites (channel, target_kind, target, allow, deny)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(7i64)
+        .bind(0i64)
+        .bind("2")
+        .bind(Permissions::SEND_MESSAGES.0 as i64)
+        .bind(0i64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO channel_overwrites (channel, target_kind, target, allow, deny)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(7i64)
+        .bind(1i64)
+        .bind(member.to_string())
+        .bind(0i64)
+        .bind(Permissions::VIEW_CHANNEL.0 as i64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let loaded = store.load_overwrites().await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|(c, o)| *c == 7
+            && o.target == OverwriteTarget::Role(2)
+            && o.allow == Permissions::SEND_MESSAGES));
+        assert!(loaded.iter().any(|(c, o)| *c == 7
+            && o.target == OverwriteTarget::Member(member)
+            && o.deny == Permissions::VIEW_CHANNEL));
+    }
+
+    #[tokio::test]
+    async fn role_grants_round_trip_and_unreadable_rows_demote() {
+        let (_dir, store) = store().await;
+        let member = Identity::generate().fingerprint();
+        for (fp, role) in [
+            (member.to_string(), 2i64),
+            ("not-a-fingerprint".into(), 1i64),
+        ] {
+            sqlx::query("INSERT INTO role_members (fingerprint, role_id) VALUES ($1, $2)")
+                .bind(fp)
+                .bind(role)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let grants = store.load_role_members().await.unwrap();
+        assert_eq!(
+            grants,
+            vec![(member, 2)],
+            "the unreadable row is skipped, not fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ban_applies_until_it_expires_and_permanent_ones_never_do() {
+        let (_dir, store) = store().await;
+        let banned = Identity::generate().fingerprint();
+        let issuer = Identity::generate().fingerprint();
+        let forever = Identity::generate().fingerprint();
+        for (fp, until) in [(banned, Some(1_000i64)), (forever, None)] {
+            sqlx::query(
+                "INSERT INTO bans (fingerprint, reason, until_unix_ms, issued_by, issued_at_unix_ms)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(fp.to_string())
+            .bind("spam")
+            .bind(until)
+            .bind(issuer.to_string())
+            .bind(500i64)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+
+        // Before expiry: both apply. After: only the permanent one.
+        assert!(store.active_ban(banned, 999).await.unwrap().is_some());
+        assert!(store.active_ban(banned, 1_000).await.unwrap().is_none());
+        assert!(store.active_ban(forever, u64::MAX).await.unwrap().is_some());
+        assert!(
+            store.active_ban(issuer, 0).await.unwrap().is_none(),
+            "unbanned is unbanned"
+        );
+    }
 }
