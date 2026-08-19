@@ -23,7 +23,7 @@ use pickle_proto::{
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Control frames queued for one client.
 ///
@@ -138,6 +138,29 @@ impl Shared {
                 })
                 .ok()
         });
+
+        // Whether a server has an owner is the one thing an operator cannot
+        // work out from the outside. A `PICKLE_OWNER` that never reached the
+        // process and one that arrived correctly both start silently, and the
+        // existing warning above only fires on a value that is present but
+        // malformed. So say which it is, every time, and name the fingerprint
+        // so it can be checked against the one the client shows.
+        let assignments = roles.assignments().count();
+        match &owner {
+            Some(fingerprint) => info!(%fingerprint, assignments, "owner configured"),
+            // Not fatal — roles can carry every capability — but the owner is
+            // deliberately kept out of `roles.json` precisely so a damaged or
+            // emptied file cannot lock an operator out, and a server relying
+            // only on that file has given up the safeguard.
+            None if assignments > 0 => warn!(
+                assignments,
+                "no owner configured; administration depends entirely on roles.json"
+            ),
+            None => warn!(
+                "no owner and no role assignments: nobody can administer this server. \
+                 Set PICKLE_OWNER to the fingerprint your client shows."
+            ),
+        }
 
         Self {
             config,
@@ -605,7 +628,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use parking_lot::Mutex;
-    use pickle_proto::ChannelKind;
+    use pickle_proto::{Capability, ChannelKind};
     use std::sync::Arc;
 
     /// Records what would have gone out on the wire.
@@ -658,6 +681,52 @@ mod tests {
 
     fn shared() -> Shared {
         Shared::new(test_config(), Identity::generate(), [0u8; 32], test_roles())
+    }
+
+    #[test]
+    fn a_configured_owner_passes_every_check_and_nobody_else_does() {
+        // The behaviour PICKLE_OWNER exists for, asserted end to end from the
+        // config rather than from the role store: an operator who sets it has
+        // no way to confirm it took effect beyond a startup log, so the
+        // resolution from string to capability is worth pinning down.
+        let operator = Identity::generate();
+        let bystander = Identity::generate();
+
+        let config = ServerConfig {
+            owner: Some(operator.fingerprint().to_string()),
+            ..test_config()
+        };
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+
+        let owner = shared.permissions(operator.fingerprint());
+        for capability in Capability::ALL {
+            assert!(owner.allows(capability), "owner denied {capability:?}");
+        }
+
+        let other = shared.permissions(bystander.fingerprint());
+        assert!(
+            !other.allows(Capability::KickUsers),
+            "an unrelated identity must not inherit the owner's capabilities"
+        );
+    }
+
+    #[test]
+    fn a_malformed_owner_leaves_the_server_ownerless_rather_than_refusing_to_start() {
+        // Only reachable from a hand-edited config file; the environment path
+        // refuses a bad value outright. Starting ownerless is recoverable,
+        // where refusing to boot over a typo is not.
+        let config = ServerConfig {
+            owner: Some("not-a-fingerprint".into()),
+            ..test_config()
+        };
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+
+        assert!(
+            !shared
+                .permissions(Identity::generate().fingerprint())
+                .allows(Capability::KickUsers),
+            "a server with an unreadable owner must grant nobody ownership"
+        );
     }
 
     fn voice_frame(seq: u32) -> VoiceUpstream {

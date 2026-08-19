@@ -26,6 +26,13 @@ After=pickle-db.service
 
 [Container]
 Image=ghcr.io/pickle-chat/pickle-server:latest
+
+# Without this the container is named `systemd-pickle-server`, because podman's
+# generator prefixes the unit name. The service works either way, but every
+# `podman` command an operator reaches for takes the container name, so leaving
+# it implicit means `podman inspect pickle-server` reports nothing found.
+ContainerName=pickle-server
+
 Network=pickle.network
 
 # QUIC is UDP. See ../README.md.
