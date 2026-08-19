@@ -105,6 +105,32 @@ async fn expect_event<T>(
     }
 }
 
+/// Walk a client into "General" (channel 3), the default configuration's voice
+/// channel, and wait for the server to confirm the move. Admission lands
+/// everyone in the text-only lobby — connecting must never put someone in a
+/// room where they can be heard — so a test that wants audio flowing has to
+/// take that walk first, exactly as a person would.
+async fn join_general(
+    client: &pickle_client::Client,
+    events: &mut mpsc::UnboundedReceiver<ClientEvent>,
+) {
+    assert!(client.join_channel(3));
+    let id = client.client_id();
+    expect_event(
+        events,
+        "the move into the voice channel",
+        |event| match event {
+            ClientEvent::UserMoved {
+                client,
+                to: Some(3),
+                ..
+            } if *client == id => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn a_client_can_connect_and_authenticate() {
     let server = TestServer::default().await;
@@ -122,7 +148,7 @@ async fn a_client_can_connect_and_authenticate() {
 }
 
 #[tokio::test]
-async fn a_client_lands_in_the_default_channel() {
+async fn a_client_arrives_in_no_channel_with_a_place_to_read() {
     let server = TestServer::default().await;
     let (client, _events) = connect_client(&server, "alice").await.unwrap();
 
@@ -132,7 +158,17 @@ async fn a_client_lands_in_the_default_channel() {
         .iter()
         .find(|u| u.client_id == session.client_id)
         .unwrap();
-    assert_eq!(me.channel, Some(session.default_channel));
+    // Presence means standing in a voice room; connecting does not do that.
+    assert_eq!(me.channel, None);
+
+    // But there is somewhere to read from the first moment: the suggested
+    // channel carries text, and text is open without joining.
+    let suggested = session
+        .channels
+        .iter()
+        .find(|c| Some(c.id) == session.default_channel)
+        .expect("the default config has a text channel to suggest");
+    assert!(suggested.kind.has_text());
 }
 
 #[tokio::test]
@@ -271,9 +307,13 @@ async fn clients_see_each_other_arrive_and_leave() {
 async fn voice_reaches_another_client_in_the_same_channel() {
     // The core of the whole application: audio in one end, audio out the other.
     let server = TestServer::default().await;
-    let (alice, _alice_events) = connect_client(&server, "alice").await.unwrap();
-    let (_bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
+    let (alice, mut alice_events) = connect_client(&server, "alice").await.unwrap();
+    let (bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
     let alice_id = alice.client_id();
+    // Both walk from the text-only lobby into General; nothing is audible
+    // where admission put them.
+    join_general(&alice, &mut alice_events).await;
+    join_general(&bob, &mut bob_events).await;
 
     let payload = bytes::Bytes::from_static(&[0xaa, 0xbb, 0xcc, 0xdd]);
 
@@ -307,13 +347,14 @@ async fn voice_reaches_another_client_in_the_same_channel() {
 #[tokio::test]
 async fn voice_does_not_reach_a_client_in_another_channel() {
     let server = TestServer::default().await;
-    let (alice, _alice_events) = connect_client(&server, "alice").await.unwrap();
+    let (alice, mut alice_events) = connect_client(&server, "alice").await.unwrap();
     let (bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
 
-    // Channel 2 is "AFK" in the default configuration.
-    assert!(bob.join_channel(2));
+    // Alice speaks from "General"; bob sits in "AFK" (channel 4).
+    join_general(&alice, &mut alice_events).await;
+    assert!(bob.join_channel(4));
     expect_event(&mut bob_events, "bob's channel move", |event| match event {
-        ClientEvent::UserMoved { to: Some(2), .. } => Some(()),
+        ClientEvent::UserMoved { to: Some(4), .. } => Some(()),
         _ => None,
     })
     .await;
@@ -332,10 +373,34 @@ async fn voice_does_not_reach_a_client_in_another_channel() {
 }
 
 #[tokio::test]
-async fn a_muted_client_is_silenced_by_the_server() {
+async fn leaving_a_channel_places_you_nowhere_and_everyone_is_told() {
     let server = TestServer::default().await;
     let (alice, mut alice_events) = connect_client(&server, "alice").await.unwrap();
     let (_bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
+    let alice_id = alice.client_id();
+
+    join_general(&alice, &mut alice_events).await;
+
+    assert!(alice.leave_channel());
+    // The departure is broadcast, not private: bob sees alice step out.
+    expect_event(&mut bob_events, "alice leaving", |event| match event {
+        ClientEvent::UserMoved {
+            client,
+            from: Some(3),
+            to: None,
+        } if *client == alice_id => Some(()),
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_muted_client_is_silenced_by_the_server() {
+    let server = TestServer::default().await;
+    let (alice, mut alice_events) = connect_client(&server, "alice").await.unwrap();
+    let (bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
+    join_general(&alice, &mut alice_events).await;
+    join_general(&bob, &mut bob_events).await;
 
     assert!(alice.set_voice_state(true, false));
     expect_event(
@@ -367,7 +432,10 @@ async fn a_text_message_reaches_the_channel() {
     let (alice, mut alice_events) = connect_client(&server, "alice").await.unwrap();
     let (_bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
 
-    let channel = alice.session().default_channel;
+    let channel = alice
+        .session()
+        .default_channel
+        .expect("the default config lands clients in the lobby");
     assert!(alice.send_message(channel, "hello **world**", 12345));
 
     let received = expect_event(&mut bob_events, "the message", |event| match event {
@@ -551,7 +619,10 @@ async fn a_later_client_can_read_what_it_missed() {
     let server = TestServer::default().await;
 
     let (early, mut early_events) = connect_client(&server, "alice").await.unwrap();
-    let channel = early.session().default_channel;
+    let channel = early
+        .session()
+        .default_channel
+        .expect("the default config lands clients in the lobby");
     early.send_message(channel, "said while you were away", 1);
 
     // Wait for the server's echo before leaving. Sending is fire-and-forget, so
@@ -592,7 +663,9 @@ async fn history_is_scoped_to_the_channel_asked_about() {
     let (client, mut events) = connect_client(&server, "alice").await.unwrap();
 
     let session = client.session();
-    let default_channel = session.default_channel;
+    let default_channel = session
+        .default_channel
+        .expect("the default config lands clients in the lobby");
     let other = session
         .channels
         .iter()

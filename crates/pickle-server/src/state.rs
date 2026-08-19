@@ -23,7 +23,7 @@ use pickle_proto::{
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Control frames queued for one client.
 ///
@@ -93,7 +93,12 @@ pub struct Shared {
     pub identity: Identity,
     pub cert_hash: [u8; 32],
     pub limits: ServerLimits,
-    pub default_channel: ChannelId,
+    /// The channel a client should read first: the lowest-ordered top-level
+    /// channel that carries text. Text is open — every message reaches every
+    /// client, joined or not — so this is a suggestion about where to look,
+    /// not a placement. Nobody is placed anywhere on admission; presence
+    /// means standing in a voice room, and connecting must never do that.
+    pub default_channel: Option<ChannelId>,
     /// Who holds which role. Behind its own lock rather than inside `Inner`, so
     /// resolving permissions on every administrative command does not contend
     /// with the client and channel maps that voice relay reads.
@@ -118,10 +123,9 @@ impl Shared {
         let channels = build_channels(&config);
         let default_channel = channels
             .values()
-            .filter(|c| c.parent.is_none())
+            .filter(|c| c.parent.is_none() && c.kind.has_text())
             .min_by_key(|c| (c.order, c.id))
-            .map(|c| c.id)
-            .expect("config validation guarantees a top-level channel");
+            .map(|c| c.id);
 
         let limits = ServerLimits {
             max_users: config.max_users,
@@ -138,6 +142,29 @@ impl Shared {
                 })
                 .ok()
         });
+
+        // Whether a server has an owner is the one thing an operator cannot
+        // work out from the outside. A `PICKLE_OWNER` that never reached the
+        // process and one that arrived correctly both start silently, and the
+        // existing warning above only fires on a value that is present but
+        // malformed. So say which it is, every time, and name the fingerprint
+        // so it can be checked against the one the client shows.
+        let assignments = roles.assignments().count();
+        match &owner {
+            Some(fingerprint) => info!(%fingerprint, assignments, "owner configured"),
+            // Not fatal — roles can carry every capability — but the owner is
+            // deliberately kept out of `roles.json` precisely so a damaged or
+            // emptied file cannot lock an operator out, and a server relying
+            // only on that file has given up the safeguard.
+            None if assignments > 0 => warn!(
+                assignments,
+                "no owner configured; administration depends entirely on roles.json"
+            ),
+            None => warn!(
+                "no owner and no role assignments: nobody can administer this server. \
+                 Set PICKLE_OWNER to the fingerprint your client shows."
+            ),
+        }
 
         Self {
             config,
@@ -248,7 +275,7 @@ impl Shared {
             client_id,
             identity,
             nickname,
-            channel: Some(self.default_channel),
+            channel: None,
             voice: VoiceState::default(),
             connected_at_unix_ms: now_unix_ms(),
             permissions,
@@ -278,11 +305,17 @@ impl Shared {
     ) -> Result<Option<ChannelId>, ErrorCode> {
         let mut inner = self.inner.write();
 
-        let max_users = inner
+        let target = inner
             .channels
             .get(&channel)
-            .ok_or(ErrorCode::NoSuchChannel)?
-            .max_users;
+            .ok_or(ErrorCode::NoSuchChannel)?;
+        // Being "in" a channel means being in its voice room. A text channel
+        // has no room to stand in — everyone can already read and write it —
+        // so joining one is refused rather than recorded as meaningless state.
+        if !target.kind.has_voice() {
+            return Err(ErrorCode::NotPermitted);
+        }
+        let max_users = target.max_users;
         if let Some(max) = max_users {
             let occupants = inner
                 .clients
@@ -402,24 +435,6 @@ impl Shared {
     }
 
     /// Queue a control frame for everyone currently in `channel`.
-    pub fn broadcast_to_channel(
-        &self,
-        channel: ChannelId,
-        message: ServerControl,
-        except: Option<ClientId>,
-    ) {
-        let overflowed: Vec<ClientId> = {
-            let inner = self.inner.read();
-            inner
-                .clients
-                .iter()
-                .filter(|(id, entry)| Some(**id) != except && entry.info.channel == Some(channel))
-                .filter_map(|(_, entry)| try_queue(entry, message.clone()))
-                .collect()
-        };
-        self.drop_overflowed(overflowed.into_iter());
-    }
-
     /// Disconnect clients whose queue filled up.
     ///
     /// Their control stream has gaps by definition, so continuing would leave
@@ -605,7 +620,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use parking_lot::Mutex;
-    use pickle_proto::ChannelKind;
+    use pickle_proto::{Capability, ChannelKind};
     use std::sync::Arc;
 
     /// Records what would have gone out on the wire.
@@ -660,6 +675,52 @@ mod tests {
         Shared::new(test_config(), Identity::generate(), [0u8; 32], test_roles())
     }
 
+    #[test]
+    fn a_configured_owner_passes_every_check_and_nobody_else_does() {
+        // The behaviour PICKLE_OWNER exists for, asserted end to end from the
+        // config rather than from the role store: an operator who sets it has
+        // no way to confirm it took effect beyond a startup log, so the
+        // resolution from string to capability is worth pinning down.
+        let operator = Identity::generate();
+        let bystander = Identity::generate();
+
+        let config = ServerConfig {
+            owner: Some(operator.fingerprint().to_string()),
+            ..test_config()
+        };
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+
+        let owner = shared.permissions(operator.fingerprint());
+        for capability in Capability::ALL {
+            assert!(owner.allows(capability), "owner denied {capability:?}");
+        }
+
+        let other = shared.permissions(bystander.fingerprint());
+        assert!(
+            !other.allows(Capability::KickUsers),
+            "an unrelated identity must not inherit the owner's capabilities"
+        );
+    }
+
+    #[test]
+    fn a_malformed_owner_leaves_the_server_ownerless_rather_than_refusing_to_start() {
+        // Only reachable from a hand-edited config file; the environment path
+        // refuses a bad value outright. Starting ownerless is recoverable,
+        // where refusing to boot over a typo is not.
+        let config = ServerConfig {
+            owner: Some("not-a-fingerprint".into()),
+            ..test_config()
+        };
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+
+        assert!(
+            !shared
+                .permissions(Identity::generate().fingerprint())
+                .allows(Capability::KickUsers),
+            "a server with an unreadable owner must grant nobody ownership"
+        );
+    }
+
     fn voice_frame(seq: u32) -> VoiceUpstream {
         VoiceUpstream {
             seq,
@@ -668,12 +729,60 @@ mod tests {
         }
     }
 
+    /// Join and then move into "General" (channel 3), the default config's
+    /// voice channel. The relay tests need occupants somewhere audible, and
+    /// admission deliberately lands nobody there.
+    fn join_voice(shared: &Shared, nickname: &str) -> TestClient {
+        let client = join(shared, nickname);
+        shared.join_channel(client.info.client_id, 3).unwrap();
+        client
+    }
+
     #[test]
-    fn admitted_clients_land_in_the_default_channel() {
+    fn admission_places_nobody_anywhere() {
+        // Presence means standing in a voice room, and connecting must never
+        // do that. Text needs no presence at all.
         let shared = shared();
         let alice = join(&shared, "alice");
-        assert_eq!(alice.info.channel, Some(shared.default_channel));
+        assert_eq!(alice.info.channel, None);
         assert_eq!(shared.user_count(), 1);
+
+        // Nowhere is not stuck: an explicit join into a voice room works.
+        shared.join_channel(alice.info.client_id, 3).unwrap();
+    }
+
+    #[test]
+    fn joining_a_text_channel_is_refused() {
+        // Being "in" a channel is being in its voice room. A text channel has
+        // no room to stand in — everyone already reads and writes it — so the
+        // server refuses to record the meaningless state.
+        let shared = shared();
+        let alice = join(&shared, "alice");
+        assert_eq!(
+            shared.join_channel(alice.info.client_id, 1),
+            Err(ErrorCode::NotPermitted)
+        );
+    }
+
+    #[test]
+    fn a_message_reaches_clients_in_other_channels_and_in_none() {
+        // The openness rule itself: text delivery ignores presence entirely.
+        let shared = shared();
+        let alice = join(&shared, "alice");
+        let mut in_voice = join_voice(&shared, "bob");
+        let mut nowhere = join(&shared, "carol");
+
+        let message = shared.build_message(&alice.info, 1, "hi".into(), None);
+        shared.broadcast(
+            ServerControl::MessagePosted {
+                message: Box::new(message),
+                nonce: None,
+            },
+            Some(alice.info.client_id),
+        );
+
+        assert!(in_voice.control.try_recv().is_ok());
+        assert!(nowhere.control.try_recv().is_ok());
     }
 
     #[test]
@@ -755,8 +864,8 @@ mod tests {
     #[test]
     fn voice_reaches_others_in_the_same_channel() {
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.relay_voice(alice.info.client_id, voice_frame(1));
 
@@ -770,10 +879,10 @@ mod tests {
     #[test]
     fn voice_does_not_cross_channels() {
         let shared = shared();
-        let alice = join(&shared, "alice");
+        // Alice speaks from "General"; bob sits in "AFK" (channel 4).
+        let alice = join_voice(&shared, "alice");
         let bob = join(&shared, "bob");
-        // Channel 2 is "AFK" from the default config.
-        shared.join_channel(bob.info.client_id, 2).unwrap();
+        shared.join_channel(bob.info.client_id, 4).unwrap();
 
         shared.relay_voice(alice.info.client_id, voice_frame(1));
         assert!(bob.sink.0.lock().is_empty());
@@ -783,8 +892,8 @@ mod tests {
     fn a_muted_client_cannot_transmit() {
         // Enforced server-side, so a patched client gains nothing by lying.
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.set_voice_state(alice.info.client_id, true, false);
         shared.relay_voice(alice.info.client_id, voice_frame(1));
@@ -795,8 +904,8 @@ mod tests {
     #[test]
     fn a_deafened_client_receives_nothing() {
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.set_voice_state(bob.info.client_id, false, true);
         shared.relay_voice(alice.info.client_id, voice_frame(1));
@@ -816,15 +925,31 @@ mod tests {
 
     #[test]
     fn voice_is_dropped_in_a_text_only_channel() {
-        let mut config = test_config();
-        config.channels[0].kind = ChannelKind::Text;
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
-
+        // Admission lands both in the text-only Lobby, which is exactly the
+        // situation this guards: a client transmitting from a text channel —
+        // deliberately or through a bug — must reach nobody.
+        let shared = shared();
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
         shared.relay_voice(alice.info.client_id, voice_frame(1));
 
         assert!(bob.sink.0.lock().is_empty());
+    }
+
+    #[test]
+    fn leaving_a_channel_stops_voice_reaching_anyone() {
+        let shared = shared();
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
+
+        let from = shared.leave_channel(alice.info.client_id);
+        assert_eq!(from, Some(3), "leaving reports where the user was");
+
+        shared.relay_voice(alice.info.client_id, voice_frame(1));
+        assert!(
+            bob.sink.0.lock().is_empty(),
+            "a client in no channel must reach nobody"
+        );
     }
 
     #[test]
@@ -839,8 +964,8 @@ mod tests {
     fn the_relayed_frame_is_attributed_to_its_sender() {
         use pickle_proto::voice::VoiceDownstream;
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.relay_voice(alice.info.client_id, voice_frame(77));
 
@@ -864,29 +989,11 @@ mod tests {
     }
 
     #[test]
-    fn channel_broadcast_respects_membership() {
-        let shared = shared();
-        let alice = join(&shared, "alice");
-        let mut bob = join(&shared, "bob");
-        shared.join_channel(bob.info.client_id, 2).unwrap();
-
-        shared.broadcast_to_channel(
-            shared.default_channel,
-            ServerControl::Pong { nonce: 1 },
-            None,
-        );
-
-        let mut alice = alice;
-        assert!(alice.control.try_recv().is_ok());
-        assert!(bob.control.try_recv().is_err());
-    }
-
-    #[test]
     fn joining_reports_the_previous_channel() {
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let previous = shared.join_channel(alice.info.client_id, 2).unwrap();
-        assert_eq!(previous, Some(shared.default_channel));
+        let alice = join_voice(&shared, "alice");
+        let previous = shared.join_channel(alice.info.client_id, 4).unwrap();
+        assert_eq!(previous, Some(3));
     }
 
     #[test]
@@ -902,15 +1009,15 @@ mod tests {
     #[test]
     fn a_full_channel_refuses_new_arrivals() {
         let mut config = test_config();
-        config.channels[1].max_users = Some(1);
+        config.channels[2].max_users = Some(1);
         let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
-        shared.join_channel(alice.info.client_id, 2).unwrap();
+        shared.join_channel(alice.info.client_id, 3).unwrap();
 
         assert_eq!(
-            shared.join_channel(bob.info.client_id, 2),
+            shared.join_channel(bob.info.client_id, 3),
             Err(ErrorCode::ChannelFull)
         );
     }
@@ -919,12 +1026,12 @@ mod tests {
     fn rejoining_a_full_channel_you_are_already_in_is_allowed() {
         // The occupant count must exclude the joiner, or a re-join would fail.
         let mut config = test_config();
-        config.channels[1].max_users = Some(1);
+        config.channels[2].max_users = Some(1);
         let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
 
         let alice = join(&shared, "alice");
-        shared.join_channel(alice.info.client_id, 2).unwrap();
-        assert!(shared.join_channel(alice.info.client_id, 2).is_ok());
+        shared.join_channel(alice.info.client_id, 3).unwrap();
+        assert!(shared.join_channel(alice.info.client_id, 3).is_ok());
     }
 
     #[test]
@@ -957,10 +1064,21 @@ mod tests {
     }
 
     #[test]
-    fn the_default_channel_is_the_lowest_ordered_top_level_one() {
+    fn the_suggested_channel_is_the_lowest_ordered_text_one() {
         let shared = shared();
-        let lobby = shared.channel(shared.default_channel).unwrap();
+        let lobby = shared.channel(shared.default_channel.unwrap()).unwrap();
         assert_eq!(lobby.name, "Lobby");
+        assert!(lobby.kind.has_text());
+    }
+
+    #[test]
+    fn a_server_with_no_text_anywhere_suggests_nothing() {
+        let mut config = test_config();
+        for channel in &mut config.channels {
+            channel.kind = ChannelKind::Voice;
+        }
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        assert_eq!(shared.default_channel, None);
     }
 
     #[test]

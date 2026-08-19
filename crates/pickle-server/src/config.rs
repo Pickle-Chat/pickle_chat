@@ -148,14 +148,33 @@ fn default_channel_kind() -> ChannelKind {
     ChannelKind::VoiceAndText
 }
 fn default_channels() -> Vec<ChannelConfig> {
+    // The Lobby is text-only on purpose: it is where new connections land, and
+    // landing must never put someone in a room where they can be heard. Voice
+    // lives one click away in General.
     vec![
         ChannelConfig {
             name: "Lobby".into(),
             topic: "Say hello".into(),
-            kind: ChannelKind::VoiceAndText,
+            kind: ChannelKind::Text,
             parent: None,
             max_users: None,
             order: 0,
+        },
+        ChannelConfig {
+            name: "Off topic".into(),
+            topic: "Everything that is not the topic".into(),
+            kind: ChannelKind::Text,
+            parent: None,
+            max_users: None,
+            order: 1,
+        },
+        ChannelConfig {
+            name: "General".into(),
+            topic: "Hang out".into(),
+            kind: ChannelKind::VoiceAndText,
+            parent: None,
+            max_users: None,
+            order: 2,
         },
         ChannelConfig {
             name: "AFK".into(),

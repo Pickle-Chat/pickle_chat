@@ -7,9 +7,8 @@ chat people expect from Discord.
 There are no accounts. A user *is* an Ed25519 keypair on their own machine, and
 servers recognise returning users by public key. Nothing is registered anywhere.
 
-**Status:** early. Voice works end to end, and text chat is stored and served
-back — though the client does not yet render history it fetches. See
-[What works today](#what-works-today).
+**Status:** early. Voice works end to end; text chat is stored, and history is
+shown when you open a channel. See [What works today](#what-works-today).
 
 ## Quick start
 
@@ -122,23 +121,26 @@ server on a loopback port and drive real clients through it.
 Working:
 
 - Server hosting, configuration, channels (including nesting), server passwords
+- Channel kinds: voice, text-only, or both. Text is open — read and write any
+  text channel without joining it. Being *in* a channel means being in its
+  voice room, entered only by an explicit join, so connecting never puts you
+  somewhere you can be heard
 - Identity generation, mining, keystore, fingerprints
 - Several identities per user, switchable, with a chosen one signing each login
 - Several servers connected at once, a tab each, reopened on the next launch
 - Authentication with proof-of-work enforcement and certificate binding
 - Trust-on-first-use server pinning
 - Voice: capture, gating, Opus, relay, jitter buffering, mixing, mute/deafen
-- Text messages delivered live to a channel, and stored for history
+- Text messages delivered live, stored, and shown as history on opening a channel
 - Settings: identities, saved servers, audio devices, and keybinds, all persisted
 - Push to talk, bound to a key and grabbed globally where the platform allows
 - Desktop client covering all of the above
 
 Not yet built:
 
-- **Reading history in the client.** The server stores messages and answers
-  history requests, but the desktop client discards the response and still shows
-  only what arrived while it was connected. The protocol and the store are
-  finished; the UI is not.
+- **Older history than the first page.** Opening a channel shows its most
+  recent hundred messages; scrolling further back fetches nothing yet, though
+  the protocol supports asking.
 - **Editing, deletion, and reactions.** Still refused by the server, though the
   message store they were waiting on now exists.
 - **Rich text rendering.** Messages carry markdown; the client renders plain

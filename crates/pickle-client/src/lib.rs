@@ -205,7 +205,9 @@ pub struct SessionInfo {
     pub server_identity: PublicIdentity,
     pub channels: Vec<Channel>,
     pub users: Vec<UserInfo>,
-    pub default_channel: ChannelId,
+    /// The channel to read first — a suggestion, not a placement. `None` on
+    /// a server with no text-capable channel at all.
+    pub default_channel: Option<ChannelId>,
     pub limits: ServerLimits,
 }
 

@@ -13,6 +13,7 @@ import {
   type User,
 } from "./api";
 import { EMPTY, reduce, type ConnectionState } from "./connections";
+import { Fingerprint } from "./Fingerprint";
 import { LevelMeter } from "./LevelMeter";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { usePushToTalk } from "./usePushToTalk";
@@ -85,7 +86,10 @@ export function App() {
             password: bookmark?.password,
             identity: previous.identity,
           });
-          if (!cancelled) dispatch({ type: "opened", connection });
+          if (!cancelled) {
+            dispatch({ type: "opened", connection });
+            requestHistoryOnce(connection.session, connection.info.defaultChannel);
+          }
         } catch (e) {
           if (cancelled) continue;
           const changed = identityChangeOf(e);
@@ -117,10 +121,28 @@ export function App() {
 
   const active = connections.active === null ? null : connections.byId[connections.active] ?? null;
 
+  // Channels whose past has already been requested, keyed session:channel.
+  // Merging is idempotent, so this is politeness, not correctness — and a
+  // reconnect gets a new session id, which naturally asks again.
+  const historyRequested = useRef(new Set<string>());
+  const requestHistoryOnce = (session: SessionId, channel: number | null) => {
+    if (channel === null) return;
+    const key = `${session}:${channel}`;
+    if (historyRequested.current.has(key)) return;
+    historyRequested.current.add(key);
+    api.fetchHistory(session, channel).catch(() => {
+      // A channel with no fetchable past (voice-only, or history disabled)
+      // is not an error worth a banner; the pane simply starts empty.
+      historyRequested.current.delete(key);
+    });
+  };
+
   const onConnected = (connection: Connection) => {
     dispatch({ type: "opened", connection });
     setError(null);
     refreshVoice();
+    // The suggested channel is what the pane opens on; fill in its past.
+    requestHistoryOnce(connection.session, connection.info.defaultChannel);
   };
 
   // The deliberate act: pin the fingerprint the user was shown, then retry
@@ -225,8 +247,20 @@ export function App() {
           hasVoice={voiceSession === active.session}
           onError={setError}
           onSelectChannel={(channel) => {
+            // Selecting is reading, nothing more. Text is open on the server,
+            // so viewing a channel needs no presence in it — and must never
+            // acquire any as a side effect.
+            dispatch({ type: "channelSelected", session: active.session, channel });
+            requestHistoryOnce(active.session, channel);
+          }}
+          onJoinVoice={(channel) => {
+            // Entering a voice room also opens its text, if it carries any.
             dispatch({ type: "channelSelected", session: active.session, channel });
             api.joinChannel(active.session, channel).catch((e) => setError(String(e)));
+            requestHistoryOnce(active.session, channel);
+          }}
+          onLeaveChannel={() => {
+            api.leaveChannel(active.session).catch((e) => setError(String(e)));
           }}
           onTakeVoice={() => {
             api
@@ -317,6 +351,8 @@ function ConnectionView({
   hasVoice,
   onError,
   onSelectChannel,
+  onJoinVoice,
+  onLeaveChannel,
   onTakeVoice,
   onDisconnect,
 }: {
@@ -324,6 +360,8 @@ function ConnectionView({
   hasVoice: boolean;
   onError: (error: string) => void;
   onSelectChannel: (channel: number) => void;
+  onJoinVoice: (channel: number) => void;
+  onLeaveChannel: () => void;
   onTakeVoice: () => void;
   onDisconnect: () => void;
 }) {
@@ -354,7 +392,9 @@ function ConnectionView({
         activeChannel={connection.activeChannel}
         selfId={connection.info.clientId}
         hasVoice={hasVoice}
-        onJoin={onSelectChannel}
+        onSelect={onSelectChannel}
+        onJoinVoice={onJoinVoice}
+        onLeave={onLeaveChannel}
       />
       <ChatPane
         channel={channel}
@@ -421,10 +461,10 @@ function IdentityBadge({
           {identity.nickname}
         </button>
       )}
-      {/* The fingerprint, not the nickname, is what actually identifies you. */}
-      <code className="fingerprint" title={identity.fingerprint}>
-        {identity.short}
-      </code>
+      {/* The fingerprint, not the nickname, is what actually identifies you —
+          and it is what a server operator needs in order to grant you
+          anything, so it has to be copyable. */}
+      <Fingerprint value={identity.fingerprint} display={identity.short} />
       <span className="level" title="Identity security level — proof of work over your public key">
         L{identity.securityLevel}
       </span>
@@ -539,7 +579,9 @@ function ConnectForm({
                 <button className="linklike" onClick={() => setAddress(server.address)}>
                   {server.name}
                 </button>
-                <code className="fingerprint">{server.fingerprint}</code>
+                {/* Shown in full: this is the value compared out of band to
+                    check a server is the one you think it is. */}
+                <Fingerprint value={server.fingerprint} />
                 <span className="muted">{server.address}</span>
               </li>
             ))}
@@ -557,7 +599,9 @@ function ChannelList({
   activeChannel,
   selfId,
   hasVoice,
-  onJoin,
+  onSelect,
+  onJoinVoice,
+  onLeave,
 }: {
   session: SessionId;
   channels: Channel[];
@@ -566,7 +610,9 @@ function ChannelList({
   selfId: number;
   /// Whether this connection is the one carrying voice.
   hasVoice: boolean;
-  onJoin: (id: number) => void;
+  onSelect: (id: number) => void;
+  onJoinVoice: (id: number) => void;
+  onLeave: () => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
 
@@ -603,34 +649,67 @@ function ChannelList({
     <nav className="channels">
       {sorted.map((channel) => (
         <div key={channel.id} className={channel.parent ? "channel nested" : "channel"}>
-          <button
-            className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
-            onClick={() => onJoin(channel.id)}
-            title={channel.topic}
-          >
-            <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
-            {channel.name}
-          </button>
+          <div className="channel-row">
+            {/* Clicking reads. It never joins: text is open without presence,
+                and a click must not walk anyone into a voice room. */}
+            <button
+              className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
+              onClick={() => onSelect(channel.id)}
+              title={channel.topic}
+            >
+              <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
+              {channel.name}
+            </button>
+            {/* Presence is entered and left explicitly, only where there is a
+                voice room to be present in. */}
+            {channel.hasVoice &&
+              (users.some((u) => u.clientId === selfId && u.channel === channel.id) ? (
+                <button
+                  className="presence leave"
+                  onClick={onLeave}
+                  title="Leave — you will no longer be heard here"
+                  aria-label={`Leave ${channel.name}`}
+                >
+                  leave
+                </button>
+              ) : (
+                <button
+                  className="presence"
+                  onClick={() => onJoinVoice(channel.id)}
+                  title="Join this voice channel"
+                  aria-label={`Join ${channel.name}`}
+                >
+                  join
+                </button>
+              ))}
+          </div>
           <ul className="occupants">
             {users
               .filter((user) => user.channel === channel.id)
               .map((user) => {
+                // Voice presence is meaningless where nothing can be heard: in
+                // a text-only channel the engine may still be transmitting to a
+                // server that discards it, and a talk-dot there would show
+                // someone "speaking" whom nobody can hear.
+                const voiced = channel.hasVoice;
                 // `speaking` includes us when we are transmitting, so this one
                 // check covers everyone the channel can currently hear.
-                const talking = speaking.includes(user.clientId);
+                const talking = voiced && speaking.includes(user.clientId);
                 const silenced = user.selfDeafened || user.selfMuted;
 
                 return (
                   <li key={user.clientId} className={talking ? "speaking" : undefined}>
-                    {/* Always rendered, so names do not shift sideways as
-                        people start and stop talking. */}
-                    <span
-                      className={talking ? "talk-dot on" : "talk-dot"}
-                      aria-hidden="true"
-                    />
+                    {/* Always rendered in a voice channel, so names do not
+                        shift sideways as people start and stop talking. */}
+                    {voiced && (
+                      <span
+                        className={talking ? "talk-dot on" : "talk-dot"}
+                        aria-hidden="true"
+                      />
+                    )}
                     <span className="occupant-name">{user.nickname}</span>
                     {user.clientId === selfId && <span className="muted">(you)</span>}
-                    {silenced && (
+                    {voiced && silenced && (
                       <span
                         title={user.selfDeafened ? "Deafened" : "Muted"}
                         aria-label={user.selfDeafened ? "Deafened" : "Muted"}
@@ -640,7 +719,7 @@ function ChannelList({
                     )}
                     {/* Announced only for the person themselves; narrating every
                         speaker in a busy channel would be unusable. */}
-                    {user.clientId === selfId && (
+                    {user.clientId === selfId && voiced && (
                       <span className="visually-hidden" role="status" aria-live="polite">
                         {talking ? "Transmitting" : "Not transmitting"}
                       </span>
@@ -651,6 +730,24 @@ function ChannelList({
           </ul>
         </div>
       ))}
+      {/* Presence is voice presence, so anyone not standing in a voice room
+          lives here — which right after connecting is everyone. Render them,
+          or they would simply be invisible. */}
+      {users.some((user) => user.channel === null) && (
+        <div className="channel">
+          <span className="channel-name unjoined">Online — not in voice</span>
+          <ul className="occupants">
+            {users
+              .filter((user) => user.channel === null)
+              .map((user) => (
+                <li key={user.clientId}>
+                  <span className="occupant-name">{user.nickname}</span>
+                  {user.clientId === selfId && <span className="muted">(you)</span>}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
     </nav>
   );
 }
