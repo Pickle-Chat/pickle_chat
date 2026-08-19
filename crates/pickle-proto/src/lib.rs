@@ -76,7 +76,12 @@ pub struct AuthOk {
     pub client_id: ClientId,
     pub channels: Vec<Channel>,
     pub users: Vec<UserInfo>,
-    pub default_channel: ChannelId,
+    /// Where the server placed this client, if anywhere. Admission never puts
+    /// anyone in a channel that carries voice — connecting to a server should
+    /// not mean walking into a room where you can be heard — so on a server
+    /// with no text-only channel there is nowhere safe to land, and this is
+    /// `None`.
+    pub default_channel: Option<ChannelId>,
     pub limits: ServerLimits,
 }
 

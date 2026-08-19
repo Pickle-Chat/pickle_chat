@@ -150,7 +150,7 @@ pub struct SessionDto {
     pub client_id: u32,
     pub server_name: String,
     pub server_fingerprint: String,
-    pub default_channel: u32,
+    pub default_channel: Option<u32>,
     pub channels: Vec<ChannelDto>,
     pub users: Vec<UserDto>,
 }

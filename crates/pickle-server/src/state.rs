@@ -93,7 +93,12 @@ pub struct Shared {
     pub identity: Identity,
     pub cert_hash: [u8; 32],
     pub limits: ServerLimits,
-    pub default_channel: ChannelId,
+    /// Where admitted clients are placed, if anywhere: the lowest-ordered
+    /// top-level channel that carries no voice. Connecting to a server must
+    /// never drop someone into a room where they can be heard, so a server
+    /// whose channels all carry voice places new arrivals in no channel at
+    /// all rather than in the least bad one.
+    pub default_channel: Option<ChannelId>,
     /// Who holds which role. Behind its own lock rather than inside `Inner`, so
     /// resolving permissions on every administrative command does not contend
     /// with the client and channel maps that voice relay reads.
@@ -118,10 +123,9 @@ impl Shared {
         let channels = build_channels(&config);
         let default_channel = channels
             .values()
-            .filter(|c| c.parent.is_none())
+            .filter(|c| c.parent.is_none() && !c.kind.has_voice())
             .min_by_key(|c| (c.order, c.id))
-            .map(|c| c.id)
-            .expect("config validation guarantees a top-level channel");
+            .map(|c| c.id);
 
         let limits = ServerLimits {
             max_users: config.max_users,
@@ -248,7 +252,7 @@ impl Shared {
             client_id,
             identity,
             nickname,
-            channel: Some(self.default_channel),
+            channel: self.default_channel,
             voice: VoiceState::default(),
             connected_at_unix_ms: now_unix_ms(),
             permissions,
@@ -668,12 +672,52 @@ mod tests {
         }
     }
 
+    /// Join and then move into "General" (channel 2), the default config's
+    /// voice channel. The relay tests need occupants somewhere audible, and
+    /// admission deliberately lands nobody there.
+    fn join_voice(shared: &Shared, nickname: &str) -> TestClient {
+        let client = join(shared, nickname);
+        shared.join_channel(client.info.client_id, 2).unwrap();
+        client
+    }
+
     #[test]
     fn admitted_clients_land_in_the_default_channel() {
         let shared = shared();
         let alice = join(&shared, "alice");
-        assert_eq!(alice.info.channel, Some(shared.default_channel));
+        assert_eq!(alice.info.channel, shared.default_channel);
         assert_eq!(shared.user_count(), 1);
+    }
+
+    #[test]
+    fn admission_never_places_anyone_where_they_can_be_heard() {
+        let shared = shared();
+        let alice = join(&shared, "alice");
+        let landed = shared
+            .channel(alice.info.channel.expect("the default config has a lobby"))
+            .unwrap();
+        assert!(
+            !landed.kind.has_voice(),
+            "connecting must not walk anyone into a live microphone"
+        );
+    }
+
+    #[test]
+    fn a_server_with_only_voice_channels_places_arrivals_nowhere() {
+        // Every channel carries voice, so there is nowhere safe to land — and
+        // "nowhere" is the right answer, not the least bad voice room.
+        let mut config = test_config();
+        for channel in &mut config.channels {
+            channel.kind = ChannelKind::VoiceAndText;
+        }
+        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        assert_eq!(shared.default_channel, None);
+
+        let alice = join(&shared, "alice");
+        assert_eq!(alice.info.channel, None);
+
+        // Being nowhere is not being voiceless-forever: an explicit join works.
+        shared.join_channel(alice.info.client_id, 2).unwrap();
     }
 
     #[test]
@@ -755,8 +799,8 @@ mod tests {
     #[test]
     fn voice_reaches_others_in_the_same_channel() {
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.relay_voice(alice.info.client_id, voice_frame(1));
 
@@ -770,10 +814,10 @@ mod tests {
     #[test]
     fn voice_does_not_cross_channels() {
         let shared = shared();
-        let alice = join(&shared, "alice");
+        // Alice speaks from "General"; bob sits in "AFK" (channel 3).
+        let alice = join_voice(&shared, "alice");
         let bob = join(&shared, "bob");
-        // Channel 2 is "AFK" from the default config.
-        shared.join_channel(bob.info.client_id, 2).unwrap();
+        shared.join_channel(bob.info.client_id, 3).unwrap();
 
         shared.relay_voice(alice.info.client_id, voice_frame(1));
         assert!(bob.sink.0.lock().is_empty());
@@ -783,8 +827,8 @@ mod tests {
     fn a_muted_client_cannot_transmit() {
         // Enforced server-side, so a patched client gains nothing by lying.
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.set_voice_state(alice.info.client_id, true, false);
         shared.relay_voice(alice.info.client_id, voice_frame(1));
@@ -795,8 +839,8 @@ mod tests {
     #[test]
     fn a_deafened_client_receives_nothing() {
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.set_voice_state(bob.info.client_id, false, true);
         shared.relay_voice(alice.info.client_id, voice_frame(1));
@@ -816,10 +860,10 @@ mod tests {
 
     #[test]
     fn voice_is_dropped_in_a_text_only_channel() {
-        let mut config = test_config();
-        config.channels[0].kind = ChannelKind::Text;
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
-
+        // Admission lands both in the text-only Lobby, which is exactly the
+        // situation this guards: a client transmitting from a text channel —
+        // deliberately or through a bug — must reach nobody.
+        let shared = shared();
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
         shared.relay_voice(alice.info.client_id, voice_frame(1));
@@ -839,8 +883,8 @@ mod tests {
     fn the_relayed_frame_is_attributed_to_its_sender() {
         use pickle_proto::voice::VoiceDownstream;
         let shared = shared();
-        let alice = join(&shared, "alice");
-        let bob = join(&shared, "bob");
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
 
         shared.relay_voice(alice.info.client_id, voice_frame(77));
 
@@ -871,7 +915,7 @@ mod tests {
         shared.join_channel(bob.info.client_id, 2).unwrap();
 
         shared.broadcast_to_channel(
-            shared.default_channel,
+            shared.default_channel.unwrap(),
             ServerControl::Pong { nonce: 1 },
             None,
         );
@@ -886,7 +930,7 @@ mod tests {
         let shared = shared();
         let alice = join(&shared, "alice");
         let previous = shared.join_channel(alice.info.client_id, 2).unwrap();
-        assert_eq!(previous, Some(shared.default_channel));
+        assert_eq!(previous, shared.default_channel);
     }
 
     #[test]
@@ -957,10 +1001,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_channel_is_the_lowest_ordered_top_level_one() {
+    fn the_default_channel_is_the_lowest_ordered_voiceless_one() {
         let shared = shared();
-        let lobby = shared.channel(shared.default_channel).unwrap();
+        let lobby = shared.channel(shared.default_channel.unwrap()).unwrap();
         assert_eq!(lobby.name, "Lobby");
+        assert!(!lobby.kind.has_voice());
     }
 
     #[test]

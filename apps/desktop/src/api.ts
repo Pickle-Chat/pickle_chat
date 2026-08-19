@@ -61,7 +61,8 @@ export interface Session {
   clientId: number;
   serverName: string;
   serverFingerprint: string;
-  defaultChannel: number;
+  /** Where the server placed us — null on a server with nowhere voiceless to land. */
+  defaultChannel: number | null;
   channels: Channel[];
   users: User[];
 }

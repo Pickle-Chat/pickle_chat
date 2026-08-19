@@ -178,6 +178,15 @@ code.fingerprint {
   background: var(--panel-2);
 }
 
+/* The "Not in a channel" group heading: a span, not a button — there is
+   nothing to join — so it must not inherit button affordances. */
+.channel-name.unjoined {
+  display: block;
+  color: var(--muted);
+  font-style: italic;
+  padding: 2px 6px;
+}
+
 .channel .glyph {
   color: var(--muted);
 }

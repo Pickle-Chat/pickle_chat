@@ -537,22 +537,29 @@ function ChannelList({
             {users
               .filter((user) => user.channel === channel.id)
               .map((user) => {
+                // Voice presence is meaningless where nothing can be heard: in
+                // a text-only channel the engine may still be transmitting to a
+                // server that discards it, and a talk-dot there would show
+                // someone "speaking" whom nobody can hear.
+                const voiced = channel.hasVoice;
                 // `speaking` includes us when we are transmitting, so this one
                 // check covers everyone the channel can currently hear.
-                const talking = speaking.includes(user.clientId);
+                const talking = voiced && speaking.includes(user.clientId);
                 const silenced = user.selfDeafened || user.selfMuted;
 
                 return (
                   <li key={user.clientId} className={talking ? "speaking" : undefined}>
-                    {/* Always rendered, so names do not shift sideways as
-                        people start and stop talking. */}
-                    <span
-                      className={talking ? "talk-dot on" : "talk-dot"}
-                      aria-hidden="true"
-                    />
+                    {/* Always rendered in a voice channel, so names do not
+                        shift sideways as people start and stop talking. */}
+                    {voiced && (
+                      <span
+                        className={talking ? "talk-dot on" : "talk-dot"}
+                        aria-hidden="true"
+                      />
+                    )}
                     <span className="occupant-name">{user.nickname}</span>
                     {user.clientId === selfId && <span className="muted">(you)</span>}
-                    {silenced && (
+                    {voiced && silenced && (
                       <span
                         title={user.selfDeafened ? "Deafened" : "Muted"}
                         aria-label={user.selfDeafened ? "Deafened" : "Muted"}
@@ -562,7 +569,7 @@ function ChannelList({
                     )}
                     {/* Announced only for the person themselves; narrating every
                         speaker in a busy channel would be unusable. */}
-                    {user.clientId === selfId && (
+                    {user.clientId === selfId && voiced && (
                       <span className="visually-hidden" role="status" aria-live="polite">
                         {talking ? "Transmitting" : "Not transmitting"}
                       </span>
@@ -573,6 +580,25 @@ function ChannelList({
           </ul>
         </div>
       ))}
+      {/* A server whose channels all carry voice gives new arrivals nowhere to
+          land, so people can now exist in no channel at all. Render them, or
+          they would simply be invisible — including yourself, right after
+          connecting. */}
+      {users.some((user) => user.channel === null) && (
+        <div className="channel">
+          <span className="channel-name unjoined">Not in a channel</span>
+          <ul className="occupants">
+            {users
+              .filter((user) => user.channel === null)
+              .map((user) => (
+                <li key={user.clientId}>
+                  <span className="occupant-name">{user.nickname}</span>
+                  {user.clientId === selfId && <span className="muted">(you)</span>}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
     </nav>
   );
 }
