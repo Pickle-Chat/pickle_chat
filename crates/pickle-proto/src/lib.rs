@@ -76,11 +76,10 @@ pub struct AuthOk {
     pub client_id: ClientId,
     pub channels: Vec<Channel>,
     pub users: Vec<UserInfo>,
-    /// Where the server placed this client, if anywhere. Admission never puts
-    /// anyone in a channel that carries voice — connecting to a server should
-    /// not mean walking into a room where you can be heard — so on a server
-    /// with no text-only channel there is nowhere safe to land, and this is
-    /// `None`.
+    /// The channel a client should read first — a suggestion, not a
+    /// placement. Text is open: every message reaches every client, joined or
+    /// not, so admission places nobody anywhere. `None` on a server with no
+    /// text-capable channel at all.
     pub default_channel: Option<ChannelId>,
     pub limits: ServerLimits,
 }
@@ -274,6 +273,8 @@ pub struct UserInfo {
     pub client_id: ClientId,
     pub identity: PublicIdentity,
     pub nickname: String,
+    /// The voice room this user is standing in, if any. Text needs no
+    /// presence — every text channel is open to every connected user.
     pub channel: Option<ChannelId>,
     pub voice: VoiceState,
     pub connected_at_unix_ms: u64,

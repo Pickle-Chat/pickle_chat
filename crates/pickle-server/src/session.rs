@@ -400,7 +400,14 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
                     client_id,
                     ServerControl::Error {
                         code,
-                        detail: format!("could not join channel {channel}"),
+                        detail: if code == ErrorCode::NotPermitted {
+                            format!(
+                                "channel {channel} carries no voice; text channels \
+                                 are open to everyone without joining"
+                            )
+                        } else {
+                            format!("could not join channel {channel}")
+                        },
                     },
                 ),
             }
@@ -446,8 +453,7 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
         } => send_message(shared, client_id, channel, content, reply_to, nonce).await,
 
         ClientControl::Typing { channel } => {
-            shared.broadcast_to_channel(
-                channel,
+            shared.broadcast(
                 ServerControl::Typing {
                     client: client_id,
                     channel,
@@ -622,8 +628,10 @@ async fn send_message(
             nonce: Some(nonce),
         },
     );
-    shared.broadcast_to_channel(
-        channel,
+    // To everyone, not to the channel's occupants: text is readable without
+    // joining, and occupancy means voice presence. The channel id on the
+    // message is how clients file it, not who may see it.
+    shared.broadcast(
         ServerControl::MessagePosted {
             message: Box::new(message),
             nonce: None,

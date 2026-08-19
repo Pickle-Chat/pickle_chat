@@ -171,7 +171,7 @@ code.fingerprint {
 }
 
 /* Quiet until wanted: the row shows it, the hover names it. */
-.channel-row .leave {
+.channel-row .presence {
   background: none;
   border: none;
   color: var(--muted);
@@ -180,9 +180,13 @@ code.fingerprint {
   padding: 0 6px;
 }
 
-.channel-row:hover .leave,
-.channel-row .leave:focus-visible {
+.channel-row:hover .presence,
+.channel-row .presence:focus-visible {
   visibility: visible;
+}
+
+.channel-row .presence.leave {
+  color: var(--danger, #c66);
 }
 
 .channel-name {

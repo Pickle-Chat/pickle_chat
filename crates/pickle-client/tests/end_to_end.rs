@@ -148,7 +148,7 @@ async fn a_client_can_connect_and_authenticate() {
 }
 
 #[tokio::test]
-async fn a_client_lands_in_the_default_channel() {
+async fn a_client_arrives_in_no_channel_with_a_place_to_read() {
     let server = TestServer::default().await;
     let (client, _events) = connect_client(&server, "alice").await.unwrap();
 
@@ -158,18 +158,17 @@ async fn a_client_lands_in_the_default_channel() {
         .iter()
         .find(|u| u.client_id == session.client_id)
         .unwrap();
-    assert_eq!(me.channel, session.default_channel);
+    // Presence means standing in a voice room; connecting does not do that.
+    assert_eq!(me.channel, None);
 
-    // The landing channel is not merely *a* channel: it must carry no voice.
-    let landed = session
+    // But there is somewhere to read from the first moment: the suggested
+    // channel carries text, and text is open without joining.
+    let suggested = session
         .channels
         .iter()
-        .find(|c| Some(c.id) == me.channel)
-        .expect("the default config gives arrivals somewhere to land");
-    assert!(
-        !landed.kind.has_voice(),
-        "connecting must not walk anyone into a live microphone"
-    );
+        .find(|c| Some(c.id) == session.default_channel)
+        .expect("the default config has a text channel to suggest");
+    assert!(suggested.kind.has_text());
 }
 
 #[tokio::test]

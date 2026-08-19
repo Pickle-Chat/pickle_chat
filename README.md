@@ -122,8 +122,10 @@ server on a loopback port and drive real clients through it.
 Working:
 
 - Server hosting, configuration, channels (including nesting), server passwords
-- Channel kinds: voice, text-only, or both — connecting lands you in a
-  text-only channel, never in a room where you can be heard
+- Channel kinds: voice, text-only, or both. Text is open — read and write any
+  text channel without joining it. Being *in* a channel means being in its
+  voice room, entered only by an explicit join, so connecting never puts you
+  somewhere you can be heard
 - Identity generation, mining, keystore, fingerprints
 - Several identities per user, switchable, with a chosen one signing each login
 - Several servers connected at once, a tab each, reopened on the next launch

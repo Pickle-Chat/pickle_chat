@@ -161,14 +161,17 @@ export function App() {
           hasVoice={voiceSession === active.session}
           onError={setError}
           onSelectChannel={(channel) => {
+            // Selecting is reading, nothing more. Text is open on the server,
+            // so viewing a channel needs no presence in it — and must never
+            // acquire any as a side effect.
+            dispatch({ type: "channelSelected", session: active.session, channel });
+          }}
+          onJoinVoice={(channel) => {
+            // Entering a voice room also opens its text, if it carries any.
             dispatch({ type: "channelSelected", session: active.session, channel });
             api.joinChannel(active.session, channel).catch((e) => setError(String(e)));
           }}
           onLeaveChannel={() => {
-            // The view empties with the membership: staying parked on a room
-            // you just left would show a conversation that has stopped
-            // arriving, silently going stale.
-            dispatch({ type: "channelSelected", session: active.session, channel: null });
             api.leaveChannel(active.session).catch((e) => setError(String(e)));
           }}
           onTakeVoice={() => {
@@ -256,6 +259,7 @@ function ConnectionView({
   hasVoice,
   onError,
   onSelectChannel,
+  onJoinVoice,
   onLeaveChannel,
   onTakeVoice,
   onDisconnect,
@@ -264,6 +268,7 @@ function ConnectionView({
   hasVoice: boolean;
   onError: (error: string) => void;
   onSelectChannel: (channel: number) => void;
+  onJoinVoice: (channel: number) => void;
   onLeaveChannel: () => void;
   onTakeVoice: () => void;
   onDisconnect: () => void;
@@ -295,7 +300,8 @@ function ConnectionView({
         activeChannel={connection.activeChannel}
         selfId={connection.info.clientId}
         hasVoice={hasVoice}
-        onJoin={onSelectChannel}
+        onSelect={onSelectChannel}
+        onJoinVoice={onJoinVoice}
         onLeave={onLeaveChannel}
       />
       <ChatPane
@@ -489,7 +495,8 @@ function ChannelList({
   activeChannel,
   selfId,
   hasVoice,
-  onJoin,
+  onSelect,
+  onJoinVoice,
   onLeave,
 }: {
   session: SessionId;
@@ -499,7 +506,8 @@ function ChannelList({
   selfId: number;
   /// Whether this connection is the one carrying voice.
   hasVoice: boolean;
-  onJoin: (id: number) => void;
+  onSelect: (id: number) => void;
+  onJoinVoice: (id: number) => void;
   onLeave: () => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
@@ -538,31 +546,38 @@ function ChannelList({
       {sorted.map((channel) => (
         <div key={channel.id} className={channel.parent ? "channel nested" : "channel"}>
           <div className="channel-row">
+            {/* Clicking reads. It never joins: text is open without presence,
+                and a click must not walk anyone into a voice room. */}
             <button
               className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
-              onClick={() => onJoin(channel.id)}
+              onClick={() => onSelect(channel.id)}
               title={channel.topic}
             >
               <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
               {channel.name}
             </button>
-            {/* On the channel you are standing in, not the one you are
-                viewing: leaving is about presence — stepping out of a voice
-                room, or unsubscribing from a room's live messages. */}
-            {users.some((u) => u.clientId === selfId && u.channel === channel.id) && (
-              <button
-                className="leave"
-                onClick={onLeave}
-                title={
-                  channel.hasVoice
-                    ? "Leave — you will no longer be heard here"
-                    : "Leave — new messages here will no longer reach you"
-                }
-                aria-label={`Leave ${channel.name}`}
-              >
-                leave
-              </button>
-            )}
+            {/* Presence is entered and left explicitly, only where there is a
+                voice room to be present in. */}
+            {channel.hasVoice &&
+              (users.some((u) => u.clientId === selfId && u.channel === channel.id) ? (
+                <button
+                  className="presence leave"
+                  onClick={onLeave}
+                  title="Leave — you will no longer be heard here"
+                  aria-label={`Leave ${channel.name}`}
+                >
+                  leave
+                </button>
+              ) : (
+                <button
+                  className="presence"
+                  onClick={() => onJoinVoice(channel.id)}
+                  title="Join this voice channel"
+                  aria-label={`Join ${channel.name}`}
+                >
+                  join
+                </button>
+              ))}
           </div>
           <ul className="occupants">
             {users
@@ -611,13 +626,12 @@ function ChannelList({
           </ul>
         </div>
       ))}
-      {/* A server whose channels all carry voice gives new arrivals nowhere to
-          land, so people can now exist in no channel at all. Render them, or
-          they would simply be invisible — including yourself, right after
-          connecting. */}
+      {/* Presence is voice presence, so anyone not standing in a voice room
+          lives here — which right after connecting is everyone. Render them,
+          or they would simply be invisible. */}
       {users.some((user) => user.channel === null) && (
         <div className="channel">
-          <span className="channel-name unjoined">Not in a channel</span>
+          <span className="channel-name unjoined">Online — not in voice</span>
           <ul className="occupants">
             {users
               .filter((user) => user.channel === null)
