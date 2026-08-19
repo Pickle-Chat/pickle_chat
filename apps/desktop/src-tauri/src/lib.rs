@@ -94,6 +94,7 @@ pub fn run() {
             commands::speaking,
             commands::known_servers,
             commands::forget_server,
+            commands::trust_changed_identity,
             commands::bookmarks,
             commands::add_bookmark,
             commands::update_bookmark,
