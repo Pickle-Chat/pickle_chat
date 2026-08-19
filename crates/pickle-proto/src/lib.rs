@@ -13,6 +13,7 @@
 //! a single hole in the host's firewall.
 
 pub mod codec;
+pub mod perms;
 pub mod voice;
 
 use pickle_identity::{Fingerprint, PublicIdentity};
