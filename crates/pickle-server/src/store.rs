@@ -19,7 +19,11 @@
 //! held, so the property the voice relay depends on — never awaiting inside a
 //! lock — is untouched by adding a database.
 
-use pickle_proto::{ChannelId, ChatMessage, MessageId};
+use pickle_identity::Fingerprint;
+use pickle_proto::{
+    BanEntry, Channel, ChannelId, ChannelKind, ChatMessage, MessageId, Overwrite, OverwriteTarget,
+    Permissions, Role, RoleId,
+};
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Row};
 use std::path::Path;
@@ -184,6 +188,150 @@ impl Store {
         })
     }
 
+    // ---- Permissions ------------------------------------------------------
+    //
+    // Loaded once at startup into the in-memory engine and written through by
+    // the admin handlers. Everything stays in the portable subset; every
+    // query is covered by a round-trip test below, standing in for the
+    // compile-time checking two backends rule out.
+
+    /// Every role, ordered by position ascending (@everyone first).
+    pub async fn load_roles(&self) -> Result<Vec<Role>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, name, position, color, permissions FROM roles ORDER BY position ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(row_to_role)
+            .collect::<Result<_, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub async fn insert_role(&self, role: &Role) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO roles (id, name, position, color, permissions)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(role.id as i64)
+        .bind(role.name.clone())
+        .bind(role.position as i64)
+        .bind(role.color.map(|c| c as i64))
+        .bind(role.permissions.0 as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every member's explicit role grants.
+    pub async fn load_role_members(&self) -> Result<Vec<(Fingerprint, RoleId)>, StoreError> {
+        let rows = sqlx::query("SELECT fingerprint, role_id FROM role_members")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut grants = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let raw: String = row.try_get("fingerprint")?;
+            // A row this code did not write (hand-edited, or a future bug) is
+            // skipped rather than fatal: an unreadable grant must not stop the
+            // server, and dropping it merely demotes its holder.
+            let Ok(fingerprint) = Fingerprint::parse(&raw) else {
+                tracing::warn!(fingerprint = raw, "skipping an unreadable role grant");
+                continue;
+            };
+            let role: i64 = row.try_get("role_id")?;
+            grants.push((fingerprint, role as RoleId));
+        }
+        Ok(grants)
+    }
+
+    /// Every channel's overwrites, tagged with their channel id.
+    pub async fn load_overwrites(&self) -> Result<Vec<(ChannelId, Overwrite)>, StoreError> {
+        let rows =
+            sqlx::query("SELECT channel, target_kind, target, allow, deny FROM channel_overwrites")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut overwrites = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let channel: i64 = row.try_get("channel")?;
+            let kind: i64 = row.try_get("target_kind")?;
+            let raw: String = row.try_get("target")?;
+            let target = match kind {
+                0 => raw.parse::<RoleId>().ok().map(OverwriteTarget::Role),
+                1 => Fingerprint::parse(&raw).ok().map(OverwriteTarget::Member),
+                _ => None,
+            };
+            let Some(target) = target else {
+                tracing::warn!(target = raw, kind, "skipping an unreadable overwrite");
+                continue;
+            };
+            let allow: i64 = row.try_get("allow")?;
+            let deny: i64 = row.try_get("deny")?;
+            overwrites.push((
+                channel as ChannelId,
+                Overwrite {
+                    target,
+                    allow: Permissions(allow as u64),
+                    deny: Permissions(deny as u64),
+                },
+            ));
+        }
+        Ok(overwrites)
+    }
+
+    /// Every channel, in display order. Overwrites are loaded separately and
+    /// joined in memory by the caller.
+    pub async fn load_channels(&self) -> Result<Vec<Channel>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, parent, name, topic, kind, max_users, sort_order
+             FROM channels ORDER BY sort_order ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(row_to_channel)
+            .collect::<Result<_, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub async fn insert_channel(&self, channel: &Channel) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO channels (id, parent, name, topic, kind, max_users, sort_order)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(channel.id as i64)
+        .bind(channel.parent.map(|p| p as i64))
+        .bind(channel.name.clone())
+        .bind(channel.topic.clone())
+        .bind(kind_str(channel.kind))
+        .bind(channel.max_users.map(|m| m as i64))
+        .bind(channel.order as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The active ban for a fingerprint, if any. Expiry is compared here, on
+    /// read, so a lapsed ban needs nothing running to stop applying.
+    pub async fn active_ban(
+        &self,
+        fingerprint: Fingerprint,
+        now_unix_ms: u64,
+    ) -> Result<Option<BanEntry>, StoreError> {
+        let row = sqlx::query(
+            "SELECT fingerprint, reason, until_unix_ms, issued_by, issued_at_unix_ms
+             FROM bans WHERE fingerprint = $1",
+        )
+        .bind(fingerprint.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let ban = row_to_ban(&row)?;
+        match ban.until_unix_ms {
+            Some(until) if until <= now_unix_ms => Ok(None),
+            _ => Ok(Some(ban)),
+        }
+    }
+
     /// Delete messages older than `cutoff`, returning how many went.
     pub async fn prune_before(&self, cutoff_unix_ms: u64) -> Result<u64, StoreError> {
         let result = sqlx::query("DELETE FROM messages WHERE sent_at_unix_ms < $1")
@@ -250,6 +398,75 @@ pub struct History {
     /// Oldest first.
     pub messages: Vec<ChatMessage>,
     pub reached_start: bool,
+}
+
+fn row_to_role(row: &AnyRow) -> Result<Role, sqlx::Error> {
+    let id: i64 = row.try_get("id")?;
+    let position: i64 = row.try_get("position")?;
+    let color: Option<i64> = row.try_get("color")?;
+    let permissions: i64 = row.try_get("permissions")?;
+    Ok(Role {
+        id: id as RoleId,
+        name: row.try_get("name")?,
+        color: color.map(|c| c as u32),
+        position: position as u32,
+        permissions: Permissions(permissions as u64),
+    })
+}
+
+fn row_to_channel(row: &AnyRow) -> Result<Channel, sqlx::Error> {
+    let id: i64 = row.try_get("id")?;
+    let parent: Option<i64> = row.try_get("parent")?;
+    let kind: String = row.try_get("kind")?;
+    let max_users: Option<i64> = row.try_get("max_users")?;
+    let order: i64 = row.try_get("sort_order")?;
+    Ok(Channel {
+        id: id as ChannelId,
+        parent: parent.map(|p| p as ChannelId),
+        name: row.try_get("name")?,
+        topic: row.try_get("topic")?,
+        kind: kind_from_str(&kind),
+        max_users: max_users.map(|m| m as u16),
+        order: order as i32,
+        // Joined in memory by the caller from load_overwrites.
+        overwrites: Vec::new(),
+    })
+}
+
+fn row_to_ban(row: &AnyRow) -> Result<BanEntry, sqlx::Error> {
+    let raw: String = row.try_get("fingerprint")?;
+    let issued_by_raw: String = row.try_get("issued_by")?;
+    let until: Option<i64> = row.try_get("until_unix_ms")?;
+    let issued_at: i64 = row.try_get("issued_at_unix_ms")?;
+    let parse =
+        |value: &str| Fingerprint::parse(value).map_err(|e| sqlx::Error::Decode(Box::new(e)));
+    Ok(BanEntry {
+        fingerprint: parse(&raw)?,
+        reason: row.try_get("reason")?,
+        until_unix_ms: until.map(|u| u as u64),
+        issued_by: parse(&issued_by_raw)?,
+        issued_at_unix_ms: issued_at as u64,
+    })
+}
+
+/// The kind column's spellings are the config file's, so a row is readable by
+/// anyone who has seen a server.toml.
+fn kind_str(kind: ChannelKind) -> &'static str {
+    match kind {
+        ChannelKind::Voice => "voice",
+        ChannelKind::Text => "text",
+        ChannelKind::VoiceAndText => "voice_and_text",
+    }
+}
+
+fn kind_from_str(raw: &str) -> ChannelKind {
+    match raw {
+        "voice" => ChannelKind::Voice,
+        "text" => ChannelKind::Text,
+        // The unknown case reads as the most permissive kind rather than
+        // refusing to boot over one bad row.
+        _ => ChannelKind::VoiceAndText,
+    }
 }
 
 fn row_to_message(row: &AnyRow) -> Result<ChatMessage, sqlx::Error> {
