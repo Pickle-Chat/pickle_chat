@@ -74,9 +74,43 @@ input {
   padding: 6px 8px;
 }
 
-code.fingerprint {
+/* `code.fingerprint` is also used for short monospace values that are not
+   fingerprints at all — a device's vendor:product pair, a udev rule path — so
+   the bare-element form has to keep working alongside the button. */
+code.fingerprint,
+.fingerprint code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
+  color: var(--muted);
+}
+
+/* A fingerprint is a button so it can be copied, but it should read as the
+   value it is, not as a control. The affordance is deferred to hover. */
+button.fingerprint.copyable {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  border-radius: 3px;
+}
+
+button.fingerprint.copyable:hover code {
+  color: var(--text);
+  text-decoration: underline dotted;
+}
+
+/* Keyboard users get a permanent outline; the hover hint is not reachable. */
+button.fingerprint.copyable:focus-visible {
+  outline: 2px solid var(--accent, currentColor);
+  outline-offset: 2px;
+}
+
+.copy-flash {
+  font-size: 10px;
   color: var(--muted);
 }
 
