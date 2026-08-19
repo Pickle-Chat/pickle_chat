@@ -167,7 +167,18 @@ jobs:
             name: macos
             # One universal binary rather than separate Intel and Apple Silicon
             # downloads, which people pick wrongly.
-            args: --target universal-apple-darwin --bundles dmg
+            #
+            # The overlay config ad-hoc signs the bundle. Without it the app
+            # ships with no usable signature at all — `codesign -v` reports
+            # "code object is not signed at all" and Gatekeeper rejects it for
+            # "no usable signature" — and macOS then has no stable identity to
+            # attach a microphone grant to, so it asks again on every launch.
+            #
+            # It lives in its own file rather than in tauri.conf.json because a
+            # real certificate is configured through APPLE_CERTIFICATE, and
+            # tauri refuses to start when that disagrees with a `signingIdentity`
+            # in the config. Dropping this flag is then the whole migration.
+            args: --target universal-apple-darwin --bundles dmg --config src-tauri/tauri.macos-adhoc.conf.json
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
