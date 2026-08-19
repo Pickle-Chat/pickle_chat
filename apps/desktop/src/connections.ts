@@ -159,6 +159,20 @@ function applyEvent(
           active === connection.session ? connection.unread : connection.unread + 1,
       };
 
+    case "history": {
+      // The past merges in rather than replacing: live messages may already
+      // have arrived for this channel, and the author's own echo may overlap
+      // with what the server hands back. Ids are server-assigned and global,
+      // so they are both the dedupe key and the sort order. Unread does not
+      // move — nothing here is new.
+      const byId = new Map(connection.messages.map((m) => [m.id, m]));
+      for (const message of event.messages) byId.set(message.id, message);
+      return {
+        ...connection,
+        messages: [...byId.values()].sort((a, b) => a.id - b.id),
+      };
+    }
+
     case "serverError":
       return { ...connection, disconnected: connection.disconnected ?? event.detail };
 

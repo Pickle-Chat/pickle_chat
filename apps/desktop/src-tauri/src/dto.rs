@@ -252,6 +252,11 @@ pub enum EventDto {
     Message {
         message: MessageDto,
     },
+    History {
+        channel: u32,
+        messages: Vec<MessageDto>,
+        reached_start: bool,
+    },
     Typing {
         client_id: u32,
         channel: u32,
@@ -282,6 +287,15 @@ impl EventDto {
             ClientEvent::MessagePosted { message, .. } => Self::Message {
                 message: MessageDto::from(message),
             },
+            ClientEvent::History {
+                channel,
+                messages,
+                reached_start,
+            } => Self::History {
+                channel: *channel,
+                messages: messages.iter().map(MessageDto::from).collect(),
+                reached_start: *reached_start,
+            },
             ClientEvent::Typing { client, channel } => Self::Typing {
                 client_id: *client,
                 channel: *channel,
@@ -301,8 +315,7 @@ impl EventDto {
             | ClientEvent::ChannelUpdated(_)
             | ClientEvent::ChannelRemoved(_)
             | ClientEvent::MessageEdited { .. }
-            | ClientEvent::MessageDeleted { .. }
-            | ClientEvent::History { .. } => return None,
+            | ClientEvent::MessageDeleted { .. } => return None,
         })
     }
 }

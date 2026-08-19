@@ -74,7 +74,10 @@ export function App() {
             password: bookmark?.password,
             identity: previous.identity,
           });
-          if (!cancelled) dispatch({ type: "opened", connection });
+          if (!cancelled) {
+            dispatch({ type: "opened", connection });
+            requestHistoryOnce(connection.session, connection.info.defaultChannel);
+          }
         } catch (e) {
           if (!cancelled) {
             setError(`Could not reconnect to ${previous.address}: ${e}`);
@@ -95,10 +98,28 @@ export function App() {
 
   const active = connections.active === null ? null : connections.byId[connections.active] ?? null;
 
+  // Channels whose past has already been requested, keyed session:channel.
+  // Merging is idempotent, so this is politeness, not correctness — and a
+  // reconnect gets a new session id, which naturally asks again.
+  const historyRequested = useRef(new Set<string>());
+  const requestHistoryOnce = (session: SessionId, channel: number | null) => {
+    if (channel === null) return;
+    const key = `${session}:${channel}`;
+    if (historyRequested.current.has(key)) return;
+    historyRequested.current.add(key);
+    api.fetchHistory(session, channel).catch(() => {
+      // A channel with no fetchable past (voice-only, or history disabled)
+      // is not an error worth a banner; the pane simply starts empty.
+      historyRequested.current.delete(key);
+    });
+  };
+
   const onConnected = (connection: Connection) => {
     dispatch({ type: "opened", connection });
     setError(null);
     refreshVoice();
+    // The suggested channel is what the pane opens on; fill in its past.
+    requestHistoryOnce(connection.session, connection.info.defaultChannel);
   };
 
   const refreshVoice = () => {
@@ -165,11 +186,13 @@ export function App() {
             // so viewing a channel needs no presence in it — and must never
             // acquire any as a side effect.
             dispatch({ type: "channelSelected", session: active.session, channel });
+            requestHistoryOnce(active.session, channel);
           }}
           onJoinVoice={(channel) => {
             // Entering a voice room also opens its text, if it carries any.
             dispatch({ type: "channelSelected", session: active.session, channel });
             api.joinChannel(active.session, channel).catch((e) => setError(String(e)));
+            requestHistoryOnce(active.session, channel);
           }}
           onLeaveChannel={() => {
             api.leaveChannel(active.session).catch((e) => setError(String(e)));

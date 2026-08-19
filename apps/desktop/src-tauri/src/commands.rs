@@ -401,6 +401,21 @@ pub fn leave_channel(state: State<'_, AppState>, session: SessionId) -> Result<(
     })
 }
 
+/// Ask the server for a channel's recent past. The reply arrives as a
+/// History event through the same pump as everything else.
+#[tauri::command]
+pub fn fetch_history(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        // 100 is deliberately under the server's cap, leaving room to raise
+        // it here without a protocol conversation.
+        active.client.fetch_history(channel, None, 100);
+    })
+}
+
 #[tauri::command]
 pub fn send_message(
     state: State<'_, AppState>,
