@@ -81,6 +81,19 @@ podman run --rm -v pickle-data:/data \
   ghcr.io/pickle-chat/pickle-server:latest identity
 ```
 
+The server states at startup whether it has an owner and names the fingerprint,
+so a `PICKLE_OWNER` that never reached the container is visible rather than
+silent — the two cases are otherwise indistinguishable, because a server with no
+owner starts perfectly happily:
+
+```bash
+journalctl --user -u pickle-server | grep -i owner
+```
+
+A malformed fingerprint is different again: set through the environment it stops
+the server rather than being ignored, so a typo shows up as a unit that will not
+start, not as a server you quietly do not own.
+
 ## The two things that cost you a server
 
 **The port must be UDP.** `PublishPort=42071:42071/udp`. Pickle speaks QUIC;
