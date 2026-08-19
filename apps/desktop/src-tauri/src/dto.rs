@@ -66,7 +66,7 @@ pub struct IdentityListDto {
     pub identities: Vec<VaultEntryDto>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelDto {
     pub id: u32,
@@ -97,9 +97,12 @@ impl From<&Channel> for ChannelDto {
 pub struct UserDto {
     pub client_id: u32,
     pub nickname: String,
-    /// Abbreviated fingerprint — the only reliable way to tell apart two users
-    /// who chose the same nickname.
+    /// The full fingerprint: the stable key for anything that acts on a user
+    /// across sessions — role grants, bans, copy-to-verify.
     pub fingerprint: String,
+    /// Abbreviated form for lists, the only reliable way to tell apart two
+    /// users who chose the same nickname.
+    pub short: String,
     pub security_level: u32,
     pub channel: Option<u32>,
     pub self_muted: bool,
@@ -111,7 +114,8 @@ impl From<&UserInfo> for UserDto {
         Self {
             client_id: user.client_id,
             nickname: user.nickname.clone(),
-            fingerprint: user.identity.fingerprint().short(),
+            fingerprint: user.identity.fingerprint().to_string(),
+            short: user.identity.fingerprint().short(),
             security_level: user.identity.security_level(),
             channel: user.channel,
             self_muted: user.voice.self_muted,
@@ -261,7 +265,17 @@ pub enum EventDto {
         client_id: u32,
         channel: u32,
     },
+    ChannelCreated {
+        channel: ChannelDto,
+    },
+    ChannelUpdated {
+        channel: ChannelDto,
+    },
+    ChannelRemoved {
+        channel_id: u32,
+    },
     ServerError {
+        code: &'static str,
         detail: String,
     },
     Disconnected {
@@ -300,7 +314,15 @@ impl EventDto {
                 client_id: *client,
                 channel: *channel,
             },
-            ClientEvent::ServerError { detail, .. } => Self::ServerError {
+            ClientEvent::ChannelCreated(channel) => Self::ChannelCreated {
+                channel: ChannelDto::from(channel),
+            },
+            ClientEvent::ChannelUpdated(channel) => Self::ChannelUpdated {
+                channel: ChannelDto::from(channel),
+            },
+            ClientEvent::ChannelRemoved(id) => Self::ChannelRemoved { channel_id: *id },
+            ClientEvent::ServerError { code, detail } => Self::ServerError {
+                code: error_code_str(*code),
                 detail: detail.clone(),
             },
             ClientEvent::Disconnected { reason } => Self::Disconnected {
@@ -311,9 +333,6 @@ impl EventDto {
             ClientEvent::Voice(_)
             | ClientEvent::VoiceActivity { .. }
             | ClientEvent::Pong { .. }
-            | ClientEvent::ChannelCreated(_)
-            | ClientEvent::ChannelUpdated(_)
-            | ClientEvent::ChannelRemoved(_)
             | ClientEvent::MessageEdited { .. }
             | ClientEvent::MessageDeleted { .. } => return None,
         })
@@ -370,5 +389,71 @@ impl From<&pickle_client::ConnectError> for ConnectFailureDto {
             message: error.to_string(),
             identity_changed,
         }
+    }
+}
+
+/// Stable camelCase names for the frontend. Deliberately a hand-written
+/// exhaustive match rather than serde on the proto enum: the frontend should
+/// not depend on the wire format's spelling, and a new `ErrorCode` variant
+/// must fail compilation here instead of leaking an unknown string.
+fn error_code_str(code: pickle_proto::ErrorCode) -> &'static str {
+    use pickle_proto::ErrorCode;
+    match code {
+        ErrorCode::NotAuthenticated => "notAuthenticated",
+        ErrorCode::NoSuchChannel => "noSuchChannel",
+        ErrorCode::NoSuchMessage => "noSuchMessage",
+        ErrorCode::ChannelFull => "channelFull",
+        ErrorCode::ChannelPasswordRequired => "channelPasswordRequired",
+        ErrorCode::NotPermitted => "notPermitted",
+        ErrorCode::RateLimited => "rateLimited",
+        ErrorCode::MessageTooLong => "messageTooLong",
+        ErrorCode::Malformed => "malformed",
+        ErrorCode::Internal => "internal",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The JSON contract with api.ts, pinned where TypeScript cannot pin it:
+    /// the tag, the camelCase field names, and the code strings must match the
+    /// ServerEvent union by hand, so a drift here is a silent UI breakage.
+    #[test]
+    fn server_error_serializes_with_a_code_the_frontend_knows() {
+        let dto = EventDto::ServerError {
+            code: error_code_str(pickle_proto::ErrorCode::NotPermitted),
+            detail: "no".into(),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["type"], "serverError");
+        assert_eq!(json["code"], "notPermitted");
+        assert_eq!(json["detail"], "no");
+    }
+
+    #[test]
+    fn channel_removed_names_its_field_in_camel_case() {
+        let dto = EventDto::ChannelRemoved { channel_id: 7 };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["type"], "channelRemoved");
+        assert_eq!(json["channelId"], 7);
+    }
+
+    #[test]
+    fn a_user_dto_carries_both_fingerprint_forms() {
+        let identity = pickle_identity::Identity::generate();
+        let user = pickle_proto::UserInfo {
+            client_id: 1,
+            identity: identity.public(),
+            nickname: "randy".into(),
+            channel: None,
+            voice: Default::default(),
+            connected_at_unix_ms: 0,
+            permissions: Default::default(),
+        };
+        let dto = UserDto::from(&user);
+        assert_eq!(dto.fingerprint, identity.fingerprint().to_string());
+        assert_eq!(dto.short, identity.fingerprint().short());
+        assert_ne!(dto.fingerprint, dto.short, "short must actually abbreviate");
     }
 }

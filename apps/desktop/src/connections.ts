@@ -4,18 +4,36 @@
 // connection's slice, and keeping the rules in one place is what stops the tabs
 // from drifting apart as they are added.
 
-import type { Connection, Message, ServerEvent, Session, SessionId, User } from "./api";
+import type {
+  Channel,
+  Connection,
+  Message,
+  ServerErrorCode,
+  ServerEvent,
+  Session,
+  SessionId,
+  User,
+} from "./api";
 
 export interface ConnectionState {
   session: SessionId;
   info: Session;
   identity: string;
+  /// The live channel list, seeded from the login snapshot exactly as `users`
+  /// is. `info.channels` stays what login said; this one follows the channel
+  /// events, which is what lets the server change the map mid-session.
+  channels: Channel[];
   users: User[];
   messages: Message[];
   activeChannel: number | null;
   /// Set when the server drops us. The tab stays so the reason is readable
   /// rather than vanishing along with the explanation.
   disconnected: string | null;
+  /// The latest refusal, shown as a dismissible banner inside this tab. One
+  /// slot, last wins: a refusal answers the user's most recent action, and a
+  /// stack of stale ones would bury the answer. Deliberately NOT fatal — a
+  /// server saying "no" is a conversation, not a disconnection.
+  notice: { code: ServerErrorCode; detail: string } | null;
   /// Cleared when the tab is looked at, so a tab you are reading never nags.
   unread: number;
 }
@@ -34,6 +52,7 @@ export type Action =
   | { type: "closed"; session: SessionId }
   | { type: "focused"; session: SessionId | null }
   | { type: "channelSelected"; session: SessionId; channel: number | null }
+  | { type: "noticeDismissed"; session: SessionId }
   | { type: "event"; session: SessionId; event: ServerEvent };
 
 export function reduce(state: ConnectionsState, action: Action): ConnectionsState {
@@ -50,10 +69,12 @@ export function reduce(state: ConnectionsState, action: Action): ConnectionsStat
             session,
             info,
             identity,
+            channels: info.channels,
             users: info.users,
             messages: [],
             activeChannel: info.defaultChannel,
             disconnected: null,
+            notice: null,
             unread: 0,
           },
         },
@@ -89,6 +110,12 @@ export function reduce(state: ConnectionsState, action: Action): ConnectionsStat
       return {
         ...state,
         byId: patch(state, action.session, (c) => ({ ...c, activeChannel: action.channel })),
+      };
+
+    case "noticeDismissed":
+      return {
+        ...state,
+        byId: patch(state, action.session, (c) => ({ ...c, notice: null })),
       };
 
     case "event":
@@ -173,8 +200,44 @@ function applyEvent(
       };
     }
 
+    // The channel map can now change mid-session. Same shapes as the user
+    // events: created doubles as an upsert, updated replaces by id.
+    case "channelCreated":
+      return {
+        ...connection,
+        channels: [
+          ...connection.channels.filter((c) => c.id !== event.channel.id),
+          event.channel,
+        ],
+      };
+
+    case "channelUpdated":
+      return {
+        ...connection,
+        channels: connection.channels.map((c) =>
+          c.id === event.channel.id ? event.channel : c,
+        ),
+      };
+
+    case "channelRemoved": {
+      const channels = connection.channels.filter((c) => c.id !== event.channelId);
+      // The view cannot stay on a channel that no longer exists for us. Fall
+      // back to the login suggestion if it survives, else to nowhere.
+      const activeChannel =
+        connection.activeChannel === event.channelId
+          ? channels.some((c) => c.id === connection.info.defaultChannel)
+            ? connection.info.defaultChannel
+            : null
+          : connection.activeChannel;
+      return { ...connection, channels, activeChannel };
+    }
+
+    // A refusal is an answer, not an outage: the tab stays alive and the
+    // reason lands next to whatever provoked it. Only the `disconnected`
+    // event — which the client core emits exactly when the control stream is
+    // genuinely gone — may declare this connection dead.
     case "serverError":
-      return { ...connection, disconnected: connection.disconnected ?? event.detail };
+      return { ...connection, notice: { code: event.code, detail: event.detail } };
 
     case "disconnected":
       // The tab is kept, holding the reason. Removing it here would take the
