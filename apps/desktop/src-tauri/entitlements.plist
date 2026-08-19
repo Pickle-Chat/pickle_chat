@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Required as soon as the bundle is signed, because Tauri enables the
+    hardened runtime by default. Under it, Core Audio input is refused unless
+    the binary carries this entitlement — the Info.plist usage description
+    alone is not enough, and the refusal looks exactly like a broken
+    microphone: capture appears to run and delivers silence.
+
+    This lives in tauri.conf.json rather than alongside the ad-hoc signing
+    overlay because it is needed for any signature, including the Developer ID
+    one that replaces it.
+  -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
