@@ -143,6 +143,37 @@ code.fingerprint {
   border: none;
 }
 
+/* The identity decision is not a dismissible toast: it is a question, and it
+   looks like one. Amber rather than the error red — the situation is
+   suspicious, not yet known to be hostile. */
+.banner.identity-alert {
+  display: block;
+  background: #3a3320;
+  color: #f0e0b0;
+  border-bottom: 1px solid #a8892e;
+}
+
+.banner.identity-alert p {
+  margin: 6px 0;
+}
+
+.banner.identity-alert code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.identity-alert-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.identity-alert-actions button {
+  border: 1px solid #a8892e;
+  border-radius: 4px;
+  padding: 4px 10px;
+}
+
 .layout {
   flex: 1;
   min-height: 0;

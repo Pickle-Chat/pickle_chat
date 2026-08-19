@@ -306,3 +306,56 @@ impl EventDto {
         })
     }
 }
+
+/// Why a connection could not be made, in a shape the frontend can act on.
+///
+/// Almost every failure is just a sentence to show. The identity change is
+/// the exception: the library refuses to resolve it automatically — re-pinning
+/// must be a deliberate act by the user — so the frontend needs the parts,
+/// not the prose, to offer that act.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectFailureDto {
+    pub message: String,
+    pub identity_changed: Option<IdentityChangedDto>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityChangedDto {
+    /// The key the pin is filed under — what the user typed, canonicalised —
+    /// which is what a re-pin must be filed under too.
+    pub address_key: String,
+    pub previous: String,
+    pub current: String,
+}
+
+impl From<String> for ConnectFailureDto {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            identity_changed: None,
+        }
+    }
+}
+
+impl From<&pickle_client::ConnectError> for ConnectFailureDto {
+    fn from(error: &pickle_client::ConnectError) -> Self {
+        let identity_changed = match error {
+            pickle_client::ConnectError::IdentityChanged {
+                address,
+                expected,
+                actual,
+            } => Some(IdentityChangedDto {
+                address_key: address.clone(),
+                previous: expected.to_string(),
+                current: actual.to_string(),
+            }),
+            _ => None,
+        };
+        Self {
+            message: error.to_string(),
+            identity_changed,
+        }
+    }
+}

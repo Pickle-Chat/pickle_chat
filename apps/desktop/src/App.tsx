@@ -8,6 +8,8 @@ import {
   type Message,
   type SessionId,
   type Settings,
+  describeError,
+  identityChangeOf,
   type User,
 } from "./api";
 import { EMPTY, reduce, type ConnectionState } from "./connections";
@@ -20,6 +22,15 @@ export function App() {
   const [connections, dispatch] = useReducer(reduce, EMPTY);
   const [voiceSession, setVoiceSession] = useState<SessionId | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A server whose identity no longer matches the pin. Never resolved
+  // automatically — this holds the decision open until the user makes it,
+  // together with everything needed to retry the connection if they accept.
+  const [identityAlert, setIdentityAlert] = useState<{
+    addressKey: string;
+    previous: string;
+    current: string;
+    retry: { address: string; password?: string; identity?: string };
+  } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [restoring, setRestoring] = useState(false);
@@ -76,8 +87,19 @@ export function App() {
           });
           if (!cancelled) dispatch({ type: "opened", connection });
         } catch (e) {
-          if (!cancelled) {
-            setError(`Could not reconnect to ${previous.address}: ${e}`);
+          if (cancelled) continue;
+          const changed = identityChangeOf(e);
+          if (changed) {
+            setIdentityAlert({
+              ...changed,
+              retry: {
+                address: previous.address,
+                password: bookmark?.password,
+                identity: previous.identity,
+              },
+            });
+          } else {
+            setError(`Could not reconnect to ${previous.address}: ${describeError(e)}`);
           }
         }
       }
@@ -99,6 +121,27 @@ export function App() {
     dispatch({ type: "opened", connection });
     setError(null);
     refreshVoice();
+  };
+
+  // The deliberate act: pin the fingerprint the user was shown, then retry
+  // the connection that surfaced the change. If the server has changed again
+  // in the meantime, the retry fails with a fresh alert for the new value —
+  // nothing is ever pinned sight-unseen.
+  const trustAndReconnect = async () => {
+    if (!identityAlert) return;
+    const { addressKey, current, retry } = identityAlert;
+    setIdentityAlert(null);
+    try {
+      await api.trustChangedIdentity(addressKey, current);
+      onConnected(await api.connect(retry));
+    } catch (e) {
+      const changed = identityChangeOf(e);
+      if (changed) {
+        setIdentityAlert({ ...changed, retry });
+      } else {
+        setError(describeError(e));
+      }
+    }
   };
 
   const refreshVoice = () => {
@@ -146,6 +189,27 @@ export function App() {
         />
       )}
 
+      {identityAlert && (
+        <div className="banner identity-alert" role="alertdialog" aria-label="Server identity changed">
+          <div>
+            <strong>{identityAlert.retry.address} identifies differently.</strong>
+            <p>
+              It previously identified as <code>{identityAlert.previous}</code>, and now
+              presents <code>{identityAlert.current}</code>. This is what an impostor
+              would look like — but it is also what reinstalling or restoring a server
+              without its data volume looks like. Verify the new fingerprint with the
+              operator before trusting it.
+            </p>
+            <div className="identity-alert-actions">
+              <button onClick={trustAndReconnect}>
+                Trust the new identity and reconnect
+              </button>
+              <button onClick={() => setIdentityAlert(null)}>Not now</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {error && (
         <div className="banner error" role="alert">
           {error}
@@ -173,7 +237,11 @@ export function App() {
           onDisconnect={() => onDisconnect(active.session)}
         />
       ) : (
-        <ConnectForm onConnected={onConnected} onError={setError} />
+        <ConnectForm
+          onConnected={onConnected}
+          onError={setError}
+          onIdentityChanged={(change, retry) => setIdentityAlert({ ...change, retry })}
+        />
       )}
     </div>
   );
@@ -374,9 +442,14 @@ function IdentityBadge({
 function ConnectForm({
   onConnected,
   onError,
+  onIdentityChanged,
 }: {
   onConnected: (connection: Connection) => void;
   onError: (error: string) => void;
+  onIdentityChanged: (
+    change: { addressKey: string; previous: string; current: string },
+    retry: { address: string; password?: string; identity?: string },
+  ) => void;
 }) {
   const [address, setAddress] = useState("127.0.0.1:42071");
   const [password, setPassword] = useState("");
@@ -399,7 +472,12 @@ function ConnectForm({
       // holding the last one's password.
       setPassword("");
     } catch (err) {
-      onError(String(err));
+      const changed = identityChangeOf(err);
+      if (changed) {
+        onIdentityChanged(changed, { address, password: password || undefined, identity });
+      } else {
+        onError(describeError(err));
+      }
     } finally {
       setBusy(false);
     }
