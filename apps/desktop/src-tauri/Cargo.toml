@@ -23,6 +23,7 @@ pickle-audio.workspace = true
 tauri = { version = "2", features = [] }
 # Push-to-talk has to work while a game has focus, which an in-window key
 # listener cannot do.
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-global-shortcut = "2"
 serde.workspace = true
 serde_json.workspace = true
