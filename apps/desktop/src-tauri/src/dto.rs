@@ -330,7 +330,18 @@ impl EventDto {
             },
 
             // Handled on the Rust side or not yet surfaced in the UI.
-            ClientEvent::Voice(_)
+            // The role and admin-reply events feed the Rust-side permission
+            // mirror (next commit), which emits derived snapshot events the
+            // frontend can consume whole; the raw frames stay on this side of
+            // the bridge.
+            ClientEvent::RoleCreated(_)
+            | ClientEvent::RoleUpdated(_)
+            | ClientEvent::RoleDeleted { .. }
+            | ClientEvent::RolesReordered { .. }
+            | ClientEvent::BanList { .. }
+            | ClientEvent::Ack { .. }
+            | ClientEvent::CommandFailed { .. }
+            | ClientEvent::Voice(_)
             | ClientEvent::VoiceActivity { .. }
             | ClientEvent::Pong { .. }
             | ClientEvent::MessageEdited { .. }
@@ -449,7 +460,8 @@ mod tests {
             channel: None,
             voice: Default::default(),
             connected_at_unix_ms: 0,
-            permissions: Default::default(),
+            roles: Vec::new(),
+            owner: false,
         };
         let dto = UserDto::from(&user);
         assert_eq!(dto.fingerprint, identity.fingerprint().to_string());
