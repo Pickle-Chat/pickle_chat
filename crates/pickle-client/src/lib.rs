@@ -778,6 +778,50 @@ mod tests {
     }
 
     #[test]
+    fn a_deliberate_repin_resolves_a_changed_identity() {
+        // The resolution path the client UI drives: the user is shown the new
+        // fingerprint, agrees to it, the pin is replaced with exactly that
+        // value — and only then does the same connection succeed. Trusting is
+        // an act on the store, never a policy loosening.
+        let mut store = TrustStore::ephemeral();
+        let original = Identity::generate().fingerprint();
+        let replacement = Identity::generate().fingerprint();
+        store.trust("1.2.3.4:42071", original, "Server");
+
+        let check = |store: &mut TrustStore| {
+            apply_trust_policy(
+                store,
+                TrustPolicy::OnFirstUse,
+                "1.2.3.4:42071",
+                "1.2.3.4:42071",
+                replacement,
+                "Server",
+            )
+        };
+
+        assert!(matches!(
+            check(&mut store),
+            Err(ConnectError::IdentityChanged { .. })
+        ));
+
+        store.trust("1.2.3.4:42071", replacement, "Server");
+        check(&mut store).expect("the replaced pin must be honoured");
+
+        // And a server that changes identity *again* after the user agreed is
+        // refused again — nothing was pinned sight-unseen.
+        let third = Identity::generate().fingerprint();
+        let result = apply_trust_policy(
+            &mut store,
+            TrustPolicy::OnFirstUse,
+            "1.2.3.4:42071",
+            "1.2.3.4:42071",
+            third,
+            "Server",
+        );
+        assert!(matches!(result, Err(ConnectError::IdentityChanged { .. })));
+    }
+
+    #[test]
     fn insecure_policy_pins_nothing() {
         let mut store = TrustStore::ephemeral();
         let fingerprint = Identity::generate().fingerprint();
