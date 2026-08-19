@@ -61,7 +61,8 @@ export interface Session {
   clientId: number;
   serverName: string;
   serverFingerprint: string;
-  defaultChannel: number;
+  /** Where the server placed us — null on a server with nowhere voiceless to land. */
+  defaultChannel: number | null;
   channels: Channel[];
   users: User[];
 }
@@ -119,6 +120,7 @@ export type ServerEvent =
   | { type: "userMoved"; clientId: number; channel: number | null }
   | { type: "userUpdated"; user: User }
   | { type: "message"; message: Message }
+  | { type: "history"; channel: number; messages: Message[]; reachedStart: boolean }
   | { type: "typing"; clientId: number; channel: number }
   | { type: "serverError"; detail: string }
   | { type: "disconnected"; reason: string };
@@ -272,6 +274,9 @@ export const api = {
 
   joinChannel: (session: SessionId, channel: number) =>
     invoke<void>("join_channel", { session, channel }),
+  leaveChannel: (session: SessionId) => invoke<void>("leave_channel", { session }),
+  fetchHistory: (session: SessionId, channel: number) =>
+    invoke<void>("fetch_history", { session, channel }),
   sendMessage: (session: SessionId, channel: number, content: string) =>
     invoke<void>("send_message", { session, channel, content }),
 
