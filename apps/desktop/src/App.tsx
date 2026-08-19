@@ -52,9 +52,15 @@ export function App() {
   // on the Rust side and goes straight to the speakers. Each event names its
   // connection, so it lands in the right tab.
   useEffect(() => {
-    const unlisten = api.onServerEvent((session, event) =>
-      dispatch({ type: "event", session, event }),
-    );
+    const unlisten = api.onServerEvent((session, event) => {
+      // A channel that leaves our view must be refetched if it ever returns:
+      // whatever history we had for it is stale by exactly the span we were
+      // not allowed to watch.
+      if (event.type === "channelRemoved") {
+        historyRequested.current.delete(`${session}:${event.channelId}`);
+      }
+      dispatch({ type: "event", session, event });
+    });
     return () => {
       unlisten.then((fn) => fn());
     };
@@ -269,6 +275,7 @@ export function App() {
               .catch((e) => setError(String(e)));
           }}
           onDisconnect={() => onDisconnect(active.session)}
+          onDismissNotice={() => dispatch({ type: "noticeDismissed", session: active.session })}
         />
       ) : (
         <ConnectForm
@@ -355,6 +362,7 @@ function ConnectionView({
   onLeaveChannel,
   onTakeVoice,
   onDisconnect,
+  onDismissNotice,
 }: {
   connection: ConnectionState;
   hasVoice: boolean;
@@ -364,6 +372,7 @@ function ConnectionView({
   onLeaveChannel: () => void;
   onTakeVoice: () => void;
   onDisconnect: () => void;
+  onDismissNotice: () => void;
 }) {
   if (connection.disconnected) {
     return (
@@ -381,13 +390,22 @@ function ConnectionView({
   }
 
   const channel =
-    connection.info.channels.find((c) => c.id === connection.activeChannel) ?? null;
+    connection.channels.find((c) => c.id === connection.activeChannel) ?? null;
 
   return (
-    <main className="layout">
+    <>
+      {connection.notice && (
+        <div className="banner error connection-notice" role="alert">
+          {connection.notice.detail}
+          <button onClick={onDismissNotice} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      )}
+      <main className="layout">
       <ChannelList
         session={connection.session}
-        channels={connection.info.channels}
+        channels={connection.channels}
         users={connection.users}
         activeChannel={connection.activeChannel}
         selfId={connection.info.clientId}
@@ -414,7 +432,8 @@ function ConnectionView({
         onError={onError}
         onDisconnect={onDisconnect}
       />
-    </main>
+      </main>
+    </>
   );
 }
 

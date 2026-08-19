@@ -68,7 +68,10 @@ export interface Channel {
 export interface User {
   clientId: number;
   nickname: string;
+  /** Full fingerprint — the stable key for role grants, bans, verification. */
   fingerprint: string;
+  /** Abbreviated form for display. */
+  short: string;
   securityLevel: number;
   channel: number | null;
   selfMuted: boolean;
@@ -141,6 +144,21 @@ export interface MiningProgress {
   done: boolean;
 }
 
+/** Stable names for the server's refusal codes, mirrored from the Rust side's
+    exhaustive mapping — a new code is a compile error there, not a mystery
+    string here. */
+export type ServerErrorCode =
+  | "notAuthenticated"
+  | "noSuchChannel"
+  | "noSuchMessage"
+  | "channelFull"
+  | "channelPasswordRequired"
+  | "notPermitted"
+  | "rateLimited"
+  | "messageTooLong"
+  | "malformed"
+  | "internal";
+
 export type ServerEvent =
   | { type: "userJoined"; user: User }
   | { type: "userLeft"; clientId: number }
@@ -149,7 +167,10 @@ export type ServerEvent =
   | { type: "message"; message: Message }
   | { type: "history"; channel: number; messages: Message[]; reachedStart: boolean }
   | { type: "typing"; clientId: number; channel: number }
-  | { type: "serverError"; detail: string }
+  | { type: "channelCreated"; channel: Channel }
+  | { type: "channelUpdated"; channel: Channel }
+  | { type: "channelRemoved"; channelId: number }
+  | { type: "serverError"; code: ServerErrorCode; detail: string }
   | { type: "disconnected"; reason: string };
 
 export type GateMode = "voiceActivity" | "pushToTalk" | "continuous";
