@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    macOS will not grant microphone access to an app that does not say why it
+    wants it. Without this key the system never prompts, never lists Pickle
+    under Privacy & Security > Microphone, and Core Audio hands the app a
+    stream of zeros rather than reporting an error — so capture appears to work
+    while sending silence.
+
+    Tauri merges this file into the generated Info.plist. It is picked up by
+    virtue of sitting next to tauri.conf.json.
+  -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Pickle uses your microphone so you can talk to people in voice channels.</string>
+</dict>
+</plist>
