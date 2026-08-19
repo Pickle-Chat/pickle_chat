@@ -11,6 +11,7 @@ import {
   type User,
 } from "./api";
 import { EMPTY, reduce, type ConnectionState } from "./connections";
+import { Fingerprint } from "./Fingerprint";
 import { LevelMeter } from "./LevelMeter";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { usePushToTalk } from "./usePushToTalk";
@@ -392,10 +393,10 @@ function IdentityBadge({
           {identity.nickname}
         </button>
       )}
-      {/* The fingerprint, not the nickname, is what actually identifies you. */}
-      <code className="fingerprint" title={identity.fingerprint}>
-        {identity.short}
-      </code>
+      {/* The fingerprint, not the nickname, is what actually identifies you —
+          and it is what a server operator needs in order to grant you
+          anything, so it has to be copyable. */}
+      <Fingerprint value={identity.fingerprint} display={identity.short} />
       <span className="level" title="Identity security level — proof of work over your public key">
         L{identity.securityLevel}
       </span>
@@ -500,7 +501,9 @@ function ConnectForm({
                 <button className="linklike" onClick={() => setAddress(server.address)}>
                   {server.name}
                 </button>
-                <code className="fingerprint">{server.fingerprint}</code>
+                {/* Shown in full: this is the value compared out of band to
+                    check a server is the one you think it is. */}
+                <Fingerprint value={server.fingerprint} />
                 <span className="muted">{server.address}</span>
               </li>
             ))}

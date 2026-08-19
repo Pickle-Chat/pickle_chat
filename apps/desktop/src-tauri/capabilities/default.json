@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main Pickle window. Deliberately minimal: the app talks to servers through Rust, so the web layer needs no network, filesystem, or shell access of its own. Global shortcuts are registered from Rust, so the web layer is granted nothing beyond the plugin's default.",
+  "description": "Permissions for the main Pickle window. Deliberately minimal: the app talks to servers through Rust, so the web layer needs no network, filesystem, or shell access of its own. Global shortcuts are registered from Rust, so the web layer is granted nothing beyond the plugin's default. The clipboard is write-only — copying a fingerprint is the one use, and reading the clipboard back would let the page see whatever else the user had copied.",
   "windows": ["main"],
-  "permissions": ["core:default", "global-shortcut:default"]
+  "permissions": ["core:default", "global-shortcut:default", "clipboard-manager:allow-write-text"]
 }

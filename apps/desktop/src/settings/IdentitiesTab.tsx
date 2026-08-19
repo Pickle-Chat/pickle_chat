@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type IdentityList, type VaultEntry } from "../api";
+import { Fingerprint } from "../Fingerprint";
 
 export function IdentitiesTab({
   connected,
@@ -168,9 +169,7 @@ function IdentityRow({
           {active && <span className="muted"> — active</span>}
         </span>
         <span className="muted">
-          <code className="fingerprint" title={entry.fingerprint}>
-            {entry.short}
-          </code>{" "}
+          <Fingerprint value={entry.fingerprint} display={entry.short} />{" "}
           L{entry.securityLevel}
           {entry.label && ` · ${entry.label}`}
         </span>
