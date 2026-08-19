@@ -672,12 +672,12 @@ mod tests {
         }
     }
 
-    /// Join and then move into "General" (channel 2), the default config's
+    /// Join and then move into "General" (channel 3), the default config's
     /// voice channel. The relay tests need occupants somewhere audible, and
     /// admission deliberately lands nobody there.
     fn join_voice(shared: &Shared, nickname: &str) -> TestClient {
         let client = join(shared, nickname);
-        shared.join_channel(client.info.client_id, 2).unwrap();
+        shared.join_channel(client.info.client_id, 3).unwrap();
         client
     }
 
@@ -814,10 +814,10 @@ mod tests {
     #[test]
     fn voice_does_not_cross_channels() {
         let shared = shared();
-        // Alice speaks from "General"; bob sits in "AFK" (channel 3).
+        // Alice speaks from "General"; bob sits in "AFK" (channel 4).
         let alice = join_voice(&shared, "alice");
         let bob = join(&shared, "bob");
-        shared.join_channel(bob.info.client_id, 3).unwrap();
+        shared.join_channel(bob.info.client_id, 4).unwrap();
 
         shared.relay_voice(alice.info.client_id, voice_frame(1));
         assert!(bob.sink.0.lock().is_empty());
@@ -869,6 +869,22 @@ mod tests {
         shared.relay_voice(alice.info.client_id, voice_frame(1));
 
         assert!(bob.sink.0.lock().is_empty());
+    }
+
+    #[test]
+    fn leaving_a_channel_stops_voice_reaching_anyone() {
+        let shared = shared();
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
+
+        let from = shared.leave_channel(alice.info.client_id);
+        assert_eq!(from, Some(3), "leaving reports where the user was");
+
+        shared.relay_voice(alice.info.client_id, voice_frame(1));
+        assert!(
+            bob.sink.0.lock().is_empty(),
+            "a client in no channel must reach nobody"
+        );
     }
 
     #[test]

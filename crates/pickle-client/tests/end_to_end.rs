@@ -105,7 +105,7 @@ async fn expect_event<T>(
     }
 }
 
-/// Walk a client into "General" (channel 2), the default configuration's voice
+/// Walk a client into "General" (channel 3), the default configuration's voice
 /// channel, and wait for the server to confirm the move. Admission lands
 /// everyone in the text-only lobby — connecting must never put someone in a
 /// room where they can be heard — so a test that wants audio flowing has to
@@ -114,7 +114,7 @@ async fn join_general(
     client: &pickle_client::Client,
     events: &mut mpsc::UnboundedReceiver<ClientEvent>,
 ) {
-    assert!(client.join_channel(2));
+    assert!(client.join_channel(3));
     let id = client.client_id();
     expect_event(
         events,
@@ -122,7 +122,7 @@ async fn join_general(
         |event| match event {
             ClientEvent::UserMoved {
                 client,
-                to: Some(2),
+                to: Some(3),
                 ..
             } if *client == id => Some(()),
             _ => None,
@@ -351,11 +351,11 @@ async fn voice_does_not_reach_a_client_in_another_channel() {
     let (alice, mut alice_events) = connect_client(&server, "alice").await.unwrap();
     let (bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
 
-    // Alice speaks from "General"; bob sits in "AFK" (channel 3).
+    // Alice speaks from "General"; bob sits in "AFK" (channel 4).
     join_general(&alice, &mut alice_events).await;
-    assert!(bob.join_channel(3));
+    assert!(bob.join_channel(4));
     expect_event(&mut bob_events, "bob's channel move", |event| match event {
-        ClientEvent::UserMoved { to: Some(3), .. } => Some(()),
+        ClientEvent::UserMoved { to: Some(4), .. } => Some(()),
         _ => None,
     })
     .await;
@@ -371,6 +371,28 @@ async fn voice_does_not_reach_a_client_in_another_channel() {
             "voice must not cross channel boundaries"
         );
     }
+}
+
+#[tokio::test]
+async fn leaving_a_channel_places_you_nowhere_and_everyone_is_told() {
+    let server = TestServer::default().await;
+    let (alice, mut alice_events) = connect_client(&server, "alice").await.unwrap();
+    let (_bob, mut bob_events) = connect_client(&server, "bob").await.unwrap();
+    let alice_id = alice.client_id();
+
+    join_general(&alice, &mut alice_events).await;
+
+    assert!(alice.leave_channel());
+    // The departure is broadcast, not private: bob sees alice step out.
+    expect_event(&mut bob_events, "alice leaving", |event| match event {
+        ClientEvent::UserMoved {
+            client,
+            from: Some(3),
+            to: None,
+        } if *client == alice_id => Some(()),
+        _ => None,
+    })
+    .await;
 }
 
 #[tokio::test]

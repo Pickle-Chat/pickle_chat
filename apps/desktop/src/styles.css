@@ -165,6 +165,26 @@ code.fingerprint {
   margin-left: 14px;
 }
 
+.channel-row {
+  display: flex;
+  align-items: center;
+}
+
+/* Quiet until wanted: the row shows it, the hover names it. */
+.channel-row .leave {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  visibility: hidden;
+  padding: 0 6px;
+}
+
+.channel-row:hover .leave,
+.channel-row .leave:focus-visible {
+  visibility: visible;
+}
+
 .channel-name {
   width: 100%;
   text-align: left;

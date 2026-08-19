@@ -273,6 +273,7 @@ export const api = {
 
   joinChannel: (session: SessionId, channel: number) =>
     invoke<void>("join_channel", { session, channel }),
+  leaveChannel: (session: SessionId) => invoke<void>("leave_channel", { session }),
   sendMessage: (session: SessionId, channel: number, content: string) =>
     invoke<void>("send_message", { session, channel, content }),
 

@@ -33,7 +33,7 @@ export type Action =
   | { type: "opened"; connection: Connection }
   | { type: "closed"; session: SessionId }
   | { type: "focused"; session: SessionId | null }
-  | { type: "channelSelected"; session: SessionId; channel: number }
+  | { type: "channelSelected"; session: SessionId; channel: number | null }
   | { type: "event"; session: SessionId; event: ServerEvent };
 
 export function reduce(state: ConnectionsState, action: Action): ConnectionsState {

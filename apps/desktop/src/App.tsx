@@ -164,6 +164,13 @@ export function App() {
             dispatch({ type: "channelSelected", session: active.session, channel });
             api.joinChannel(active.session, channel).catch((e) => setError(String(e)));
           }}
+          onLeaveChannel={() => {
+            // The view empties with the membership: staying parked on a room
+            // you just left would show a conversation that has stopped
+            // arriving, silently going stale.
+            dispatch({ type: "channelSelected", session: active.session, channel: null });
+            api.leaveChannel(active.session).catch((e) => setError(String(e)));
+          }}
           onTakeVoice={() => {
             api
               .setVoiceSession(active.session)
@@ -249,6 +256,7 @@ function ConnectionView({
   hasVoice,
   onError,
   onSelectChannel,
+  onLeaveChannel,
   onTakeVoice,
   onDisconnect,
 }: {
@@ -256,6 +264,7 @@ function ConnectionView({
   hasVoice: boolean;
   onError: (error: string) => void;
   onSelectChannel: (channel: number) => void;
+  onLeaveChannel: () => void;
   onTakeVoice: () => void;
   onDisconnect: () => void;
 }) {
@@ -287,6 +296,7 @@ function ConnectionView({
         selfId={connection.info.clientId}
         hasVoice={hasVoice}
         onJoin={onSelectChannel}
+        onLeave={onLeaveChannel}
       />
       <ChatPane
         channel={channel}
@@ -480,6 +490,7 @@ function ChannelList({
   selfId,
   hasVoice,
   onJoin,
+  onLeave,
 }: {
   session: SessionId;
   channels: Channel[];
@@ -489,6 +500,7 @@ function ChannelList({
   /// Whether this connection is the one carrying voice.
   hasVoice: boolean;
   onJoin: (id: number) => void;
+  onLeave: () => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
 
@@ -525,14 +537,33 @@ function ChannelList({
     <nav className="channels">
       {sorted.map((channel) => (
         <div key={channel.id} className={channel.parent ? "channel nested" : "channel"}>
-          <button
-            className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
-            onClick={() => onJoin(channel.id)}
-            title={channel.topic}
-          >
-            <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
-            {channel.name}
-          </button>
+          <div className="channel-row">
+            <button
+              className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
+              onClick={() => onJoin(channel.id)}
+              title={channel.topic}
+            >
+              <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
+              {channel.name}
+            </button>
+            {/* On the channel you are standing in, not the one you are
+                viewing: leaving is about presence — stepping out of a voice
+                room, or unsubscribing from a room's live messages. */}
+            {users.some((u) => u.clientId === selfId && u.channel === channel.id) && (
+              <button
+                className="leave"
+                onClick={onLeave}
+                title={
+                  channel.hasVoice
+                    ? "Leave — you will no longer be heard here"
+                    : "Leave — new messages here will no longer reach you"
+                }
+                aria-label={`Leave ${channel.name}`}
+              >
+                leave
+              </button>
+            )}
+          </div>
           <ul className="occupants">
             {users
               .filter((user) => user.channel === channel.id)

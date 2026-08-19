@@ -391,6 +391,16 @@ pub fn join_channel(
     })
 }
 
+/// Step out of the current channel into no channel at all. Being nowhere is a
+/// real state: you are still connected, still listed, and no longer somewhere
+/// you can be heard or receive a room's live messages.
+#[tauri::command]
+pub fn leave_channel(state: State<'_, AppState>, session: SessionId) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active.client.leave_channel();
+    })
+}
+
 #[tauri::command]
 pub fn send_message(
     state: State<'_, AppState>,

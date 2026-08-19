@@ -161,12 +161,20 @@ fn default_channels() -> Vec<ChannelConfig> {
             order: 0,
         },
         ChannelConfig {
+            name: "Off topic".into(),
+            topic: "Everything that is not the topic".into(),
+            kind: ChannelKind::Text,
+            parent: None,
+            max_users: None,
+            order: 1,
+        },
+        ChannelConfig {
             name: "General".into(),
             topic: "Hang out".into(),
             kind: ChannelKind::VoiceAndText,
             parent: None,
             max_users: None,
-            order: 1,
+            order: 2,
         },
         ChannelConfig {
             name: "AFK".into(),
