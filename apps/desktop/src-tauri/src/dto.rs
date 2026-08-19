@@ -150,7 +150,7 @@ pub struct SessionDto {
     pub client_id: u32,
     pub server_name: String,
     pub server_fingerprint: String,
-    pub default_channel: u32,
+    pub default_channel: Option<u32>,
     pub channels: Vec<ChannelDto>,
     pub users: Vec<UserDto>,
 }
@@ -252,6 +252,11 @@ pub enum EventDto {
     Message {
         message: MessageDto,
     },
+    History {
+        channel: u32,
+        messages: Vec<MessageDto>,
+        reached_start: bool,
+    },
     Typing {
         client_id: u32,
         channel: u32,
@@ -282,6 +287,15 @@ impl EventDto {
             ClientEvent::MessagePosted { message, .. } => Self::Message {
                 message: MessageDto::from(message),
             },
+            ClientEvent::History {
+                channel,
+                messages,
+                reached_start,
+            } => Self::History {
+                channel: *channel,
+                messages: messages.iter().map(MessageDto::from).collect(),
+                reached_start: *reached_start,
+            },
             ClientEvent::Typing { client, channel } => Self::Typing {
                 client_id: *client,
                 channel: *channel,
@@ -301,8 +315,60 @@ impl EventDto {
             | ClientEvent::ChannelUpdated(_)
             | ClientEvent::ChannelRemoved(_)
             | ClientEvent::MessageEdited { .. }
-            | ClientEvent::MessageDeleted { .. }
-            | ClientEvent::History { .. } => return None,
+            | ClientEvent::MessageDeleted { .. } => return None,
         })
+    }
+}
+
+/// Why a connection could not be made, in a shape the frontend can act on.
+///
+/// Almost every failure is just a sentence to show. The identity change is
+/// the exception: the library refuses to resolve it automatically — re-pinning
+/// must be a deliberate act by the user — so the frontend needs the parts,
+/// not the prose, to offer that act.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectFailureDto {
+    pub message: String,
+    pub identity_changed: Option<IdentityChangedDto>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityChangedDto {
+    /// The key the pin is filed under — what the user typed, canonicalised —
+    /// which is what a re-pin must be filed under too.
+    pub address_key: String,
+    pub previous: String,
+    pub current: String,
+}
+
+impl From<String> for ConnectFailureDto {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            identity_changed: None,
+        }
+    }
+}
+
+impl From<&pickle_client::ConnectError> for ConnectFailureDto {
+    fn from(error: &pickle_client::ConnectError) -> Self {
+        let identity_changed = match error {
+            pickle_client::ConnectError::IdentityChanged {
+                address,
+                expected,
+                actual,
+            } => Some(IdentityChangedDto {
+                address_key: address.clone(),
+                previous: expected.to_string(),
+                current: actual.to_string(),
+            }),
+            _ => None,
+        };
+        Self {
+            message: error.to_string(),
+            identity_changed,
+        }
     }
 }

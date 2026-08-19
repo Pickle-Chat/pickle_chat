@@ -8,6 +8,8 @@ import {
   type Message,
   type SessionId,
   type Settings,
+  describeError,
+  identityChangeOf,
   type User,
 } from "./api";
 import { EMPTY, reduce, type ConnectionState } from "./connections";
@@ -21,6 +23,15 @@ export function App() {
   const [connections, dispatch] = useReducer(reduce, EMPTY);
   const [voiceSession, setVoiceSession] = useState<SessionId | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A server whose identity no longer matches the pin. Never resolved
+  // automatically — this holds the decision open until the user makes it,
+  // together with everything needed to retry the connection if they accept.
+  const [identityAlert, setIdentityAlert] = useState<{
+    addressKey: string;
+    previous: string;
+    current: string;
+    retry: { address: string; password?: string; identity?: string };
+  } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [restoring, setRestoring] = useState(false);
@@ -75,10 +86,24 @@ export function App() {
             password: bookmark?.password,
             identity: previous.identity,
           });
-          if (!cancelled) dispatch({ type: "opened", connection });
-        } catch (e) {
           if (!cancelled) {
-            setError(`Could not reconnect to ${previous.address}: ${e}`);
+            dispatch({ type: "opened", connection });
+            requestHistoryOnce(connection.session, connection.info.defaultChannel);
+          }
+        } catch (e) {
+          if (cancelled) continue;
+          const changed = identityChangeOf(e);
+          if (changed) {
+            setIdentityAlert({
+              ...changed,
+              retry: {
+                address: previous.address,
+                password: bookmark?.password,
+                identity: previous.identity,
+              },
+            });
+          } else {
+            setError(`Could not reconnect to ${previous.address}: ${describeError(e)}`);
           }
         }
       }
@@ -96,10 +121,49 @@ export function App() {
 
   const active = connections.active === null ? null : connections.byId[connections.active] ?? null;
 
+  // Channels whose past has already been requested, keyed session:channel.
+  // Merging is idempotent, so this is politeness, not correctness — and a
+  // reconnect gets a new session id, which naturally asks again.
+  const historyRequested = useRef(new Set<string>());
+  const requestHistoryOnce = (session: SessionId, channel: number | null) => {
+    if (channel === null) return;
+    const key = `${session}:${channel}`;
+    if (historyRequested.current.has(key)) return;
+    historyRequested.current.add(key);
+    api.fetchHistory(session, channel).catch(() => {
+      // A channel with no fetchable past (voice-only, or history disabled)
+      // is not an error worth a banner; the pane simply starts empty.
+      historyRequested.current.delete(key);
+    });
+  };
+
   const onConnected = (connection: Connection) => {
     dispatch({ type: "opened", connection });
     setError(null);
     refreshVoice();
+    // The suggested channel is what the pane opens on; fill in its past.
+    requestHistoryOnce(connection.session, connection.info.defaultChannel);
+  };
+
+  // The deliberate act: pin the fingerprint the user was shown, then retry
+  // the connection that surfaced the change. If the server has changed again
+  // in the meantime, the retry fails with a fresh alert for the new value —
+  // nothing is ever pinned sight-unseen.
+  const trustAndReconnect = async () => {
+    if (!identityAlert) return;
+    const { addressKey, current, retry } = identityAlert;
+    setIdentityAlert(null);
+    try {
+      await api.trustChangedIdentity(addressKey, current);
+      onConnected(await api.connect(retry));
+    } catch (e) {
+      const changed = identityChangeOf(e);
+      if (changed) {
+        setIdentityAlert({ ...changed, retry });
+      } else {
+        setError(describeError(e));
+      }
+    }
   };
 
   const refreshVoice = () => {
@@ -147,6 +211,27 @@ export function App() {
         />
       )}
 
+      {identityAlert && (
+        <div className="banner identity-alert" role="alertdialog" aria-label="Server identity changed">
+          <div>
+            <strong>{identityAlert.retry.address} identifies differently.</strong>
+            <p>
+              It previously identified as <code>{identityAlert.previous}</code>, and now
+              presents <code>{identityAlert.current}</code>. This is what an impostor
+              would look like — but it is also what reinstalling or restoring a server
+              without its data volume looks like. Verify the new fingerprint with the
+              operator before trusting it.
+            </p>
+            <div className="identity-alert-actions">
+              <button onClick={trustAndReconnect}>
+                Trust the new identity and reconnect
+              </button>
+              <button onClick={() => setIdentityAlert(null)}>Not now</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {error && (
         <div className="banner error" role="alert">
           {error}
@@ -162,8 +247,20 @@ export function App() {
           hasVoice={voiceSession === active.session}
           onError={setError}
           onSelectChannel={(channel) => {
+            // Selecting is reading, nothing more. Text is open on the server,
+            // so viewing a channel needs no presence in it — and must never
+            // acquire any as a side effect.
+            dispatch({ type: "channelSelected", session: active.session, channel });
+            requestHistoryOnce(active.session, channel);
+          }}
+          onJoinVoice={(channel) => {
+            // Entering a voice room also opens its text, if it carries any.
             dispatch({ type: "channelSelected", session: active.session, channel });
             api.joinChannel(active.session, channel).catch((e) => setError(String(e)));
+            requestHistoryOnce(active.session, channel);
+          }}
+          onLeaveChannel={() => {
+            api.leaveChannel(active.session).catch((e) => setError(String(e)));
           }}
           onTakeVoice={() => {
             api
@@ -174,7 +271,11 @@ export function App() {
           onDisconnect={() => onDisconnect(active.session)}
         />
       ) : (
-        <ConnectForm onConnected={onConnected} onError={setError} />
+        <ConnectForm
+          onConnected={onConnected}
+          onError={setError}
+          onIdentityChanged={(change, retry) => setIdentityAlert({ ...change, retry })}
+        />
       )}
     </div>
   );
@@ -250,6 +351,8 @@ function ConnectionView({
   hasVoice,
   onError,
   onSelectChannel,
+  onJoinVoice,
+  onLeaveChannel,
   onTakeVoice,
   onDisconnect,
 }: {
@@ -257,6 +360,8 @@ function ConnectionView({
   hasVoice: boolean;
   onError: (error: string) => void;
   onSelectChannel: (channel: number) => void;
+  onJoinVoice: (channel: number) => void;
+  onLeaveChannel: () => void;
   onTakeVoice: () => void;
   onDisconnect: () => void;
 }) {
@@ -287,7 +392,9 @@ function ConnectionView({
         activeChannel={connection.activeChannel}
         selfId={connection.info.clientId}
         hasVoice={hasVoice}
-        onJoin={onSelectChannel}
+        onSelect={onSelectChannel}
+        onJoinVoice={onJoinVoice}
+        onLeave={onLeaveChannel}
       />
       <ChatPane
         channel={channel}
@@ -375,9 +482,14 @@ function IdentityBadge({
 function ConnectForm({
   onConnected,
   onError,
+  onIdentityChanged,
 }: {
   onConnected: (connection: Connection) => void;
   onError: (error: string) => void;
+  onIdentityChanged: (
+    change: { addressKey: string; previous: string; current: string },
+    retry: { address: string; password?: string; identity?: string },
+  ) => void;
 }) {
   const [address, setAddress] = useState("127.0.0.1:42071");
   const [password, setPassword] = useState("");
@@ -400,7 +512,12 @@ function ConnectForm({
       // holding the last one's password.
       setPassword("");
     } catch (err) {
-      onError(String(err));
+      const changed = identityChangeOf(err);
+      if (changed) {
+        onIdentityChanged(changed, { address, password: password || undefined, identity });
+      } else {
+        onError(describeError(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -482,7 +599,9 @@ function ChannelList({
   activeChannel,
   selfId,
   hasVoice,
-  onJoin,
+  onSelect,
+  onJoinVoice,
+  onLeave,
 }: {
   session: SessionId;
   channels: Channel[];
@@ -491,7 +610,9 @@ function ChannelList({
   selfId: number;
   /// Whether this connection is the one carrying voice.
   hasVoice: boolean;
-  onJoin: (id: number) => void;
+  onSelect: (id: number) => void;
+  onJoinVoice: (id: number) => void;
+  onLeave: () => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
 
@@ -528,34 +649,67 @@ function ChannelList({
     <nav className="channels">
       {sorted.map((channel) => (
         <div key={channel.id} className={channel.parent ? "channel nested" : "channel"}>
-          <button
-            className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
-            onClick={() => onJoin(channel.id)}
-            title={channel.topic}
-          >
-            <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
-            {channel.name}
-          </button>
+          <div className="channel-row">
+            {/* Clicking reads. It never joins: text is open without presence,
+                and a click must not walk anyone into a voice room. */}
+            <button
+              className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
+              onClick={() => onSelect(channel.id)}
+              title={channel.topic}
+            >
+              <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
+              {channel.name}
+            </button>
+            {/* Presence is entered and left explicitly, only where there is a
+                voice room to be present in. */}
+            {channel.hasVoice &&
+              (users.some((u) => u.clientId === selfId && u.channel === channel.id) ? (
+                <button
+                  className="presence leave"
+                  onClick={onLeave}
+                  title="Leave — you will no longer be heard here"
+                  aria-label={`Leave ${channel.name}`}
+                >
+                  leave
+                </button>
+              ) : (
+                <button
+                  className="presence"
+                  onClick={() => onJoinVoice(channel.id)}
+                  title="Join this voice channel"
+                  aria-label={`Join ${channel.name}`}
+                >
+                  join
+                </button>
+              ))}
+          </div>
           <ul className="occupants">
             {users
               .filter((user) => user.channel === channel.id)
               .map((user) => {
+                // Voice presence is meaningless where nothing can be heard: in
+                // a text-only channel the engine may still be transmitting to a
+                // server that discards it, and a talk-dot there would show
+                // someone "speaking" whom nobody can hear.
+                const voiced = channel.hasVoice;
                 // `speaking` includes us when we are transmitting, so this one
                 // check covers everyone the channel can currently hear.
-                const talking = speaking.includes(user.clientId);
+                const talking = voiced && speaking.includes(user.clientId);
                 const silenced = user.selfDeafened || user.selfMuted;
 
                 return (
                   <li key={user.clientId} className={talking ? "speaking" : undefined}>
-                    {/* Always rendered, so names do not shift sideways as
-                        people start and stop talking. */}
-                    <span
-                      className={talking ? "talk-dot on" : "talk-dot"}
-                      aria-hidden="true"
-                    />
+                    {/* Always rendered in a voice channel, so names do not
+                        shift sideways as people start and stop talking. */}
+                    {voiced && (
+                      <span
+                        className={talking ? "talk-dot on" : "talk-dot"}
+                        aria-hidden="true"
+                      />
+                    )}
                     <span className="occupant-name">{user.nickname}</span>
                     {user.clientId === selfId && <span className="muted">(you)</span>}
-                    {silenced && (
+                    {voiced && silenced && (
                       <span
                         title={user.selfDeafened ? "Deafened" : "Muted"}
                         aria-label={user.selfDeafened ? "Deafened" : "Muted"}
@@ -565,7 +719,7 @@ function ChannelList({
                     )}
                     {/* Announced only for the person themselves; narrating every
                         speaker in a busy channel would be unusable. */}
-                    {user.clientId === selfId && (
+                    {user.clientId === selfId && voiced && (
                       <span className="visually-hidden" role="status" aria-live="polite">
                         {talking ? "Transmitting" : "Not transmitting"}
                       </span>
@@ -576,6 +730,24 @@ function ChannelList({
           </ul>
         </div>
       ))}
+      {/* Presence is voice presence, so anyone not standing in a voice room
+          lives here — which right after connecting is everyone. Render them,
+          or they would simply be invisible. */}
+      {users.some((user) => user.channel === null) && (
+        <div className="channel">
+          <span className="channel-name unjoined">Online — not in voice</span>
+          <ul className="occupants">
+            {users
+              .filter((user) => user.channel === null)
+              .map((user) => (
+                <li key={user.clientId}>
+                  <span className="occupant-name">{user.nickname}</span>
+                  {user.clientId === selfId && <span className="muted">(you)</span>}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
     </nav>
   );
 }

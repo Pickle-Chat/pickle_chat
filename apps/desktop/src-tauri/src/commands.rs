@@ -7,8 +7,8 @@
 use crate::bookmarks::{Bookmark, BookmarkInput};
 use crate::bridge;
 use crate::dto::{
-    AudioDeviceDto, ConnectionDto, IdentityDto, IdentityListDto, SessionDto, SessionListDto,
-    SpeakingDto, VaultEntryDto,
+    AudioDeviceDto, ConnectFailureDto, ConnectionDto, IdentityDto, IdentityListDto, SessionDto,
+    SessionListDto, SpeakingDto, VaultEntryDto,
 };
 use crate::mouse_grab;
 use crate::settings::{AudioSettings, Keybinds, Settings};
@@ -274,7 +274,7 @@ pub async fn connect(
     address: String,
     password: Option<String>,
     identity: Option<String>,
-) -> Result<ConnectionDto, String> {
+) -> Result<ConnectionDto, ConnectFailureDto> {
     let target = resolve(&address)?;
     let (identity, nickname, fingerprint) = state.identity_for(identity.as_deref())?;
     let mut trust = state.trust_store()?;
@@ -294,7 +294,7 @@ pub async fn connect(
 
     let (client, events) = pickle_client::connect(options, &identity, &mut trust)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ConnectFailureDto::from(&e))?;
 
     let session_dto = SessionDto::from(client.session());
     let id = state.next_session_id();
@@ -388,6 +388,31 @@ pub fn join_channel(
 ) -> Result<(), String> {
     state.with_session(session, |active| {
         active.client.join_channel(channel);
+    })
+}
+
+/// Step out of the current channel into no channel at all. Being nowhere is a
+/// real state: you are still connected, still listed, and no longer somewhere
+/// you can be heard or receive a room's live messages.
+#[tauri::command]
+pub fn leave_channel(state: State<'_, AppState>, session: SessionId) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active.client.leave_channel();
+    })
+}
+
+/// Ask the server for a channel's recent past. The reply arrives as a
+/// History event through the same pump as everything else.
+#[tauri::command]
+pub fn fetch_history(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        // 100 is deliberately under the server's cap, leaving room to raise
+        // it here without a protocol conversation.
+        active.client.fetch_history(channel, None, 100);
     })
 }
 
@@ -693,6 +718,38 @@ fn canonical_address(input: &str) -> String {
     } else {
         format!("{trimmed}:{DEFAULT_PORT}")
     }
+}
+
+/// Replace the pinned identity for one server — the deliberate act the
+/// library insists on and never performs itself.
+///
+/// Takes the fingerprint the user was shown and agreed to, not "whatever the
+/// server presents next". If the server has changed identity again since the
+/// warning, the next connection attempt fails with a fresh mismatch instead of
+/// silently pinning something the user never saw.
+#[tauri::command]
+pub fn trust_changed_identity(
+    state: State<'_, AppState>,
+    address_key: String,
+    fingerprint: String,
+) -> Result<(), String> {
+    let fingerprint = pickle_identity::Fingerprint::parse(&fingerprint)
+        .map_err(|e| format!("that fingerprint is not readable: {e}"))?;
+
+    let mut trust = state.trust_store()?;
+    // Keep the remembered server name; the pin is what changes, not what the
+    // entry is called in the servers-you-have-used list.
+    let name = trust
+        .get(&address_key)
+        .map(|entry| entry.name.clone())
+        .unwrap_or_default();
+
+    trust.trust(&address_key, fingerprint, &name);
+    // This save *is* the user's decision. A silent failure here would show
+    // the same warning again next connect, as though the click never happened.
+    trust.save().map_err(|e| e.to_string())?;
+    info!(server = %address_key, %fingerprint, "re-pinned a changed server identity");
+    Ok(())
 }
 
 fn resolve(input: &str) -> Result<SocketAddr, String> {

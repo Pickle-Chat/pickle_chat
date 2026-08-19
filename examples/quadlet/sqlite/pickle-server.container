@@ -14,6 +14,13 @@ Documentation=https://github.com/Pickle-Chat/pickle_chat
 [Container]
 Image=ghcr.io/pickle-chat/pickle-server:latest
 
+# Without this the container is named `systemd-pickle-server`, because podman's
+# generator prefixes the unit name. The service works either way, but every
+# `podman` command an operator reaches for takes the container name, so leaving
+# it implicit means `podman inspect pickle-server` reports nothing found.
+ContainerName=pickle-server
+
+
 # QUIC is UDP. Without the /udp suffix this publishes a TCP port that nothing
 # connects to, and the failure looks like a firewall rather than a typo.
 PublishPort=42071:42071/udp

@@ -177,6 +177,37 @@ button.fingerprint.copyable:focus-visible {
   border: none;
 }
 
+/* The identity decision is not a dismissible toast: it is a question, and it
+   looks like one. Amber rather than the error red — the situation is
+   suspicious, not yet known to be hostile. */
+.banner.identity-alert {
+  display: block;
+  background: #3a3320;
+  color: #f0e0b0;
+  border-bottom: 1px solid #a8892e;
+}
+
+.banner.identity-alert p {
+  margin: 6px 0;
+}
+
+.banner.identity-alert code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.identity-alert-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.identity-alert-actions button {
+  border: 1px solid #a8892e;
+  border-radius: 4px;
+  padding: 4px 10px;
+}
+
 .layout {
   flex: 1;
   min-height: 0;
@@ -199,6 +230,30 @@ button.fingerprint.copyable:focus-visible {
   margin-left: 14px;
 }
 
+.channel-row {
+  display: flex;
+  align-items: center;
+}
+
+/* Quiet until wanted: the row shows it, the hover names it. */
+.channel-row .presence {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  visibility: hidden;
+  padding: 0 6px;
+}
+
+.channel-row:hover .presence,
+.channel-row .presence:focus-visible {
+  visibility: visible;
+}
+
+.channel-row .presence.leave {
+  color: var(--danger, #c66);
+}
+
 .channel-name {
   width: 100%;
   text-align: left;
@@ -210,6 +265,15 @@ button.fingerprint.copyable:focus-visible {
 
 .channel-name.active {
   background: var(--panel-2);
+}
+
+/* The "Not in a channel" group heading: a span, not a button — there is
+   nothing to join — so it must not inherit button affordances. */
+.channel-name.unjoined {
+  display: block;
+  color: var(--muted);
+  font-style: italic;
+  padding: 2px 6px;
 }
 
 .channel .glyph {

@@ -28,6 +28,33 @@ export interface IdentityList {
   identities: VaultEntry[];
 }
 
+/** The shape `connect` rejects with. Everything is a message; an identity
+    change additionally carries the parts needed to act on it. */
+export interface ConnectFailure {
+  message: string;
+  identityChanged: {
+    /** The key the pin is filed under — pass back to trustChangedIdentity. */
+    addressKey: string;
+    previous: string;
+    current: string;
+  } | null;
+}
+
+/** A rejected invoke can carry our structured failure or a plain string. */
+export function describeError(err: unknown): string {
+  if (typeof err === "object" && err !== null && "message" in err) {
+    return String((err as { message: unknown }).message);
+  }
+  return String(err);
+}
+
+export function identityChangeOf(err: unknown): ConnectFailure["identityChanged"] {
+  if (typeof err === "object" && err !== null && "identityChanged" in err) {
+    return (err as ConnectFailure).identityChanged;
+  }
+  return null;
+}
+
 export interface Channel {
   id: number;
   parent: number | null;
@@ -61,7 +88,8 @@ export interface Session {
   clientId: number;
   serverName: string;
   serverFingerprint: string;
-  defaultChannel: number;
+  /** Where the server placed us — null on a server with nowhere voiceless to land. */
+  defaultChannel: number | null;
   channels: Channel[];
   users: User[];
 }
@@ -119,6 +147,7 @@ export type ServerEvent =
   | { type: "userMoved"; clientId: number; channel: number | null }
   | { type: "userUpdated"; user: User }
   | { type: "message"; message: Message }
+  | { type: "history"; channel: number; messages: Message[]; reachedStart: boolean }
   | { type: "typing"; clientId: number; channel: number }
   | { type: "serverError"; detail: string }
   | { type: "disconnected"; reason: string };
@@ -272,6 +301,9 @@ export const api = {
 
   joinChannel: (session: SessionId, channel: number) =>
     invoke<void>("join_channel", { session, channel }),
+  leaveChannel: (session: SessionId) => invoke<void>("leave_channel", { session }),
+  fetchHistory: (session: SessionId, channel: number) =>
+    invoke<void>("fetch_history", { session, channel }),
   sendMessage: (session: SessionId, channel: number, content: string) =>
     invoke<void>("send_message", { session, channel, content }),
 
@@ -286,6 +318,10 @@ export const api = {
   knownServers: () =>
     invoke<{ address: string; name: string; fingerprint: string }[]>("known_servers"),
   forgetServer: (address: string) => invoke<void>("forget_server", { address }),
+  /** The deliberate re-pin after an identity change. Pass the fingerprint the
+      user was shown — never whatever the server presents next. */
+  trustChangedIdentity: (addressKey: string, fingerprint: string) =>
+    invoke<void>("trust_changed_identity", { addressKey, fingerprint }),
 
   // Bookmarks are organisational; known servers above are security state. The
   // two are deliberately separate — see the Rust `bookmarks` module.
