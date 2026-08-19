@@ -16,6 +16,11 @@ pub mod codec;
 pub mod perms;
 pub mod voice;
 
+pub use perms::{
+    can_act_on, can_manage_role, resolve, top_role_position, Overwrite, OverwriteTarget,
+    Permissions, Role, RoleId, EVERYONE_ROLE_ID,
+};
+
 use pickle_identity::{Fingerprint, PublicIdentity};
 use serde::{Deserialize, Serialize};
 
@@ -23,11 +28,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// Pre-1.0 this is checked for exact equality: a mismatch is refused outright
 /// rather than negotiated down.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// TLS ALPN identifier. Also carries the version, so an incompatible client is
 /// rejected during the TLS handshake rather than after it.
-pub const ALPN: &[u8] = b"pickle/1";
+pub const ALPN: &[u8] = b"pickle/2";
 
 /// Server-assigned, unique for the lifetime of a connection and reused
 /// afterwards. Not an identity — use [`Fingerprint`] to recognise a person.
@@ -77,10 +82,11 @@ pub struct AuthOk {
     pub client_id: ClientId,
     pub channels: Vec<Channel>,
     pub users: Vec<UserInfo>,
+    /// Every role on the server, @everyone included, ordered by position.
+    pub roles: Vec<Role>,
     /// The channel a client should read first — a suggestion, not a
-    /// placement. Text is open: every message reaches every client, joined or
-    /// not, so admission places nobody anywhere. `None` on a server with no
-    /// text-capable channel at all.
+    /// placement. `None` when no text-capable channel is visible to this
+    /// member.
     pub default_channel: Option<ChannelId>,
     pub limits: ServerLimits,
 }
@@ -157,9 +163,11 @@ pub struct Channel {
     pub topic: String,
     pub kind: ChannelKind,
     pub max_users: Option<u16>,
-    pub password_protected: bool,
     /// Sort key within the parent; ties broken by name.
     pub order: i32,
+    /// Per-channel exceptions to role permissions. Wire-visible channel data:
+    /// clients resolve their own bits from these with [`resolve`].
+    pub overwrites: Vec<Overwrite>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,114 +180,25 @@ pub struct VoiceState {
 }
 
 // ---------------------------------------------------------------------------
-// Permissions
+// Permissions — see the `perms` module, re-exported at the crate root.
 // ---------------------------------------------------------------------------
-
-/// One thing a user may be allowed to do.
-///
-/// Explicit rather than implied by rank, so "may mute but not kick" is
-/// expressible. Rank answers a different question — see [`Role::rank`].
-///
-/// New variants must be **appended**. postcard encodes an enum by variant
-/// index, so inserting one silently reinterprets every message a older peer
-/// sends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Capability {
-    KickUsers,
-    BanUsers,
-    /// Silence someone without disconnecting them.
-    MuteUsers,
-    MoveUsers,
-    ManageChannels,
-    /// Grant and revoke roles.
-    ManageRoles,
-    /// Change server-wide settings.
-    ManageServer,
-}
-
-impl Capability {
-    /// Every capability, for granting a role everything short of ownership.
-    pub const ALL: [Capability; 7] = [
-        Capability::KickUsers,
-        Capability::BanUsers,
-        Capability::MuteUsers,
-        Capability::MoveUsers,
-        Capability::ManageChannels,
-        Capability::ManageRoles,
-        Capability::ManageServer,
-    ];
-}
-
-/// A named bundle of capabilities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Role {
-    pub name: String,
-    /// Governs who may act on whom, and nothing else.
-    ///
-    /// Capabilities say what an action *is*; rank says whether the target is
-    /// above you. Acting on an equal or higher rank is refused however many
-    /// capabilities you hold, so two moderators cannot kick each other and an
-    /// admin cannot kick the owner.
-    pub rank: u32,
-    pub capabilities: Vec<Capability>,
-}
-
-impl Role {
-    pub fn allows(&self, capability: Capability) -> bool {
-        self.capabilities.contains(&capability)
-    }
-}
-
-/// What a user may do here, as resolved by the server.
-///
-/// Sent with [`UserInfo`] so a client can enable and disable its own controls
-/// without a second round trip. It is a courtesy for rendering only: the server
-/// checks every action regardless of what the client believed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Permissions {
-    /// `None` for a user with no role assigned.
-    pub role: Option<String>,
-    pub rank: u32,
-    pub capabilities: Vec<Capability>,
-    /// The server operator, who passes every check regardless of role.
-    pub owner: bool,
-}
-
-impl Permissions {
-    /// A user with no role: may do nothing administrative.
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    pub fn allows(&self, capability: Capability) -> bool {
-        self.owner || self.capabilities.contains(&capability)
-    }
-
-    /// Whether this user may act on `target`.
-    ///
-    /// Rank alone; the caller still has to hold the capability for whatever it
-    /// is doing. The owner outranks everyone, and is never outranked — losing
-    /// control of your own server to someone you promoted would be a poor
-    /// reward for promoting them.
-    pub fn outranks(&self, target: &Permissions) -> bool {
-        if target.owner {
-            return false;
-        }
-        self.owner || self.rank > target.rank
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
     pub client_id: ClientId,
     pub identity: PublicIdentity,
     pub nickname: String,
-    /// The voice room this user is standing in, if any. Text needs no
-    /// presence — every text channel is open to every connected user.
+    /// The voice room this user is standing in, if any.
     pub channel: Option<ChannelId>,
     pub voice: VoiceState,
     pub connected_at_unix_ms: u64,
-    pub permissions: Permissions,
+    /// The roles this member holds, @everyone implied. Raw inputs rather than
+    /// a resolved snapshot: a snapshot goes stale the moment a role is
+    /// edited, where inputs let every holder re-resolve with [`resolve`].
+    pub roles: Vec<RoleId>,
+    /// The server operator, from the server's config. Passes every check and
+    /// outranks everyone; cannot be acted on, online or not.
+    pub owner: bool,
 }
 
 impl UserInfo {
@@ -347,7 +266,6 @@ pub enum ClientControl {
     Auth(Box<ClientAuth>),
     JoinChannel {
         channel: ChannelId,
-        password: Option<String>,
     },
     LeaveChannel,
     SetVoiceState {
@@ -385,6 +303,111 @@ pub enum ClientControl {
     },
     Ping {
         nonce: u64,
+    },
+
+    // ---- Administration (12..). Declared in the v2 cutover so every wire
+    // index is pinned at once; a server that has not implemented one yet
+    // answers CommandFailed rather than shifting indices later. Every
+    // mutating command carries a client-chosen nonce, answered by Ack or
+    // CommandFailed, so an admin UI gets positive, correlated completion. ----
+    Kick {
+        nonce: u64,
+        client: ClientId,
+        reason: String,
+    },
+    Ban {
+        nonce: u64,
+        fingerprint: Fingerprint,
+        reason: String,
+        /// `None` is permanent. Expiry is compared on read, never swept.
+        until_unix_ms: Option<u64>,
+    },
+    Unban {
+        nonce: u64,
+        fingerprint: Fingerprint,
+    },
+    ListBans {
+        nonce: u64,
+    },
+    SetServerMute {
+        nonce: u64,
+        client: ClientId,
+        muted: bool,
+    },
+    /// `to: None` pulls the member out of voice entirely.
+    MoveMember {
+        nonce: u64,
+        client: ClientId,
+        to: Option<ChannelId>,
+    },
+    CreateRole {
+        nonce: u64,
+        name: String,
+        permissions: Permissions,
+    },
+    /// Position is deliberately absent: ReorderRoles is the single way
+    /// positions move, atomically, so an ordering can never half-apply.
+    UpdateRole {
+        nonce: u64,
+        id: RoleId,
+        name: Option<String>,
+        color: Option<Option<u32>>,
+        permissions: Option<Permissions>,
+    },
+    DeleteRole {
+        nonce: u64,
+        id: RoleId,
+    },
+    ReorderRoles {
+        nonce: u64,
+        /// A dense permutation of every role id to its new position.
+        positions: Vec<(RoleId, u32)>,
+    },
+    /// Full replacement of a member's role list; the server checks hierarchy
+    /// on the diff, so senior roles the member already holds are untouchable
+    /// but also unremovable by a junior actor.
+    SetMemberRoles {
+        nonce: u64,
+        fingerprint: Fingerprint,
+        roles: Vec<RoleId>,
+    },
+    SetChannelOverwrite {
+        nonce: u64,
+        channel: ChannelId,
+        target: OverwriteTarget,
+        allow: Permissions,
+        deny: Permissions,
+    },
+    DeleteChannelOverwrite {
+        nonce: u64,
+        channel: ChannelId,
+        target: OverwriteTarget,
+    },
+    CreateChannel {
+        nonce: u64,
+        name: String,
+        parent: Option<ChannelId>,
+        topic: String,
+        kind: ChannelKind,
+        max_users: Option<u16>,
+        order: i32,
+    },
+    /// Full desired state rather than a patch — no Option<Option<_>> clearing
+    /// semantics. Overwrites are deliberately absent; they have their own
+    /// commands.
+    UpdateChannel {
+        nonce: u64,
+        id: ChannelId,
+        parent: Option<ChannelId>,
+        name: String,
+        topic: String,
+        kind: ChannelKind,
+        max_users: Option<u16>,
+        order: i32,
+    },
+    DeleteChannel {
+        nonce: u64,
+        id: ChannelId,
     },
 }
 
@@ -448,6 +471,44 @@ pub enum ServerControl {
         code: ErrorCode,
         detail: String,
     },
+
+    // ---- Administration (19..) ----
+    RoleCreated(Role),
+    RoleUpdated(Role),
+    RoleDeleted {
+        id: RoleId,
+    },
+    /// One atomic frame carrying the full ordering, so a client never renders
+    /// a torn hierarchy.
+    RolesReordered {
+        positions: Vec<(RoleId, u32)>,
+    },
+    /// Reply to ListBans, sent only to the requester.
+    BanList {
+        bans: Vec<BanEntry>,
+    },
+    /// A mutating admin command succeeded.
+    Ack {
+        nonce: u64,
+    },
+    /// A mutating admin command was refused or failed.
+    CommandFailed {
+        nonce: u64,
+        code: ErrorCode,
+        detail: String,
+    },
+}
+
+/// One row of the ban list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanEntry {
+    pub fingerprint: Fingerprint,
+    pub reason: String,
+    /// `None` is permanent. Expired rows stay listed until unbanned — visible
+    /// history, not an active refusal.
+    pub until_unix_ms: Option<u64>,
+    pub issued_by: Fingerprint,
+    pub issued_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,10 +644,7 @@ mod tests {
     fn client_control_variants_roundtrip() {
         let cases = vec![
             ClientControl::LeaveChannel,
-            ClientControl::JoinChannel {
-                channel: 7,
-                password: Some("hunter2".into()),
-            },
+            ClientControl::JoinChannel { channel: 7 },
             ClientControl::SendMessage {
                 channel: 1,
                 content: "hello **world**".into(),
@@ -613,68 +671,6 @@ mod tests {
         assert!(ChannelKind::VoiceAndText.has_voice() && ChannelKind::VoiceAndText.has_text());
     }
 
-    fn role_at(rank: u32, capabilities: Vec<Capability>) -> Permissions {
-        Permissions {
-            role: Some("test".into()),
-            rank,
-            capabilities,
-            owner: false,
-        }
-    }
-
-    #[test]
-    fn capabilities_are_explicit_not_implied_by_rank() {
-        // The reason capabilities exist separately from rank: "may mute but not
-        // kick" has to be expressible.
-        let muter = role_at(50, vec![Capability::MuteUsers]);
-        assert!(muter.allows(Capability::MuteUsers));
-        assert!(!muter.allows(Capability::KickUsers));
-    }
-
-    #[test]
-    fn an_equal_rank_cannot_be_acted_on() {
-        // Two moderators must not be able to kick each other.
-        let one = role_at(50, Capability::ALL.to_vec());
-        let two = role_at(50, Capability::ALL.to_vec());
-        assert!(!one.outranks(&two));
-        assert!(!two.outranks(&one));
-    }
-
-    #[test]
-    fn a_higher_rank_may_act_on_a_lower_one_but_not_the_reverse() {
-        let admin = role_at(100, Capability::ALL.to_vec());
-        let moderator = role_at(50, Capability::ALL.to_vec());
-        assert!(admin.outranks(&moderator));
-        assert!(!moderator.outranks(&admin));
-    }
-
-    #[test]
-    fn the_owner_outranks_everyone_and_is_never_outranked() {
-        // Promoting someone must not be a way to lose your own server.
-        let owner = Permissions {
-            role: None,
-            rank: 0,
-            capabilities: Vec::new(),
-            owner: true,
-        };
-        let admin = role_at(u32::MAX, Capability::ALL.to_vec());
-
-        assert!(owner.outranks(&admin), "despite holding rank 0");
-        assert!(!admin.outranks(&owner), "despite holding the highest rank");
-        for capability in Capability::ALL {
-            assert!(owner.allows(capability), "{capability:?}");
-        }
-    }
-
-    #[test]
-    fn a_user_without_a_role_may_do_nothing() {
-        let nobody = Permissions::none();
-        for capability in Capability::ALL {
-            assert!(!nobody.allows(capability), "{capability:?}");
-        }
-        assert!(!nobody.outranks(&Permissions::none()));
-    }
-
     #[test]
     fn control_message_variants_keep_their_wire_positions() {
         // postcard encodes an enum by variant index, so inserting a variant
@@ -685,5 +681,37 @@ mod tests {
 
         let encoded = postcard::to_stdvec(&ClientControl::Ping { nonce: 0 }).unwrap();
         assert_eq!(encoded[0], 11, "Ping must stay at index 11");
+        let encoded = postcard::to_stdvec(&ClientControl::Kick {
+            nonce: 0,
+            client: 0,
+            reason: String::new(),
+        })
+        .unwrap();
+        assert_eq!(encoded[0], 12, "Kick must stay at index 12");
+        let encoded =
+            postcard::to_stdvec(&ClientControl::DeleteChannel { nonce: 0, id: 0 }).unwrap();
+        assert_eq!(encoded[0], 27, "DeleteChannel must stay at index 27");
+        let encoded = postcard::to_stdvec(&ServerControl::Error {
+            code: ErrorCode::Internal,
+            detail: String::new(),
+        })
+        .unwrap();
+        assert_eq!(encoded[0], 18, "Error must stay at index 18");
+        let encoded = postcard::to_stdvec(&ServerControl::RoleCreated(Role {
+            id: 0,
+            name: String::new(),
+            color: None,
+            position: 0,
+            permissions: Permissions::NONE,
+        }))
+        .unwrap();
+        assert_eq!(encoded[0], 19, "RoleCreated must stay at index 19");
+        let encoded = postcard::to_stdvec(&ServerControl::CommandFailed {
+            nonce: 0,
+            code: ErrorCode::Internal,
+            detail: String::new(),
+        })
+        .unwrap();
+        assert_eq!(encoded[0], 25, "CommandFailed must stay at index 25");
     }
 }
