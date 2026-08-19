@@ -206,6 +206,11 @@ button.fingerprint.copyable:focus-visible {
   border: 1px solid #a8892e;
   border-radius: 4px;
   padding: 4px 10px;
+/* A refusal from the server this tab is talking to. Lives inside the tab so
+   it cannot be blamed on the wrong server, and dismisses because it answers
+   one action rather than describing an ongoing condition. */
+.connection-notice {
+  border-bottom: 1px solid var(--danger);
 }
 
 .layout {
