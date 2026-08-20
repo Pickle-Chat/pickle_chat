@@ -378,12 +378,21 @@ pub fn sessions(state: State<'_, AppState>) -> SessionListDto {
         voice: state.voice.session(),
         sessions: sessions
             .values()
-            .map(|session| ConnectionDto {
-                permissions: session.perms.lock().my_permissions(),
-                roles: session.perms.lock().roles_dto(),
-                session: session.id,
-                info: SessionDto::from(session.client.session()),
-                identity: session.identity.clone(),
+            .map(|session| {
+                // One guard, bound: two .lock() calls in a single struct
+                // literal keep the first guard's temporary alive into the
+                // second, and a parking_lot mutex answers that not with a
+                // panic but with a silent self-deadlock — which, taken while
+                // the sessions map lock is also held, freezes every command
+                // in the app behind it.
+                let mirror = session.perms.lock();
+                ConnectionDto {
+                    permissions: mirror.my_permissions(),
+                    roles: mirror.roles_dto(),
+                    session: session.id,
+                    info: SessionDto::from(session.client.session()),
+                    identity: session.identity.clone(),
+                }
             })
             .collect(),
     }
