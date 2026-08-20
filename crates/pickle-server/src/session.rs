@@ -9,6 +9,7 @@
 //! reader, a control writer draining the outbound queue, and a datagram reader
 //! feeding the voice relay. The first to finish tears down the other two.
 
+use crate::admin;
 use crate::moderation;
 use crate::state::Shared;
 use pickle_identity::PublicIdentity;
@@ -448,17 +449,49 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
             moderation::move_member(shared, client_id, nonce, client, to)
         }
 
-        // Declared in the v2 cutover so the wire indices are pinned; the
-        // handlers arrive over the next PRs. Answering CommandFailed keeps a
-        // newer client's admin UI honest instead of leaving it waiting.
-        ClientControl::CreateRole { nonce, .. }
-        | ClientControl::UpdateRole { nonce, .. }
-        | ClientControl::DeleteRole { nonce, .. }
-        | ClientControl::ReorderRoles { nonce, .. }
-        | ClientControl::SetMemberRoles { nonce, .. }
-        | ClientControl::SetChannelOverwrite { nonce, .. }
-        | ClientControl::DeleteChannelOverwrite { nonce, .. }
-        | ClientControl::CreateChannel { nonce, .. }
+        ClientControl::CreateRole {
+            nonce,
+            name,
+            permissions,
+        } => admin::create_role(shared, client_id, nonce, name, permissions).await,
+        ClientControl::UpdateRole {
+            nonce,
+            id,
+            name,
+            color,
+            permissions,
+        } => admin::update_role(shared, client_id, nonce, id, name, color, permissions).await,
+        ClientControl::DeleteRole { nonce, id } => {
+            admin::delete_role(shared, client_id, nonce, id).await
+        }
+        ClientControl::ReorderRoles { nonce, positions } => {
+            admin::reorder_roles(shared, client_id, nonce, positions).await
+        }
+        ClientControl::SetMemberRoles {
+            nonce,
+            fingerprint,
+            roles,
+        } => admin::set_member_roles(shared, client_id, nonce, fingerprint, roles).await,
+        ClientControl::SetChannelOverwrite {
+            nonce,
+            channel,
+            target,
+            allow,
+            deny,
+        } => {
+            admin::set_channel_overwrite(shared, client_id, nonce, channel, target, allow, deny)
+                .await
+        }
+        ClientControl::DeleteChannelOverwrite {
+            nonce,
+            channel,
+            target,
+        } => admin::delete_channel_overwrite(shared, client_id, nonce, channel, target).await,
+
+        // Declared in the v2 cutover so the wire indices are pinned; channel
+        // CRUD arrives in the next PR. Answering CommandFailed keeps a newer
+        // client's admin UI honest instead of leaving it waiting.
+        ClientControl::CreateChannel { nonce, .. }
         | ClientControl::UpdateChannel { nonce, .. }
         | ClientControl::DeleteChannel { nonce, .. } => {
             shared.send(

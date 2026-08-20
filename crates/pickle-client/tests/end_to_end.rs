@@ -1026,3 +1026,195 @@ async fn a_server_mute_reaches_everyone_and_a_move_relocates() {
     })
     .await;
 }
+
+// ---- role and overwrite management -----------------------------------------
+
+const ADMIN: u32 = 2;
+
+/// The client core has no typed helpers for the admin commands yet — the
+/// desktop drives them through send_control, and so do these tests.
+fn send(client: &pickle_client::Client, message: pickle_proto::ClientControl) {
+    assert!(client.send_control(message));
+}
+
+#[tokio::test]
+async fn an_admin_builds_a_role_and_grants_it_live() {
+    let admin = Identity::generate();
+    let peon = Identity::generate();
+    let server = TestServer::with_grants(&[(admin.fingerprint(), ADMIN)]).await;
+
+    let (admin_client, mut admin_events) = connect_as(&server, "admin", &admin).await.unwrap();
+    let (_peon_client, mut peon_events) = connect_as(&server, "peon", &peon).await.unwrap();
+
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::CreateRole {
+            nonce: 1,
+            name: "dj".into(),
+            permissions: pickle_proto::Permissions::SPEAK,
+        },
+    );
+    let role_id = expect_event(&mut admin_events, "the role", |event| match event {
+        ClientEvent::RoleCreated(role) if role.name == "dj" => Some(role.id),
+        _ => None,
+    })
+    .await;
+    expect_event(&mut admin_events, "the ack", |event| match event {
+        ClientEvent::Ack { nonce: 1 } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // Granting lands on the live session: the peon's own UserUpdated names
+    // the new role, which is what the desktop mirror re-resolves from.
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::SetMemberRoles {
+            nonce: 2,
+            fingerprint: peon.fingerprint(),
+            roles: vec![role_id],
+        },
+    );
+    expect_event(&mut peon_events, "my own grant", |event| match event {
+        ClientEvent::UserUpdated(info)
+            if info.fingerprint() == peon.fingerprint() && info.roles == vec![role_id] =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_deny_overwrite_hides_and_reveals_a_channel_mid_session() {
+    let admin = Identity::generate();
+    let server = TestServer::with_grants(&[(admin.fingerprint(), ADMIN)]).await;
+
+    let (admin_client, mut admin_events) = connect_as(&server, "admin", &admin).await.unwrap();
+    let (_peon_client, mut peon_events) = connect_client(&server, "peon").await.unwrap();
+
+    // Deny VIEW on "Off topic" (channel 2) for @everyone.
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::SetChannelOverwrite {
+            nonce: 1,
+            channel: 2,
+            target: pickle_proto::OverwriteTarget::Role(pickle_proto::EVERYONE_ROLE_ID),
+            allow: pickle_proto::Permissions::NONE,
+            deny: pickle_proto::Permissions::VIEW_CHANNEL,
+        },
+    );
+
+    // The peon's channel list loses it, live — no reconnect.
+    expect_event(
+        &mut peon_events,
+        "the channel vanishing",
+        |event| match event {
+            ClientEvent::ChannelRemoved(2) => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+    // The administrator bypasses overwrites and keeps it, as an update.
+    expect_event(
+        &mut admin_events,
+        "the admin's update",
+        |event| match event {
+            ClientEvent::ChannelUpdated(channel) if channel.id == 2 => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+
+    // Deleting the overwrite brings it back.
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::DeleteChannelOverwrite {
+            nonce: 2,
+            channel: 2,
+            target: pickle_proto::OverwriteTarget::Role(pickle_proto::EVERYONE_ROLE_ID),
+        },
+    );
+    expect_event(
+        &mut peon_events,
+        "the channel returning",
+        |event| match event {
+            ClientEvent::ChannelCreated(channel) if channel.id == 2 => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_subset_rule_stops_minting_and_everyone_is_untouchable() {
+    let admin = Identity::generate();
+    let clerk = Identity::generate();
+    let server = TestServer::with_grants(&[(admin.fingerprint(), ADMIN)]).await;
+
+    let (admin_client, mut admin_events) = connect_as(&server, "admin", &admin).await.unwrap();
+    let (clerk_client, mut clerk_events) = connect_as(&server, "clerk", &clerk).await.unwrap();
+
+    // The admin makes a role that may manage roles but holds nothing else,
+    // and hands it to the clerk.
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::CreateRole {
+            nonce: 1,
+            name: "clerk".into(),
+            permissions: pickle_proto::Permissions::MANAGE_ROLES,
+        },
+    );
+    let clerk_role = expect_event(&mut admin_events, "the clerk role", |event| match event {
+        ClientEvent::RoleCreated(role) if role.name == "clerk" => Some(role.id),
+        _ => None,
+    })
+    .await;
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::SetMemberRoles {
+            nonce: 2,
+            fingerprint: clerk.fingerprint(),
+            roles: vec![clerk_role],
+        },
+    );
+    expect_event(&mut clerk_events, "my grant", |event| match event {
+        ClientEvent::UserUpdated(info) if info.fingerprint() == clerk.fingerprint() => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // The clerk may manage roles — but cannot mint BAN_MEMBERS, not holding it.
+    send(
+        &clerk_client,
+        pickle_proto::ClientControl::CreateRole {
+            nonce: 3,
+            name: "warlord".into(),
+            permissions: pickle_proto::Permissions::BAN_MEMBERS,
+        },
+    );
+    expect_event(
+        &mut clerk_events,
+        "the minting refusal",
+        |event| match event {
+            ClientEvent::CommandFailed { nonce: 3, .. } => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+
+    // And @everyone is beyond deletion for anyone, admin included.
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::DeleteRole {
+            nonce: 4,
+            id: pickle_proto::EVERYONE_ROLE_ID,
+        },
+    );
+    expect_event(&mut admin_events, "the refusal", |event| match event {
+        ClientEvent::CommandFailed { nonce: 4, .. } => Some(()),
+        _ => None,
+    })
+    .await;
+}

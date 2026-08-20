@@ -346,9 +346,13 @@ pub async fn connect(
 
     state.remember_open_connections();
 
-    let my_permissions = perms.lock().my_permissions();
+    let (my_permissions, roles) = {
+        let mirror = perms.lock();
+        (mirror.my_permissions(), mirror.roles_dto())
+    };
     Ok(ConnectionDto {
         permissions: my_permissions,
+        roles,
         session: id,
         info: session_dto,
         identity: state
@@ -376,6 +380,7 @@ pub fn sessions(state: State<'_, AppState>) -> SessionListDto {
             .values()
             .map(|session| ConnectionDto {
                 permissions: session.perms.lock().my_permissions(),
+                roles: session.perms.lock().roles_dto(),
                 session: session.id,
                 info: SessionDto::from(session.client.session()),
                 identity: session.identity.clone(),
@@ -525,6 +530,181 @@ pub fn move_user(
 ) -> Result<(), String> {
     state.with_session(session, |active| {
         active.client.move_member(admin_nonce(), client_id, channel);
+    })
+}
+
+// ---- role & overwrite management ------------------------------------------
+
+#[tauri::command]
+pub fn create_role(
+    state: State<'_, AppState>,
+    session: SessionId,
+    name: String,
+    permissions: Vec<String>,
+) -> Result<(), String> {
+    let bits = crate::perms::permissions_from_names(&permissions);
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::CreateRole {
+                nonce: admin_nonce(),
+                name,
+                permissions: bits,
+            });
+    })
+}
+
+#[tauri::command]
+pub fn update_role(
+    state: State<'_, AppState>,
+    session: SessionId,
+    role_id: u32,
+    name: Option<String>,
+    color: Option<u32>,
+    clear_color: Option<bool>,
+    permissions: Option<Vec<String>>,
+) -> Result<(), String> {
+    let permissions = permissions.map(|names| crate::perms::permissions_from_names(&names));
+    // JSON null and absent both deserialize to None, so "clear the color"
+    // needs its own flag — the wire's Option<Option<_>> cannot be reached
+    // through a single JSON field.
+    let color = if clear_color.unwrap_or(false) {
+        Some(None)
+    } else {
+        color.map(Some)
+    };
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::UpdateRole {
+                nonce: admin_nonce(),
+                id: role_id,
+                name,
+                color,
+                permissions,
+            });
+    })
+}
+
+#[tauri::command]
+pub fn delete_role(
+    state: State<'_, AppState>,
+    session: SessionId,
+    role_id: u32,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::DeleteRole {
+                nonce: admin_nonce(),
+                id: role_id,
+            });
+    })
+}
+
+#[tauri::command]
+pub fn reorder_roles(
+    state: State<'_, AppState>,
+    session: SessionId,
+    positions: Vec<(u32, u32)>,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::ReorderRoles {
+                nonce: admin_nonce(),
+                positions,
+            });
+    })
+}
+
+#[tauri::command]
+pub fn set_member_roles(
+    state: State<'_, AppState>,
+    session: SessionId,
+    fingerprint: String,
+    roles: Vec<u32>,
+) -> Result<(), String> {
+    let fingerprint = pickle_identity::Fingerprint::parse(&fingerprint)
+        .map_err(|e| format!("that fingerprint is not readable: {e}"))?;
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::SetMemberRoles {
+                nonce: admin_nonce(),
+                fingerprint,
+                roles,
+            });
+    })
+}
+
+fn overwrite_target(
+    target: crate::perms::OverwriteTargetDto,
+) -> Result<pickle_proto::OverwriteTarget, String> {
+    Ok(match target {
+        crate::perms::OverwriteTargetDto::Role { id } => pickle_proto::OverwriteTarget::Role(id),
+        crate::perms::OverwriteTargetDto::Member { fingerprint } => {
+            pickle_proto::OverwriteTarget::Member(
+                pickle_identity::Fingerprint::parse(&fingerprint)
+                    .map_err(|e| format!("that fingerprint is not readable: {e}"))?,
+            )
+        }
+    })
+}
+
+#[tauri::command]
+pub fn set_channel_overwrite(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+    target: crate::perms::OverwriteTargetDto,
+    allow: Vec<String>,
+    deny: Vec<String>,
+) -> Result<(), String> {
+    let target = overwrite_target(target)?;
+    let allow = crate::perms::permissions_from_names(&allow);
+    let deny = crate::perms::permissions_from_names(&deny);
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::SetChannelOverwrite {
+                nonce: admin_nonce(),
+                channel,
+                target,
+                allow,
+                deny,
+            });
+    })
+}
+
+#[tauri::command]
+pub fn delete_channel_overwrite(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+    target: crate::perms::OverwriteTargetDto,
+) -> Result<(), String> {
+    let target = overwrite_target(target)?;
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::DeleteChannelOverwrite {
+                nonce: admin_nonce(),
+                channel,
+                target,
+            });
+    })
+}
+
+/// One channel's overwrites, from the mirror, for the tri-state editor.
+#[tauri::command]
+pub fn channel_overwrites(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+) -> Result<Vec<crate::perms::OverwriteDto>, String> {
+    state.with_session(session, |active| {
+        active.perms.lock().overwrites_dto(channel)
     })
 }
 

@@ -109,6 +109,8 @@ pub struct UserDto {
     pub self_deafened: bool,
     /// Muted by a moderator, not by choice — rendered distinctly.
     pub server_muted: bool,
+    /// Role grants, @everyone implicit — what the members editor seeds from.
+    pub roles: Vec<u32>,
 }
 
 impl From<&UserInfo> for UserDto {
@@ -123,6 +125,7 @@ impl From<&UserInfo> for UserDto {
             self_muted: user.voice.self_muted,
             self_deafened: user.voice.self_deafened,
             server_muted: user.voice.server_muted,
+            roles: user.roles.clone(),
         }
     }
 }
@@ -204,6 +207,7 @@ impl From<&SessionInfo> for SessionDto {
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDto {
     pub permissions: crate::perms::MyPermissionsDto,
+    pub roles: Vec<crate::perms::RoleDto>,
     pub session: SessionId,
     pub info: SessionDto,
     /// Fingerprint of the identity this connection signed in with, which need
@@ -316,6 +320,9 @@ pub enum EventDto {
         nonce: u64,
         code: &'static str,
         detail: String,
+    },
+    RolesChanged {
+        roles: Vec<crate::perms::RoleDto>,
     },
     /// Derived by the Rust-side permission mirror, not translated from the
     /// wire: a complete snapshot, replaced wholesale, so the frontend never

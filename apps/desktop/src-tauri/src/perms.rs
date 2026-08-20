@@ -30,6 +30,8 @@ pub struct MyPermissionsDto {
     pub is_owner: bool,
     /// Administrator in the base — everything, everywhere.
     pub is_admin: bool,
+    /// Any administrative standing at all — what gates the gear.
+    pub can_open_admin: bool,
     pub channels: BTreeMap<ChannelId, ChannelPermissionsDto>,
 }
 
@@ -59,6 +61,84 @@ struct MemberStanding {
     fingerprint: Fingerprint,
     roles: Vec<RoleId>,
     owner: bool,
+}
+
+/// A role as the interface renders it.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleDto {
+    pub id: RoleId,
+    pub name: String,
+    /// "#rrggbb", or null for the default.
+    pub color: Option<String>,
+    pub position: u32,
+    /// Named bits, never numbers: the Rust side owns all bit math.
+    pub permissions: Vec<&'static str>,
+    pub is_everyone: bool,
+}
+
+/// The permission names an editor can toggle, with their bits — one list for
+/// the whole interface, exhaustively matched so a new bit cannot be missed.
+pub const EDITABLE_PERMISSIONS: &[(&str, Permissions)] = &[
+    ("administrator", Permissions::ADMINISTRATOR),
+    ("manageServer", Permissions::MANAGE_SERVER),
+    ("manageRoles", Permissions::MANAGE_ROLES),
+    ("manageChannels", Permissions::MANAGE_CHANNELS),
+    ("kickMembers", Permissions::KICK_MEMBERS),
+    ("banMembers", Permissions::BAN_MEMBERS),
+    ("viewChannel", Permissions::VIEW_CHANNEL),
+    ("sendMessages", Permissions::SEND_MESSAGES),
+    ("readHistory", Permissions::READ_HISTORY),
+    ("manageMessages", Permissions::MANAGE_MESSAGES),
+    ("connect", Permissions::CONNECT),
+    ("speak", Permissions::SPEAK),
+    ("muteMembers", Permissions::MUTE_MEMBERS),
+    ("moveMembers", Permissions::MOVE_MEMBERS),
+];
+
+pub fn permission_names(bits: Permissions) -> Vec<&'static str> {
+    EDITABLE_PERMISSIONS
+        .iter()
+        .filter(|(_, bit)| bits.contains(*bit))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+pub fn permissions_from_names(names: &[String]) -> Permissions {
+    let mut bits = Permissions::NONE;
+    for name in names {
+        if let Some((_, bit)) = EDITABLE_PERMISSIONS.iter().find(|(n, _)| n == name) {
+            bits = bits.union(*bit);
+        }
+    }
+    bits
+}
+
+fn role_dto(role: &Role) -> RoleDto {
+    RoleDto {
+        id: role.id,
+        name: role.name.clone(),
+        color: role.color.map(|c| format!("#{c:06x}")),
+        position: role.position,
+        permissions: permission_names(role.permissions),
+        is_everyone: role.id == pickle_proto::EVERYONE_ROLE_ID,
+    }
+}
+
+/// One channel overwrite as the tri-state editor renders it.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OverwriteDto {
+    pub target: OverwriteTargetDto,
+    pub allow: Vec<&'static str>,
+    pub deny: Vec<&'static str>,
+}
+
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum OverwriteTargetDto {
+    Role { id: RoleId },
+    Member { fingerprint: String },
 }
 
 /// The context menu's answer: which actions to offer against one member, and
@@ -170,9 +250,21 @@ impl PermMirror {
             self.owner,
             None,
         );
+        let standing = [
+            Permissions::MANAGE_SERVER,
+            Permissions::MANAGE_ROLES,
+            Permissions::MANAGE_CHANNELS,
+            Permissions::KICK_MEMBERS,
+            Permissions::BAN_MEMBERS,
+            Permissions::MUTE_MEMBERS,
+            Permissions::MOVE_MEMBERS,
+        ]
+        .iter()
+        .any(|bit| base.contains(*bit));
         MyPermissionsDto {
             is_owner: self.owner,
             is_admin: base.contains(Permissions::ADMINISTRATOR),
+            can_open_admin: self.owner || standing,
             channels: self
                 .channels
                 .values()
@@ -196,6 +288,48 @@ impl PermMirror {
                 })
                 .collect(),
         }
+    }
+
+    /// Every role, sorted senior-first for display.
+    pub fn roles_dto(&self) -> Vec<RoleDto> {
+        let mut roles: Vec<RoleDto> = self.roles.iter().map(role_dto).collect();
+        roles.sort_by_key(|r| std::cmp::Reverse(r.position));
+        roles
+    }
+
+    /// One channel's overwrites, for the tri-state editor.
+    pub fn overwrites_dto(&self, channel: ChannelId) -> Vec<OverwriteDto> {
+        use pickle_proto::OverwriteTarget;
+        self.channels
+            .get(&channel)
+            .map(|c| {
+                c.overwrites
+                    .iter()
+                    .map(|o| OverwriteDto {
+                        target: match &o.target {
+                            OverwriteTarget::Role(id) => OverwriteTargetDto::Role { id: *id },
+                            OverwriteTarget::Member(fp) => OverwriteTargetDto::Member {
+                                fingerprint: fp.to_string(),
+                            },
+                        },
+                        allow: permission_names(o.allow),
+                        deny: permission_names(o.deny),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Did this event change the role table? The pump re-emits the roles
+    /// snapshot when it did, alongside the permissions snapshot.
+    pub fn touches_roles(event: &ClientEvent) -> bool {
+        matches!(
+            event,
+            ClientEvent::RoleCreated(_)
+                | ClientEvent::RoleUpdated(_)
+                | ClientEvent::RoleDeleted { .. }
+                | ClientEvent::RolesReordered { .. }
+        )
     }
 
     /// Which moderation actions to offer against one member. Rendering state:
