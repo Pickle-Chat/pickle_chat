@@ -488,20 +488,37 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
             target,
         } => admin::delete_channel_overwrite(shared, client_id, nonce, channel, target).await,
 
-        // Declared in the v2 cutover so the wire indices are pinned; channel
-        // CRUD arrives in the next PR. Answering CommandFailed keeps a newer
-        // client's admin UI honest instead of leaving it waiting.
-        ClientControl::CreateChannel { nonce, .. }
-        | ClientControl::UpdateChannel { nonce, .. }
-        | ClientControl::DeleteChannel { nonce, .. } => {
-            shared.send(
-                client_id,
-                ServerControl::CommandFailed {
-                    nonce,
-                    code: ErrorCode::Internal,
-                    detail: "this build does not implement that command yet".into(),
-                },
-            );
+        ClientControl::CreateChannel {
+            nonce,
+            name,
+            parent,
+            topic,
+            kind,
+            max_users,
+            order,
+        } => {
+            admin::create_channel(
+                shared, client_id, nonce, name, parent, topic, kind, max_users, order,
+            )
+            .await
+        }
+        ClientControl::UpdateChannel {
+            nonce,
+            id,
+            parent,
+            name,
+            topic,
+            kind,
+            max_users,
+            order,
+        } => {
+            admin::update_channel(
+                shared, client_id, nonce, id, parent, name, topic, kind, max_users, order,
+            )
+            .await
+        }
+        ClientControl::DeleteChannel { nonce, id } => {
+            admin::delete_channel(shared, client_id, nonce, id).await
         }
 
         ClientControl::JoinChannel { channel } => {

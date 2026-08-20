@@ -736,3 +736,240 @@ pub async fn delete_channel_overwrite(
     shared.resync_visibility(&before, &[channel]);
     ack(shared, client, nonce);
 }
+
+/// The shared validation for create and update: a printable name and a real,
+/// acyclic parent.
+fn validate_channel(
+    shared: &Shared,
+    actor_id: ClientId,
+    nonce: u64,
+    id: Option<ChannelId>,
+    name: &str,
+    parent: Option<ChannelId>,
+) -> Option<String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        refuse(
+            shared,
+            actor_id,
+            nonce,
+            ErrorCode::Malformed,
+            "a channel needs a name",
+        );
+        return None;
+    }
+    if let Some(parent_id) = parent {
+        if !shared.channels().iter().any(|c| c.id == parent_id) {
+            refuse(
+                shared,
+                actor_id,
+                nonce,
+                ErrorCode::Malformed,
+                "no such parent",
+            );
+            return None;
+        }
+        if let Some(child) = id {
+            if shared.parent_would_cycle(child, parent) {
+                refuse(
+                    shared,
+                    actor_id,
+                    nonce,
+                    ErrorCode::Malformed,
+                    "a channel cannot contain itself",
+                );
+                return None;
+            }
+        }
+    }
+    Some(name)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_channel(
+    shared: &Arc<Shared>,
+    client: ClientId,
+    nonce: u64,
+    name: String,
+    parent: Option<ChannelId>,
+    topic: String,
+    kind: pickle_proto::ChannelKind,
+    max_users: Option<u16>,
+    order: i32,
+) {
+    if !shared.can_globally(client, Permissions::MANAGE_CHANNELS) {
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::NotPermitted,
+            "you may not manage channels",
+        );
+        return;
+    }
+    let Some(name) = validate_channel(shared, client, nonce, None, &name, parent) else {
+        return;
+    };
+    let Some(store) = shared.store() else {
+        refuse(shared, client, nonce, ErrorCode::Internal, "no database");
+        return;
+    };
+
+    let channel = pickle_proto::Channel {
+        id: shared.next_channel_id(),
+        parent,
+        name,
+        topic,
+        kind,
+        max_users,
+        order,
+        overwrites: Vec::new(),
+    };
+    if let Err(error) = store.insert_channel(&channel).await {
+        tracing::warn!(%error, "could not store a channel");
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::Internal,
+            "the channel was not saved",
+        );
+        return;
+    }
+    let before = shared.visible_ids_by_client();
+    shared.insert_channel_mem(channel);
+    // A fresh channel has no overwrites, so base bits decide who sees it —
+    // the resync delivers it as a ChannelCreated to exactly those clients.
+    shared.resync_visibility(&before, &[]);
+    ack(shared, client, nonce);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_channel(
+    shared: &Arc<Shared>,
+    client: ClientId,
+    nonce: u64,
+    id: ChannelId,
+    parent: Option<ChannelId>,
+    name: String,
+    topic: String,
+    kind: pickle_proto::ChannelKind,
+    max_users: Option<u16>,
+    order: i32,
+) {
+    if !shared.can_globally(client, Permissions::MANAGE_CHANNELS) {
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::NotPermitted,
+            "you may not manage channels",
+        );
+        return;
+    }
+    // A channel you may not view answers as one that does not exist.
+    if !shared.can(client, id, Permissions::VIEW_CHANNEL) {
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::NoSuchChannel,
+            "no such channel",
+        );
+        return;
+    }
+    let Some(name) = validate_channel(shared, client, nonce, Some(id), &name, parent) else {
+        return;
+    };
+    let Some(store) = shared.store() else {
+        refuse(shared, client, nonce, ErrorCode::Internal, "no database");
+        return;
+    };
+
+    let channel = pickle_proto::Channel {
+        id,
+        parent,
+        name,
+        topic,
+        kind,
+        max_users,
+        order,
+        // Preserved by the memory half; the store row never held them.
+        overwrites: Vec::new(),
+    };
+    if let Err(error) = store.update_channel(&channel).await {
+        tracing::warn!(%error, "could not update a channel");
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::Internal,
+            "the change was not saved",
+        );
+        return;
+    }
+    let before = shared.visible_ids_by_client();
+    shared.update_channel_mem(channel);
+    // Dropping voice from an occupied room does not eject anyone: the relay's
+    // own kind guard silences them where they stand, and walking people out
+    // is a moderator's act, not a rename's side effect.
+    shared.resync_visibility(&before, &[id]);
+    ack(shared, client, nonce);
+}
+
+pub async fn delete_channel(shared: &Arc<Shared>, client: ClientId, nonce: u64, id: ChannelId) {
+    if !shared.can_globally(client, Permissions::MANAGE_CHANNELS) {
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::NotPermitted,
+            "you may not manage channels",
+        );
+        return;
+    }
+    if !shared.can(client, id, Permissions::VIEW_CHANNEL) {
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::NoSuchChannel,
+            "no such channel",
+        );
+        return;
+    }
+    let Some(store) = shared.store() else {
+        refuse(shared, client, nonce, ErrorCode::Internal, "no database");
+        return;
+    };
+    if let Err(error) = store.delete_channel(id).await {
+        tracing::warn!(%error, "could not delete a channel");
+        refuse(
+            shared,
+            client,
+            nonce,
+            ErrorCode::Internal,
+            "the deletion was not saved",
+        );
+        return;
+    }
+
+    let before = shared.visible_ids_by_client();
+    let evicted = shared.remove_channel_mem(id);
+    for info in evicted {
+        let client_id = info.client_id;
+        shared.broadcast(
+            ServerControl::UserMoved {
+                client: client_id,
+                from: Some(id),
+                to: None,
+            },
+            None,
+        );
+        shared.broadcast(ServerControl::UserUpdated(Box::new(info)), None);
+    }
+    // Every previous viewer sees the removal through the same diff that
+    // handles permission changes — one mechanism, no special case.
+    shared.resync_visibility(&before, &[]);
+    ack(shared, client, nonce);
+}

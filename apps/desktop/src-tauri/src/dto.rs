@@ -76,6 +76,7 @@ pub struct ChannelDto {
     pub has_voice: bool,
     pub has_text: bool,
     pub order: i32,
+    pub max_users: Option<u16>,
 }
 
 impl From<&Channel> for ChannelDto {
@@ -88,6 +89,7 @@ impl From<&Channel> for ChannelDto {
             has_voice: channel.kind.has_voice(),
             has_text: channel.kind.has_text(),
             order: channel.order,
+            max_users: channel.max_users,
         }
     }
 }
