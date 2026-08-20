@@ -244,6 +244,22 @@ impl Store {
         Ok(grants)
     }
 
+    pub async fn insert_role_member(
+        &self,
+        fingerprint: Fingerprint,
+        role: RoleId,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO role_members (fingerprint, role_id) VALUES ($1, $2)
+             ON CONFLICT (fingerprint, role_id) DO NOTHING",
+        )
+        .bind(fingerprint.to_string())
+        .bind(role as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Every channel's overwrites, tagged with their channel id.
     pub async fn load_overwrites(&self) -> Result<Vec<(ChannelId, Overwrite)>, StoreError> {
         let rows =
@@ -308,6 +324,48 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record a ban, replacing any existing one for the fingerprint — a
+    /// re-ban updates the reason and clock rather than failing.
+    pub async fn insert_ban(&self, ban: &BanEntry) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO bans (fingerprint, reason, until_unix_ms, issued_by, issued_at_unix_ms)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (fingerprint) DO UPDATE SET
+                 reason = $2, until_unix_ms = $3, issued_by = $4, issued_at_unix_ms = $5",
+        )
+        .bind(ban.fingerprint.to_string())
+        .bind(ban.reason.clone())
+        .bind(ban.until_unix_ms.map(|u| u as i64))
+        .bind(ban.issued_by.to_string())
+        .bind(ban.issued_at_unix_ms as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_ban(&self, fingerprint: Fingerprint) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM bans WHERE fingerprint = $1")
+            .bind(fingerprint.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every ban on record, expired ones included — visible history until
+    /// someone unbans, exactly as the schema comment promises.
+    pub async fn list_bans(&self) -> Result<Vec<BanEntry>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT fingerprint, reason, until_unix_ms, issued_by, issued_at_unix_ms
+             FROM bans ORDER BY issued_at_unix_ms DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(row_to_ban)
+            .collect::<Result<_, _>>()
+            .map_err(StoreError::from)
     }
 
     /// The active ban for a fingerprint, if any. Expiry is compared here, on
@@ -830,6 +888,31 @@ mod tests {
             vec![(member, 2)],
             "the unreadable row is skipped, not fatal"
         );
+    }
+
+    #[tokio::test]
+    async fn bans_upsert_delete_and_list_through_the_store_api() {
+        let (_dir, store) = store().await;
+        let target = Identity::generate().fingerprint();
+        let issuer = Identity::generate().fingerprint();
+        let ban = |reason: &str| BanEntry {
+            fingerprint: target,
+            reason: reason.into(),
+            until_unix_ms: None,
+            issued_by: issuer,
+            issued_at_unix_ms: 42,
+        };
+
+        store.insert_ban(&ban("first")).await.unwrap();
+        store.insert_ban(&ban("re-banned")).await.unwrap();
+        let listed = store.list_bans().await.unwrap();
+        assert_eq!(listed.len(), 1, "a re-ban replaces, never duplicates");
+        assert_eq!(listed[0].reason, "re-banned");
+        assert!(store.active_ban(target, 0).await.unwrap().is_some());
+
+        store.delete_ban(target).await.unwrap();
+        assert!(store.list_bans().await.unwrap().is_empty());
+        assert!(store.active_ban(target, 0).await.unwrap().is_none());
     }
 
     #[tokio::test]

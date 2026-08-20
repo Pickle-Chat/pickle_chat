@@ -6,6 +6,7 @@
 //! machines to move a server without users noticing.
 
 pub mod config;
+mod moderation;
 pub mod session;
 pub mod state;
 pub mod store;

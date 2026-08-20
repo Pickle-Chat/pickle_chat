@@ -15,6 +15,7 @@ import {
 } from "./api";
 import { EMPTY, reduce, type ConnectionState } from "./connections";
 import { Fingerprint } from "./Fingerprint";
+import { UserMenu, type MenuTarget } from "./UserMenu";
 import { LevelMeter } from "./LevelMeter";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { usePushToTalk } from "./usePushToTalk";
@@ -420,6 +421,7 @@ function ConnectionView({
         onSelect={onSelectChannel}
         onJoinVoice={onJoinVoice}
         onLeave={onLeaveChannel}
+        onMenuError={onError}
       />
       <ChatPane
         channel={channel}
@@ -633,6 +635,7 @@ function ChannelList({
   onSelect,
   onJoinVoice,
   onLeave,
+  onMenuError,
 }: {
   session: SessionId;
   channels: Channel[];
@@ -645,8 +648,15 @@ function ChannelList({
   onSelect: (id: number) => void;
   onJoinVoice: (id: number) => void;
   onLeave: () => void;
+  onMenuError: (error: string) => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
+  const [menu, setMenu] = useState<MenuTarget | null>(null);
+
+  const openMenu = (e: React.MouseEvent, user: User) => {
+    e.preventDefault();
+    setMenu({ user, x: e.clientX, y: e.clientY });
+  };
 
   // Polled rather than pushed: speaking state changes every frame, and an
   // event per change would flood the bridge for something purely cosmetic.
@@ -736,7 +746,11 @@ function ChannelList({
                 const silenced = user.selfDeafened || user.selfMuted;
 
                 return (
-                  <li key={user.clientId} className={talking ? "speaking" : undefined}>
+                  <li
+                    key={user.clientId}
+                    className={talking ? "speaking" : undefined}
+                    onContextMenu={(e) => openMenu(e, user)}
+                  >
                     {/* Always rendered in a voice channel, so names do not
                         shift sideways as people start and stop talking. */}
                     {voiced && (
@@ -753,6 +767,12 @@ function ChannelList({
                         aria-label={user.selfDeafened ? "Deafened" : "Muted"}
                       >
                         {user.selfDeafened ? "🔇" : "🎙️̸"}
+                      </span>
+                    )}
+                    {/* By authority, not by choice — distinct marker. */}
+                    {voiced && user.serverMuted && (
+                      <span title="Muted by a moderator" aria-label="Muted by a moderator">
+                        ⛔
                       </span>
                     )}
                     {/* Announced only for the person themselves; narrating every
@@ -778,13 +798,22 @@ function ChannelList({
             {users
               .filter((user) => user.channel === null)
               .map((user) => (
-                <li key={user.clientId}>
+                <li key={user.clientId} onContextMenu={(e) => openMenu(e, user)}>
                   <span className="occupant-name">{user.nickname}</span>
                   {user.clientId === selfId && <span className="muted">(you)</span>}
                 </li>
               ))}
           </ul>
         </div>
+      )}
+      {menu && (
+        <UserMenu
+          session={session}
+          target={menu}
+          channels={channels}
+          onClose={() => setMenu(null)}
+          onError={onMenuError}
+        />
       )}
     </nav>
   );

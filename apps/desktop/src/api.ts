@@ -76,6 +76,8 @@ export interface User {
   channel: number | null;
   selfMuted: boolean;
   selfDeafened: boolean;
+  /** Muted by a moderator, not by choice. */
+  serverMuted: boolean;
 }
 
 export interface Message {
@@ -94,6 +96,24 @@ export interface ChannelPermissions {
   readHistory: boolean;
   connect: boolean;
   speak: boolean;
+}
+
+export interface BanEntry {
+  fingerprint: string;
+  short: string;
+  reason: string;
+  untilUnixMs: number | null;
+  issuedByShort: string;
+  issuedAtUnixMs: number;
+}
+
+export interface ModerationOptions {
+  canKick: boolean;
+  canBan: boolean;
+  canMute: boolean;
+  canMove: boolean;
+  /** One honest sentence when everything above is false. */
+  reason: string | null;
 }
 
 export interface MyPermissions {
@@ -177,7 +197,7 @@ export type ServerErrorCode =
 
 export type ServerEvent =
   | { type: "userJoined"; user: User }
-  | { type: "userLeft"; clientId: number }
+  | { type: "userLeft"; clientId: number; reason: "left" | "kicked" | "banned" }
   | { type: "userMoved"; clientId: number; channel: number | null }
   | { type: "userUpdated"; user: User }
   | { type: "message"; message: Message }
@@ -186,6 +206,8 @@ export type ServerEvent =
   | { type: "channelCreated"; channel: Channel }
   | { type: "channelUpdated"; channel: Channel }
   | { type: "channelRemoved"; channelId: number }
+  | { type: "banList"; bans: BanEntry[] }
+  | { type: "commandFailed"; nonce: number; code: ServerErrorCode; detail: string }
   | { type: "permissionsChanged"; permissions: MyPermissions }
   | { type: "serverError"; code: ServerErrorCode; detail: string }
   | { type: "disconnected"; reason: string };
@@ -344,6 +366,19 @@ export const api = {
     invoke<void>("fetch_history", { session, channel }),
   myPermissions: (session: SessionId) =>
     invoke<MyPermissions>("my_permissions", { session }),
+  kick: (session: SessionId, clientId: number, reason?: string) =>
+    invoke<void>("kick", { session, clientId, reason }),
+  ban: (session: SessionId, fingerprint: string, reason: string, untilUnixMs?: number) =>
+    invoke<void>("ban", { session, fingerprint, reason, untilUnixMs }),
+  unban: (session: SessionId, fingerprint: string) =>
+    invoke<void>("unban", { session, fingerprint }),
+  listBans: (session: SessionId) => invoke<void>("list_bans", { session }),
+  setServerMuted: (session: SessionId, clientId: number, muted: boolean) =>
+    invoke<void>("set_server_muted", { session, clientId, muted }),
+  moveUser: (session: SessionId, clientId: number, channel: number | null) =>
+    invoke<void>("move_user", { session, clientId, channel }),
+  moderationOptions: (session: SessionId, clientId: number) =>
+    invoke<ModerationOptions>("moderation_options", { session, clientId }),
   sendMessage: (session: SessionId, channel: number, content: string) =>
     invoke<void>("send_message", { session, channel, content }),
 
