@@ -7,6 +7,7 @@
 import type {
   BanEntry,
   Channel,
+  Role,
   Connection,
   MyPermissions,
   Message,
@@ -31,6 +32,8 @@ export interface ConnectionState {
   /// Set when the server drops us. The tab stays so the reason is readable
   /// rather than vanishing along with the explanation.
   disconnected: string | null;
+  /// Every role, senior first — kept live by rolesChanged snapshots.
+  roles: Role[];
   /// The ban list, when an admin surface has asked for it. Null = never
   /// fetched; the list is pull-based and replaced whole.
   bans: BanEntry[] | null;
@@ -65,7 +68,7 @@ export type Action =
 export function reduce(state: ConnectionsState, action: Action): ConnectionsState {
   switch (action.type) {
     case "opened": {
-      const { session, info, identity, permissions } = action.connection;
+      const { session, info, identity, permissions, roles } = action.connection;
       return {
         // Reconnecting an id that is somehow already present replaces it rather
         // than listing the same connection twice.
@@ -79,6 +82,7 @@ export function reduce(state: ConnectionsState, action: Action): ConnectionsStat
             channels: info.channels,
             bans: null,
             permissions,
+            roles,
             users: info.users,
             messages: [],
             activeChannel: info.defaultChannel,
@@ -245,6 +249,9 @@ function applyEvent(
     // reason lands next to whatever provoked it. Only the `disconnected`
     // event — which the client core emits exactly when the control stream is
     // genuinely gone — may declare this connection dead.
+    case "rolesChanged":
+      return { ...connection, roles: event.roles };
+
     case "banList":
       return { ...connection, bans: event.bans };
 
