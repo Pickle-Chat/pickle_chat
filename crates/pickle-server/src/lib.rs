@@ -6,7 +6,6 @@
 //! machines to move a server without users noticing.
 
 pub mod config;
-pub mod roles;
 pub mod session;
 pub mod state;
 pub mod store;
@@ -53,8 +52,16 @@ impl Server {
         let endpoint = quinn::Endpoint::server(quinn_config, config.bind)
             .with_context(|| format!("binding {}", config.bind))?;
 
-        let roles = roles::Roles::open(&data_dir.join(ROLES_FILE))
-            .context("loading roles; fix or remove the file to start with none")?;
+        // roles.json is a leftover from the deleted capability model. Never
+        // parsed — a malformed file must not affect boot, the exact property
+        // the old code fought for — just named, so its owner knows.
+        if data_dir.join(ROLES_FILE).exists() {
+            tracing::warn!(
+                "roles.json is obsolete and no longer read; roles live in the \
+                 database now. Recreate them via the admin tools, then delete \
+                 the file to silence this warning."
+            );
+        }
 
         let url = config
             .database_url
@@ -72,7 +79,59 @@ impl Server {
             .await
             .context("reading the highest stored message id")?;
 
-        let shared = Arc::new(Shared::new(config, loaded.identity, tls.cert_hash, roles));
+        // Channels and roles live in the database; the config seeds both on
+        // first boot and is a template afterwards. Seeding writes before
+        // anything reads, so a crash mid-seed re-seeds cleanly next start —
+        // every insert is keyed and the table was empty to enter this branch.
+        let mut channels = store.load_channels().await.context("loading channels")?;
+        if channels.is_empty() {
+            channels = state::build_channels(&config);
+            for channel in &channels {
+                store
+                    .insert_channel(channel)
+                    .await
+                    .context("seeding channels from the config")?;
+            }
+        }
+
+        let mut roles = store.load_roles().await.context("loading roles")?;
+        if roles.is_empty() {
+            roles = state::default_roles();
+            for role in &roles {
+                store
+                    .insert_role(role)
+                    .await
+                    .context("seeding the default roles")?;
+            }
+        }
+
+        // Overwrites ride on their channels; grants ride beside the roles.
+        for (channel_id, overwrite) in store
+            .load_overwrites()
+            .await
+            .context("loading overwrites")?
+        {
+            if let Some(channel) = channels.iter_mut().find(|c| c.id == channel_id) {
+                channel.overwrites.push(overwrite);
+            }
+        }
+        let mut members: std::collections::HashMap<_, Vec<_>> = Default::default();
+        for (fingerprint, role) in store
+            .load_role_members()
+            .await
+            .context("loading role grants")?
+        {
+            members.entry(fingerprint).or_default().push(role);
+        }
+
+        let perms = state::PermState { roles, members };
+        let shared = Arc::new(Shared::new(
+            config,
+            loaded.identity,
+            tls.cert_hash,
+            channels,
+            perms,
+        ));
         if let Some(highest) = highest {
             shared.resume_message_ids_after(highest);
         }

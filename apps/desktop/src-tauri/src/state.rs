@@ -39,6 +39,9 @@ pub struct ActiveSession {
     pub id: SessionId,
     pub client: Arc<Client>,
     pub event_pump: tokio::task::JoinHandle<()>,
+    /// This session's permission mirror, folded forward by the event pump and
+    /// read by the seeding commands. UX state only; the server re-checks all.
+    pub perms: crate::perms::SessionPerms,
     /// What the user typed to reach this server, kept verbatim so reconnecting
     /// resolves it the same way rather than pinning a resolved IP.
     pub address: String,

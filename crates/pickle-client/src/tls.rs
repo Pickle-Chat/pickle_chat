@@ -126,9 +126,11 @@ mod tests {
     }
 
     #[test]
-    fn the_alpn_matches_the_protocol_crate() {
+    fn the_alpn_carries_the_protocol_version() {
         // A mismatch would fail the TLS handshake with an opaque error, so it
-        // is worth catching here rather than at runtime.
-        assert_eq!(pickle_proto::ALPN, b"pickle/1");
+        // is worth catching here rather than at runtime — and deriving the
+        // expectation keeps this from going stale on the next version bump.
+        let expected = format!("pickle/{}", pickle_proto::PROTOCOL_VERSION);
+        assert_eq!(pickle_proto::ALPN, expected.as_bytes());
     }
 }

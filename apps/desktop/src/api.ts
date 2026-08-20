@@ -87,6 +87,21 @@ export interface Message {
   sentAtUnixMs: number;
 }
 
+/** Resolved by the Rust side with the same rules the server enforces; this
+    layer only renders the booleans. Replaced wholesale by permissionsChanged. */
+export interface ChannelPermissions {
+  send: boolean;
+  readHistory: boolean;
+  connect: boolean;
+  speak: boolean;
+}
+
+export interface MyPermissions {
+  isOwner: boolean;
+  isAdmin: boolean;
+  channels: Record<number, ChannelPermissions>;
+}
+
 export interface Session {
   clientId: number;
   serverName: string;
@@ -102,6 +117,7 @@ export interface Session {
 export type SessionId = number;
 
 export interface Connection {
+  permissions: MyPermissions;
   session: SessionId;
   info: Session;
   /// Fingerprint of the identity this connection signed in with, which need not
@@ -170,6 +186,7 @@ export type ServerEvent =
   | { type: "channelCreated"; channel: Channel }
   | { type: "channelUpdated"; channel: Channel }
   | { type: "channelRemoved"; channelId: number }
+  | { type: "permissionsChanged"; permissions: MyPermissions }
   | { type: "serverError"; code: ServerErrorCode; detail: string }
   | { type: "disconnected"; reason: string };
 
@@ -325,6 +342,8 @@ export const api = {
   leaveChannel: (session: SessionId) => invoke<void>("leave_channel", { session }),
   fetchHistory: (session: SessionId, channel: number) =>
     invoke<void>("fetch_history", { session, channel }),
+  myPermissions: (session: SessionId) =>
+    invoke<MyPermissions>("my_permissions", { session }),
   sendMessage: (session: SessionId, channel: number, content: string) =>
     invoke<void>("send_message", { session, channel, content }),
 
