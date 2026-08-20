@@ -1261,3 +1261,20 @@ button.fingerprint.copyable:focus-visible {
 .admin-matrix-cell:hover {
   border-color: var(--muted);
 }
+
+/* The way back, stated: a chevron on every role row, and a header inside the
+   editor that names what is being edited and closes it — visible before the
+   permission grid can scroll everything else away. */
+.admin-role-chevron {
+  display: inline-block;
+  width: 14px;
+  color: var(--muted);
+}
+
+.admin-role-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 6px;
+}

@@ -110,7 +110,17 @@ export function RolesTab({
 
       <ul className="admin-role-list">
         {ordered.map((role, index) => (
-          <li key={role.id}>
+          <li
+            key={role.id}
+            ref={(node) => {
+              // Opening a role can push the rest of the list off-screen; keep
+              // the opened row itself anchored in view so the way back — its
+              // own chevron and the editor's close — stays visible.
+              if (node && open === role.id) {
+                node.scrollIntoView({ block: "nearest" });
+              }
+            }}
+          >
             <div className={open === role.id ? "admin-role-row open" : "admin-role-row"}>
               <span
                 className={role.color ? "admin-role-chip" : "admin-role-chip unset"}
@@ -122,6 +132,9 @@ export function RolesTab({
                 aria-expanded={open === role.id}
                 onClick={() => setOpen(open === role.id ? null : role.id)}
               >
+                <span className="admin-role-chevron" aria-hidden="true">
+                  {open === role.id ? "▾" : "▸"}
+                </span>
                 {role.name}
               </button>
 
@@ -249,6 +262,12 @@ function RoleEditor({
 
   return (
     <div className="admin-role-editor">
+      <div className="admin-role-editor-head">
+        <strong>Editing {role.name}</strong>
+        <button className="icon" onClick={onCancel} aria-label="Close without saving">
+          ×
+        </button>
+      </div>
       {/* @everyone cannot be renamed and carries no colour of its own, so its
           editor collapses to just the bits. */}
       {!role.isEveryone && (
