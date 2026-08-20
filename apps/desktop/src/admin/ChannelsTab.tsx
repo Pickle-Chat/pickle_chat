@@ -6,10 +6,11 @@
 // of an opinion.
 
 import { useEffect, useState } from "react";
-import { type ChannelKindName } from "../api";
 import {
   api,
   type Channel,
+  type ChannelKindName,
+  type MatrixRow,
   type Overwrite,
   type OverwriteTarget,
   type Permission,
@@ -51,6 +52,116 @@ interface Draft {
 /// string the stage, the mirror rows, and React keys all agree on.
 const keyOf = (target: OverwriteTarget) =>
   target.kind === "role" ? `role:${target.id}` : `member:${target.fingerprint}`;
+
+/// The grid: every role crossed with every channel permission, resolved the
+/// way the server resolves it. A cell is the answer for a member holding only
+/// that role; clicking cycles the role's overwrite for that bit through
+/// inherit, allow and deny — seeing and editing are the same surface.
+function ChannelMatrix({
+  session,
+  channel,
+  matrix,
+  onError,
+  onChanged,
+}: {
+  session: SessionId;
+  channel: number;
+  matrix: MatrixRow[];
+  onError: (e: string) => void;
+  onChanged: () => void;
+}) {
+  const columns = matrix[0]?.cells.map((c) => c.name) ?? [];
+  // One short word per column, or the grid forces sideways scrolling before
+  // a single overwrite exists. The full name lives in the tooltip.
+  const short: Record<string, string> = {
+    viewChannel: "View",
+    sendMessages: "Send",
+    readHistory: "History",
+    manageMessages: "Manage",
+    connect: "Connect",
+    speak: "Speak",
+    muteMembers: "Mute",
+    moveMembers: "Move",
+  };
+
+  const cycle = (row: MatrixRow, cell: { name: Permission; state: string }) => {
+    // The full allow and deny lists for this role, with one bit moved one
+    // step around the cycle. The wire takes whole overwrites, not deltas.
+    const allow = new Set(
+      row.cells.filter((c) => c.state === "allow").map((c) => c.name),
+    );
+    const deny = new Set(row.cells.filter((c) => c.state === "deny").map((c) => c.name));
+    if (cell.state === "inherit") {
+      allow.add(cell.name);
+    } else if (cell.state === "allow") {
+      allow.delete(cell.name);
+      deny.add(cell.name);
+    } else {
+      deny.delete(cell.name);
+    }
+    const target = { kind: "role", id: row.roleId } as const;
+    const call =
+      allow.size === 0 && deny.size === 0
+        ? api.deleteChannelOverwrite(session, channel, target)
+        : api.setChannelOverwrite(session, channel, target, [...allow], [...deny]);
+    call.then(onChanged).catch((e) => onError(String(e)));
+  };
+
+  return (
+    <div className="admin-matrix-scroll">
+      <table className="admin-matrix">
+        <thead>
+          <tr>
+            <th />
+            {columns.map((name) => (
+              <th key={name} title={name}>
+                {short[name] ?? name}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {matrix.map((row) => (
+            <tr key={row.roleId}>
+              <th>
+                <span
+                  className={row.color ? "admin-role-chip" : "admin-role-chip unset"}
+                  style={row.color ? { background: row.color } : undefined}
+                />
+                {row.roleName}
+              </th>
+              {row.cells.map((cell) => (
+                <td key={cell.name}>
+                  <button
+                    className={`admin-matrix-cell ${cell.state}${cell.effective ? " on" : ""}`}
+                    onClick={() => cycle(row, cell)}
+                    title={
+                      `${row.roleName} · ${cell.name}: ` +
+                      (cell.effective ? "granted" : "not granted") +
+                      (cell.state === "inherit"
+                        ? cell.base
+                          ? " (from the role's own bits)"
+                          : " (not in the role's bits)"
+                        : ` (${cell.state} overwrite)`) +
+                      " — click to cycle inherit, allow, deny"
+                    }
+                  >
+                    {cell.state === "allow" ? "✓" : cell.state === "deny" ? "✕" : cell.effective ? "●" : "○"}
+                  </button>
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted">
+        Each row answers for a member holding only that role; members with
+        several roles get the union. ✓ and ✕ are this channel's own rules;
+        ● and ○ inherit from the role.
+      </p>
+    </div>
+  );
+}
 
 /// Create-or-edit form for one channel. Controlled by the caller: `channel`
 /// null is the create shape, else the full desired state is staged and sent
@@ -145,19 +256,22 @@ export function ChannelsTab({
   session,
   channels,
   roles,
+  initialSelected,
   onError,
 }: {
   session: SessionId;
   channels: Channel[];
   roles: Role[];
+  initialSelected?: number;
   onError: (e: string) => void;
 }) {
-  const [selected, setSelected] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(initialSelected ?? null);
   // The one copy of server state this tab holds, and deliberately so:
   // nothing pushes the raw overwrite list — permissionsChanged carries our
   // resolved booleans, never the per-target lists — so the mirror is read on
   // selection and re-read after every mutation.
   const [overwrites, setOverwrites] = useState<Overwrite[] | null>(null);
+  const [matrix, setMatrix] = useState<MatrixRow[] | null>(null);
   /// Bumped after every mutation; the load effect below is the only reader.
   const [generation, setGeneration] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
@@ -186,6 +300,12 @@ export function ChannelsTab({
         if (!stale) setOverwrites(list);
       })
       .catch((e) => onError(String(e)));
+    api
+      .channelMatrix(session, channel.id)
+      .then((rows) => {
+        if (!stale) setMatrix(rows);
+      })
+      .catch((e) => onError(String(e)));
     return () => {
       stale = true;
     };
@@ -194,6 +314,7 @@ export function ChannelsTab({
   const pick = (id: number | null) => {
     setSelected(id);
     setOverwrites(null);
+    setMatrix(null);
     setDrafts({});
     setAdded([]);
     setMemberDraft(null);
@@ -252,11 +373,16 @@ export function ChannelsTab({
     setDrafts((d) => ({ ...d, [key]: { allow: [], deny: [] } }));
   };
 
+  // Role overwrites are the matrix's job — visible and editable in one grid —
+  // so the card list below carries only member exceptions, which a role grid
+  // cannot show.
   const rows: { target: OverwriteTarget; saved: Overwrite | null }[] =
     overwrites === null
       ? []
       : [
-          ...overwrites.map((o) => ({ target: o.target, saved: o })),
+          ...overwrites
+            .filter((o) => o.target.kind === "member")
+            .map((o) => ({ target: o.target, saved: o })),
           // Another admin can create the overwrite we have staged; the
           // mirror's row wins, and our stage becomes its pending edit.
           ...added
@@ -334,6 +460,16 @@ export function ChannelsTab({
         </>
       )}
 
+      {channel !== undefined && matrix !== null && matrix.length > 0 && (
+        <ChannelMatrix
+          session={session}
+          channel={channel.id}
+          matrix={matrix}
+          onError={onError}
+          onChanged={() => setGeneration((g) => g + 1)}
+        />
+      )}
+
       {channel !== undefined &&
         (overwrites === null ? (
           <p className="muted">Loading…</p>
@@ -341,8 +477,7 @@ export function ChannelsTab({
           <>
             {rows.length === 0 ? (
               <p className="muted">
-                No overwrites — everyone sees this channel exactly as their
-                roles allow.
+                No member exceptions — the grid above is the whole story.
               </p>
             ) : (
               <ul className="admin-overwrite-list">
@@ -385,27 +520,11 @@ export function ChannelsTab({
             )}
 
             <div className="admin-add">
-              {/* A menu wearing a select: controlled back to the placeholder,
-                  so the same choice can fire again next time. */}
-              <select
-                value=""
-                aria-label="Add an overwrite"
-                onChange={(e) => {
-                  const value = e.target.value;
-                  if (value === "member") setMemberDraft("");
-                  else if (value !== "") addTarget({ kind: "role", id: Number(value) });
-                }}
-              >
-                <option value="" disabled>
-                  Add an overwrite…
-                </option>
-                {roles.map((role) => (
-                  <option key={role.id} value={role.id}>
-                    {role.name}
-                  </option>
-                ))}
-                <option value="member">member fingerprint…</option>
-              </select>
+              {memberDraft === null && (
+                <button className="linklike" onClick={() => setMemberDraft("")}>
+                  Add a member exception…
+                </button>
+              )}
             </div>
 
             {memberDraft !== null && (

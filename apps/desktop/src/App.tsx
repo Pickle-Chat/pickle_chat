@@ -17,6 +17,7 @@ import { EMPTY, reduce, type ConnectionState } from "./connections";
 import { Fingerprint } from "./Fingerprint";
 import { UserMenu, type MenuTarget } from "./UserMenu";
 import { AdminDialog } from "./admin/AdminDialog";
+import { ChannelMenu, type ChannelMenuTarget } from "./ChannelMenu";
 import { LevelMeter } from "./LevelMeter";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { usePushToTalk } from "./usePushToTalk";
@@ -399,13 +400,17 @@ function ConnectionView({
 
   const channel =
     connection.channels.find((c) => c.id === connection.activeChannel) ?? null;
-  const [adminOpen, setAdminOpen] = useState(false);
+  // false = closed; true = open on Roles; a number = that channel's
+  // permissions; "create" = the channels tab with nothing selected.
+  const [adminOpen, setAdminOpen] = useState<boolean | number | "create">(false);
 
   return (
     <>
-      {adminOpen && (
+      {adminOpen !== false && (
         <AdminDialog
           connection={connection}
+          initialChannel={typeof adminOpen === "number" ? adminOpen : undefined}
+          initialTab={adminOpen === "create" ? "channels" : undefined}
           onError={onError}
           onClose={() => setAdminOpen(false)}
         />
@@ -445,6 +450,12 @@ function ConnectionView({
         onJoinVoice={onJoinVoice}
         onLeave={onLeaveChannel}
         onMenuError={onError}
+        onChannelSettings={
+          connection.permissions.canOpenAdmin ? (id) => setAdminOpen(id) : undefined
+        }
+        onChannelCreate={
+          connection.permissions.canOpenAdmin ? () => setAdminOpen("create") : undefined
+        }
       />
       </div>
       <ChatPane
@@ -660,6 +671,8 @@ function ChannelList({
   onJoinVoice,
   onLeave,
   onMenuError,
+  onChannelSettings,
+  onChannelCreate,
 }: {
   session: SessionId;
   channels: Channel[];
@@ -673,9 +686,13 @@ function ChannelList({
   onJoinVoice: (id: number) => void;
   onLeave: () => void;
   onMenuError: (error: string) => void;
+  /// Present only with admin standing; its absence leaves right-click alone.
+  onChannelSettings?: (id: number) => void;
+  onChannelCreate?: () => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
   const [menu, setMenu] = useState<MenuTarget | null>(null);
+  const [channelMenu, setChannelMenu] = useState<ChannelMenuTarget | null>(null);
 
   const openMenu = (e: React.MouseEvent, user: User) => {
     e.preventDefault();
@@ -712,7 +729,16 @@ function ChannelList({
   );
 
   return (
-    <nav className="channels">
+    <nav
+      className="channels"
+      onContextMenu={
+        onChannelCreate &&
+        ((e) => {
+          e.preventDefault();
+          setChannelMenu({ channel: null, x: e.clientX, y: e.clientY });
+        })
+      }
+    >
       {sorted.map((channel) => (
         <div key={channel.id} className={channel.parent ? "channel nested" : "channel"}>
           <div className="channel-row">
@@ -721,7 +747,19 @@ function ChannelList({
             <button
               className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
               onClick={() => onSelect(channel.id)}
-              title={channel.topic}
+              onContextMenu={
+                onChannelSettings &&
+                ((e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setChannelMenu({ channel, x: e.clientX, y: e.clientY });
+                })
+              }
+              title={
+                onChannelSettings
+                  ? `${channel.topic}\nRight-click for options`.trim()
+                  : channel.topic
+              }
             >
               <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
               {channel.name}
@@ -836,6 +874,20 @@ function ChannelList({
           target={menu}
           channels={channels}
           onClose={() => setMenu(null)}
+          onError={onMenuError}
+        />
+      )}
+      {channelMenu && (
+        <ChannelMenu
+          session={session}
+          target={channelMenu}
+          onEditPermissions={() => {
+            if (channelMenu.channel !== null) {
+              onChannelSettings?.(channelMenu.channel.id);
+            }
+          }}
+          onCreateChannel={() => onChannelCreate?.()}
+          onClose={() => setChannelMenu(null)}
           onError={onMenuError}
         />
       )}

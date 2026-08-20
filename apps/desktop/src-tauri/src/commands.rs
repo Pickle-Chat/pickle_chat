@@ -788,6 +788,18 @@ pub fn delete_channel(
     })
 }
 
+/// The role-by-permission grid for one channel, from the mirror.
+#[tauri::command]
+pub fn channel_matrix(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+) -> Result<Vec<crate::perms::MatrixRowDto>, String> {
+    state.with_session(session, |active| {
+        active.perms.lock().channel_matrix(channel)
+    })
+}
+
 /// One channel's overwrites, from the mirror, for the tri-state editor.
 #[tauri::command]
 pub fn channel_overwrites(

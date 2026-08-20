@@ -48,6 +48,10 @@ pub struct ChannelPermissionsDto {
 /// commands that seed the frontend.
 pub struct PermMirror {
     fingerprint: Fingerprint,
+    /// A fingerprint belonging to nobody, for answering "what would a member
+    /// holding only role X get" — a hypothetical must never collide with a
+    /// real member overwrite.
+    probe: Fingerprint,
     owner: bool,
     roles: Vec<Role>,
     my_roles: Vec<RoleId>,
@@ -95,6 +99,40 @@ pub const EDITABLE_PERMISSIONS: &[(&str, Permissions)] = &[
     ("muteMembers", Permissions::MUTE_MEMBERS),
     ("moveMembers", Permissions::MOVE_MEMBERS),
 ];
+
+/// The channel-scoped bits in display order — the matrix's columns.
+pub const CHANNEL_PERMISSIONS: &[(&str, Permissions)] = &[
+    ("viewChannel", Permissions::VIEW_CHANNEL),
+    ("sendMessages", Permissions::SEND_MESSAGES),
+    ("readHistory", Permissions::READ_HISTORY),
+    ("manageMessages", Permissions::MANAGE_MESSAGES),
+    ("connect", Permissions::CONNECT),
+    ("speak", Permissions::SPEAK),
+    ("muteMembers", Permissions::MUTE_MEMBERS),
+    ("moveMembers", Permissions::MOVE_MEMBERS),
+];
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixRowDto {
+    pub role_id: RoleId,
+    pub role_name: String,
+    pub color: Option<String>,
+    pub is_everyone: bool,
+    pub cells: Vec<MatrixCellDto>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixCellDto {
+    pub name: &'static str,
+    /// What a member holding only this role ends up with here.
+    pub effective: bool,
+    /// What the role's bits alone would give, before overwrites.
+    pub base: bool,
+    /// This role's overwrite for this bit: "allow", "deny", or "inherit".
+    pub state: &'static str,
+}
 
 pub fn permission_names(bits: Permissions) -> Vec<&'static str> {
     EDITABLE_PERMISSIONS
@@ -160,6 +198,7 @@ impl PermMirror {
         let me = info.users.iter().find(|u| u.client_id == info.client_id);
         Self {
             fingerprint,
+            probe: pickle_identity::Identity::generate().fingerprint(),
             owner: me.map(|u| u.owner).unwrap_or(false),
             my_roles: me.map(|u| u.roles.clone()).unwrap_or_default(),
             roles: info.roles.clone(),
@@ -320,6 +359,65 @@ impl PermMirror {
             .unwrap_or_default()
     }
 
+    /// What each role means inside one channel: the resolved bits a member
+    /// holding only that role would have, cell by cell, with each cell naming
+    /// whether an overwrite forced it away from the role's base. The grid the
+    /// interface renders and edits in place.
+    ///
+    /// Per-role, deliberately: real members union several roles, so a
+    /// member's effective bits can exceed any single row — the matrix answers
+    /// "what does this role contribute", not "what does this person get".
+    pub fn channel_matrix(&self, channel: ChannelId) -> Vec<MatrixRowDto> {
+        let Some(target) = self.channels.get(&channel) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<&Role> = self.roles.iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.position));
+        rows.iter()
+            .map(|role| {
+                let held = if role.id == pickle_proto::EVERYONE_ROLE_ID {
+                    vec![]
+                } else {
+                    vec![role.id]
+                };
+                let base = resolve(&self.roles, &held, self.probe, false, None);
+                let effective = resolve(
+                    &self.roles,
+                    &held,
+                    self.probe,
+                    false,
+                    Some(&target.overwrites),
+                );
+                let overwrite = target
+                    .overwrites
+                    .iter()
+                    .find(|o| o.target == pickle_proto::OverwriteTarget::Role(role.id));
+                MatrixRowDto {
+                    role_id: role.id,
+                    role_name: role.name.clone(),
+                    color: role.color.map(|c| format!("#{c:06x}")),
+                    is_everyone: role.id == pickle_proto::EVERYONE_ROLE_ID,
+                    cells: CHANNEL_PERMISSIONS
+                        .iter()
+                        .map(|(name, bit)| {
+                            let state = match overwrite {
+                                Some(o) if o.deny.contains(*bit) => "deny",
+                                Some(o) if o.allow.contains(*bit) => "allow",
+                                _ => "inherit",
+                            };
+                            MatrixCellDto {
+                                name,
+                                effective: effective.contains(*bit),
+                                base: base.contains(*bit),
+                                state,
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
     /// Did this event change the role table? The pump re-emits the roles
     /// snapshot when it did, alongside the permissions snapshot.
     pub fn touches_roles(event: &ClientEvent) -> bool {
@@ -399,6 +497,22 @@ mod tests {
             max_users: None,
             order: id as i32,
             overwrites,
+        }
+    }
+
+    fn allow(target: OverwriteTarget, bits: Permissions) -> Overwrite {
+        Overwrite {
+            target,
+            allow: bits,
+            deny: Permissions::NONE,
+        }
+    }
+
+    fn deny(target: OverwriteTarget, bits: Permissions) -> Overwrite {
+        Overwrite {
+            target,
+            allow: Permissions::NONE,
+            deny: bits,
         }
     }
 
@@ -486,6 +600,63 @@ mod tests {
         let (_me, mut mirror) = mirror_with(vec![channel(1, Vec::new())]);
         assert!(mirror.apply(&ClientEvent::ChannelRemoved(1)));
         assert!(mirror.my_permissions().channels.is_empty());
+    }
+
+    #[test]
+    fn the_matrix_names_base_overridden_and_hidden_cells() {
+        let (_me, mut mirror) = mirror_with(vec![channel(1, Vec::new())]);
+        mirror.apply(&ClientEvent::RoleCreated(Role {
+            id: 5,
+            name: "dj".into(),
+            color: None,
+            position: 1,
+            permissions: Permissions::NONE,
+        }));
+
+        // Deny everyone's sendMessages; allow it back for dj.
+        mirror.apply(&ClientEvent::ChannelUpdated(channel(
+            1,
+            vec![
+                deny(
+                    OverwriteTarget::Role(pickle_proto::EVERYONE_ROLE_ID),
+                    Permissions::SEND_MESSAGES,
+                ),
+                allow(OverwriteTarget::Role(5), Permissions::SEND_MESSAGES),
+            ],
+        )));
+
+        let matrix = mirror.channel_matrix(1);
+        let everyone = matrix.iter().find(|r| r.is_everyone).unwrap();
+        let dj = matrix.iter().find(|r| r.role_id == 5).unwrap();
+
+        let send = |row: &MatrixRowDto| {
+            row.cells
+                .iter()
+                .find(|c| c.name == "sendMessages")
+                .unwrap()
+                .clone()
+        };
+        let e = send(everyone);
+        assert!(e.base && !e.effective, "denied away from its base");
+        assert_eq!(e.state, "deny");
+
+        let d = send(dj);
+        // dj's base includes everyone's bits (a member holds both), and the
+        // allow overwrite keeps it effective despite everyone's deny.
+        assert!(d.effective);
+        assert_eq!(d.state, "allow");
+
+        // A viewChannel deny hides everything: every cell goes dark.
+        mirror.apply(&ClientEvent::ChannelUpdated(channel(
+            1,
+            vec![deny(
+                OverwriteTarget::Role(pickle_proto::EVERYONE_ROLE_ID),
+                Permissions::VIEW_CHANNEL,
+            )],
+        )));
+        let matrix = mirror.channel_matrix(1);
+        let everyone = matrix.iter().find(|r| r.is_everyone).unwrap();
+        assert!(everyone.cells.iter().all(|c| !c.effective));
     }
 
     #[test]

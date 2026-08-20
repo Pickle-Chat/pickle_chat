@@ -100,6 +100,7 @@ pub fn run() {
             commands::set_channel_overwrite,
             commands::delete_channel_overwrite,
             commands::channel_overwrites,
+            commands::channel_matrix,
             commands::create_channel,
             commands::update_channel,
             commands::delete_channel,
