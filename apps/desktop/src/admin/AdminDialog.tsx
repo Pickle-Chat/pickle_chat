@@ -25,16 +25,22 @@ const TABS: { id: TabId; label: string }[] = [
 export function AdminDialog({
   connection,
   initialChannel,
+  initialTab,
   onError,
   onClose,
 }: {
   connection: ConnectionState;
   /// Right-clicking a channel opens the dialog straight onto its permissions.
   initialChannel?: number;
+  /// "Create channel" opens the channels tab with nothing selected — the
+  /// create form's home — without pretending a channel was picked.
+  initialTab?: "channels";
   onError: (error: string) => void;
   onClose: () => void;
 }) {
-  const [tab, setTab] = useState<TabId>(initialChannel === undefined ? "roles" : "channels");
+  const [tab, setTab] = useState<TabId>(
+    initialChannel !== undefined || initialTab === "channels" ? "channels" : "roles",
+  );
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {

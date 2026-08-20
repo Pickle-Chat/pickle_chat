@@ -400,9 +400,9 @@ function ConnectionView({
 
   const channel =
     connection.channels.find((c) => c.id === connection.activeChannel) ?? null;
-  // false = closed; true = open on Roles; a number = open on that channel's
-  // permissions (the right-click path).
-  const [adminOpen, setAdminOpen] = useState<boolean | number>(false);
+  // false = closed; true = open on Roles; a number = that channel's
+  // permissions; "create" = the channels tab with nothing selected.
+  const [adminOpen, setAdminOpen] = useState<boolean | number | "create">(false);
 
   return (
     <>
@@ -410,6 +410,7 @@ function ConnectionView({
         <AdminDialog
           connection={connection}
           initialChannel={typeof adminOpen === "number" ? adminOpen : undefined}
+          initialTab={adminOpen === "create" ? "channels" : undefined}
           onError={onError}
           onClose={() => setAdminOpen(false)}
         />
@@ -451,6 +452,9 @@ function ConnectionView({
         onMenuError={onError}
         onChannelSettings={
           connection.permissions.canOpenAdmin ? (id) => setAdminOpen(id) : undefined
+        }
+        onChannelCreate={
+          connection.permissions.canOpenAdmin ? () => setAdminOpen("create") : undefined
         }
       />
       </div>
@@ -668,6 +672,7 @@ function ChannelList({
   onLeave,
   onMenuError,
   onChannelSettings,
+  onChannelCreate,
 }: {
   session: SessionId;
   channels: Channel[];
@@ -683,6 +688,7 @@ function ChannelList({
   onMenuError: (error: string) => void;
   /// Present only with admin standing; its absence leaves right-click alone.
   onChannelSettings?: (id: number) => void;
+  onChannelCreate?: () => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
   const [menu, setMenu] = useState<MenuTarget | null>(null);
@@ -723,7 +729,16 @@ function ChannelList({
   );
 
   return (
-    <nav className="channels">
+    <nav
+      className="channels"
+      onContextMenu={
+        onChannelCreate &&
+        ((e) => {
+          e.preventDefault();
+          setChannelMenu({ channel: null, x: e.clientX, y: e.clientY });
+        })
+      }
+    >
       {sorted.map((channel) => (
         <div key={channel.id} className={channel.parent ? "channel nested" : "channel"}>
           <div className="channel-row">
@@ -736,6 +751,7 @@ function ChannelList({
                 onChannelSettings &&
                 ((e) => {
                   e.preventDefault();
+                  e.stopPropagation();
                   setChannelMenu({ channel, x: e.clientX, y: e.clientY });
                 })
               }
@@ -861,11 +877,16 @@ function ChannelList({
           onError={onMenuError}
         />
       )}
-      {channelMenu && onChannelSettings && (
+      {channelMenu && (
         <ChannelMenu
           session={session}
           target={channelMenu}
-          onEditPermissions={() => onChannelSettings(channelMenu.channel.id)}
+          onEditPermissions={() => {
+            if (channelMenu.channel !== null) {
+              onChannelSettings?.(channelMenu.channel.id);
+            }
+          }}
+          onCreateChannel={() => onChannelCreate?.()}
           onClose={() => setChannelMenu(null)}
           onError={onMenuError}
         />
