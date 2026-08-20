@@ -399,13 +399,16 @@ function ConnectionView({
 
   const channel =
     connection.channels.find((c) => c.id === connection.activeChannel) ?? null;
-  const [adminOpen, setAdminOpen] = useState(false);
+  // false = closed; true = open on Roles; a number = open on that channel's
+  // permissions (the right-click path).
+  const [adminOpen, setAdminOpen] = useState<boolean | number>(false);
 
   return (
     <>
-      {adminOpen && (
+      {adminOpen !== false && (
         <AdminDialog
           connection={connection}
+          initialChannel={typeof adminOpen === "number" ? adminOpen : undefined}
           onError={onError}
           onClose={() => setAdminOpen(false)}
         />
@@ -445,6 +448,9 @@ function ConnectionView({
         onJoinVoice={onJoinVoice}
         onLeave={onLeaveChannel}
         onMenuError={onError}
+        onChannelSettings={
+          connection.permissions.canOpenAdmin ? (id) => setAdminOpen(id) : undefined
+        }
       />
       </div>
       <ChatPane
@@ -660,6 +666,7 @@ function ChannelList({
   onJoinVoice,
   onLeave,
   onMenuError,
+  onChannelSettings,
 }: {
   session: SessionId;
   channels: Channel[];
@@ -673,6 +680,8 @@ function ChannelList({
   onJoinVoice: (id: number) => void;
   onLeave: () => void;
   onMenuError: (error: string) => void;
+  /// Present only with admin standing; its absence leaves right-click alone.
+  onChannelSettings?: (id: number) => void;
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
   const [menu, setMenu] = useState<MenuTarget | null>(null);
@@ -721,7 +730,18 @@ function ChannelList({
             <button
               className={channel.id === activeChannel ? "channel-name active" : "channel-name"}
               onClick={() => onSelect(channel.id)}
-              title={channel.topic}
+              onContextMenu={
+                onChannelSettings &&
+                ((e) => {
+                  e.preventDefault();
+                  onChannelSettings(channel.id);
+                })
+              }
+              title={
+                onChannelSettings
+                  ? `${channel.topic}\nRight-click for permissions`.trim()
+                  : channel.topic
+              }
             >
               <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
               {channel.name}

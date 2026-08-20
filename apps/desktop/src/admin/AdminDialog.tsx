@@ -24,14 +24,17 @@ const TABS: { id: TabId; label: string }[] = [
 
 export function AdminDialog({
   connection,
+  initialChannel,
   onError,
   onClose,
 }: {
   connection: ConnectionState;
+  /// Right-clicking a channel opens the dialog straight onto its permissions.
+  initialChannel?: number;
   onError: (error: string) => void;
   onClose: () => void;
 }) {
-  const [tab, setTab] = useState<TabId>("roles");
+  const [tab, setTab] = useState<TabId>(initialChannel === undefined ? "roles" : "channels");
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -94,6 +97,7 @@ export function AdminDialog({
                 session={connection.session}
                 channels={connection.channels}
                 roles={connection.roles}
+                initialSelected={initialChannel}
                 onError={onError}
               />
             )}

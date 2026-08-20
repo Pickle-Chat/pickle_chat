@@ -6,10 +6,11 @@
 // of an opinion.
 
 import { useEffect, useState } from "react";
-import { type ChannelKindName } from "../api";
 import {
   api,
   type Channel,
+  type ChannelKindName,
+  type MatrixRow,
   type Overwrite,
   type OverwriteTarget,
   type Permission,
@@ -51,6 +52,107 @@ interface Draft {
 /// string the stage, the mirror rows, and React keys all agree on.
 const keyOf = (target: OverwriteTarget) =>
   target.kind === "role" ? `role:${target.id}` : `member:${target.fingerprint}`;
+
+/// The grid: every role crossed with every channel permission, resolved the
+/// way the server resolves it. A cell is the answer for a member holding only
+/// that role; clicking cycles the role's overwrite for that bit through
+/// inherit, allow and deny — seeing and editing are the same surface.
+function ChannelMatrix({
+  session,
+  channel,
+  matrix,
+  onError,
+  onChanged,
+}: {
+  session: SessionId;
+  channel: number;
+  matrix: MatrixRow[];
+  onError: (e: string) => void;
+  onChanged: () => void;
+}) {
+  const columns = matrix[0]?.cells.map((c) => c.name) ?? [];
+
+  const cycle = (row: MatrixRow, cell: { name: Permission; state: string }) => {
+    // The full allow and deny lists for this role, with one bit moved one
+    // step around the cycle. The wire takes whole overwrites, not deltas.
+    const allow = new Set(
+      row.cells.filter((c) => c.state === "allow").map((c) => c.name),
+    );
+    const deny = new Set(row.cells.filter((c) => c.state === "deny").map((c) => c.name));
+    if (cell.state === "inherit") {
+      allow.add(cell.name);
+    } else if (cell.state === "allow") {
+      allow.delete(cell.name);
+      deny.add(cell.name);
+    } else {
+      deny.delete(cell.name);
+    }
+    const target = { kind: "role", id: row.roleId } as const;
+    const call =
+      allow.size === 0 && deny.size === 0
+        ? api.deleteChannelOverwrite(session, channel, target)
+        : api.setChannelOverwrite(session, channel, target, [...allow], [...deny]);
+    call.then(onChanged).catch((e) => onError(String(e)));
+  };
+
+  return (
+    <div className="admin-matrix-scroll">
+      <table className="admin-matrix">
+        <thead>
+          <tr>
+            <th />
+            {columns.map((name) => (
+              <th key={name} title={name}>
+                {name.replace(/([A-Z])/g, " $1").split(" ")[0]}
+                <span className="admin-matrix-colrest">
+                  {name.replace(/([A-Z])/g, " $1").split(" ").slice(1).join(" ")}
+                </span>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {matrix.map((row) => (
+            <tr key={row.roleId}>
+              <th>
+                <span
+                  className={row.color ? "admin-role-chip" : "admin-role-chip unset"}
+                  style={row.color ? { background: row.color } : undefined}
+                />
+                {row.roleName}
+              </th>
+              {row.cells.map((cell) => (
+                <td key={cell.name}>
+                  <button
+                    className={`admin-matrix-cell ${cell.state}${cell.effective ? " on" : ""}`}
+                    onClick={() => cycle(row, cell)}
+                    title={
+                      `${row.roleName} · ${cell.name}: ` +
+                      (cell.effective ? "granted" : "not granted") +
+                      (cell.state === "inherit"
+                        ? cell.base
+                          ? " (from the role's own bits)"
+                          : " (not in the role's bits)"
+                        : ` (${cell.state} overwrite)`) +
+                      " — click to cycle inherit, allow, deny"
+                    }
+                  >
+                    {cell.state === "allow" ? "✓" : cell.state === "deny" ? "✕" : cell.effective ? "●" : "○"}
+                  </button>
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted">
+        Each row answers for a member holding only that role; members with
+        several roles get the union. ✓ and ✕ are this channel's own rules;
+        ● and ○ inherit from the role.
+      </p>
+    </div>
+  );
+}
 
 /// Create-or-edit form for one channel. Controlled by the caller: `channel`
 /// null is the create shape, else the full desired state is staged and sent
@@ -145,19 +247,22 @@ export function ChannelsTab({
   session,
   channels,
   roles,
+  initialSelected,
   onError,
 }: {
   session: SessionId;
   channels: Channel[];
   roles: Role[];
+  initialSelected?: number;
   onError: (e: string) => void;
 }) {
-  const [selected, setSelected] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(initialSelected ?? null);
   // The one copy of server state this tab holds, and deliberately so:
   // nothing pushes the raw overwrite list — permissionsChanged carries our
   // resolved booleans, never the per-target lists — so the mirror is read on
   // selection and re-read after every mutation.
   const [overwrites, setOverwrites] = useState<Overwrite[] | null>(null);
+  const [matrix, setMatrix] = useState<MatrixRow[] | null>(null);
   /// Bumped after every mutation; the load effect below is the only reader.
   const [generation, setGeneration] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
@@ -186,6 +291,12 @@ export function ChannelsTab({
         if (!stale) setOverwrites(list);
       })
       .catch((e) => onError(String(e)));
+    api
+      .channelMatrix(session, channel.id)
+      .then((rows) => {
+        if (!stale) setMatrix(rows);
+      })
+      .catch((e) => onError(String(e)));
     return () => {
       stale = true;
     };
@@ -194,6 +305,7 @@ export function ChannelsTab({
   const pick = (id: number | null) => {
     setSelected(id);
     setOverwrites(null);
+    setMatrix(null);
     setDrafts({});
     setAdded([]);
     setMemberDraft(null);
@@ -332,6 +444,16 @@ export function ChannelsTab({
             </button>
           </p>
         </>
+      )}
+
+      {channel !== undefined && matrix !== null && matrix.length > 0 && (
+        <ChannelMatrix
+          session={session}
+          channel={channel.id}
+          matrix={matrix}
+          onError={onError}
+          onChanged={() => setGeneration((g) => g + 1)}
+        />
       )}
 
       {channel !== undefined &&

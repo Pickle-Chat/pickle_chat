@@ -1190,3 +1190,74 @@ button.fingerprint.copyable:focus-visible {
   flex: 1;
   min-width: 120px;
 }
+
+/* The role-by-permission grid: seeing and editing in one place. Wide by
+   nature, so it scrolls itself rather than the dialog. */
+.admin-matrix-scroll {
+  overflow-x: auto;
+}
+
+.admin-matrix {
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.admin-matrix th {
+  text-align: left;
+  font-weight: 400;
+  color: var(--muted);
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+
+.admin-matrix thead th {
+  vertical-align: bottom;
+  font-size: 11px;
+}
+
+.admin-matrix-colrest {
+  display: block;
+  font-size: 10px;
+}
+
+.admin-matrix tbody th {
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.admin-matrix td {
+  text-align: center;
+  padding: 1px 2px;
+}
+
+/* One glyph per cell: ✓/✕ are this channel's own rules, ●/○ inherit from the
+   role. Click cycles inherit → allow → deny. */
+.admin-matrix-cell {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  width: 28px;
+  padding: 2px 0;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.admin-matrix-cell.on {
+  color: var(--text);
+}
+
+.admin-matrix-cell.allow {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.admin-matrix-cell.deny {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.admin-matrix-cell:hover {
+  border-color: var(--muted);
+}

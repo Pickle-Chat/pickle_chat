@@ -131,6 +131,25 @@ export type Permission =
 
 export type ChannelKindName = "voice" | "text" | "voice_and_text";
 
+/** One role's row in a channel's permission grid. */
+export interface MatrixRow {
+  roleId: number;
+  roleName: string;
+  color: string | null;
+  isEveryone: boolean;
+  cells: MatrixCell[];
+}
+
+export interface MatrixCell {
+  name: Permission;
+  /** What a member holding only this role ends up with here. */
+  effective: boolean;
+  /** What the role's bits alone would give, before overwrites. */
+  base: boolean;
+  /** This role's overwrite for this bit. */
+  state: "allow" | "inherit" | "deny";
+}
+
 export type OverwriteTarget =
   | { kind: "role"; id: number }
   | { kind: "member"; fingerprint: string };
@@ -459,6 +478,8 @@ export const api = {
     invoke<void>("delete_channel_overwrite", { session, channel, target }),
   channelOverwrites: (session: SessionId, channel: number) =>
     invoke<Overwrite[]>("channel_overwrites", { session, channel }),
+  channelMatrix: (session: SessionId, channel: number) =>
+    invoke<MatrixRow[]>("channel_matrix", { session, channel }),
   createChannel: (
     session: SessionId,
     input: { name: string; kind: ChannelKindName; parent?: number; topic?: string; maxUsers?: number; order?: number },
