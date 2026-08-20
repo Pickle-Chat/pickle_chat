@@ -19,5 +19,3 @@ known_servers.json
 .env
 .env.local
 
-# Agent worktrees, created per-session.
-.claude/worktrees/
