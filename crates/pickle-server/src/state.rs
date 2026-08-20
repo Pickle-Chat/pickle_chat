@@ -52,18 +52,35 @@ pub trait DatagramSink: Send + Sync + 'static {
     /// Best-effort. Voice is lossy by design, so a failure here is not an error
     /// worth propagating — the frame is simply dropped.
     fn send_datagram(&self, payload: bytes::Bytes);
+
+    /// Authoritatively close the transport. A kick must not depend on the
+    /// kicked client cooperating with a FIN. Default no-op so test sinks and
+    /// any transport without a close need nothing.
+    fn close(&self, _code: u32, _reason: &[u8]) {}
 }
 
 impl DatagramSink for quinn::Connection {
     fn send_datagram(&self, payload: bytes::Bytes) {
         let _ = quinn::Connection::send_datagram(self, payload);
     }
+
+    fn close(&self, code: u32, reason: &[u8]) {
+        quinn::Connection::close(self, code.into(), reason);
+    }
 }
 
-struct ConnectedClient {
+pub struct ConnectedClient {
     info: UserInfo,
     control: ControlSender,
     datagrams: Box<dyn DatagramSink>,
+}
+
+impl ConnectedClient {
+    /// Close the underlying transport with an application code and reason.
+    /// Only meaningful on an entry already removed from the roster.
+    pub fn close_transport(&self, code: u32, reason: &[u8]) {
+        self.datagrams.close(code, reason);
+    }
 }
 
 /// Queue a frame, naming the client if its queue is full.
@@ -694,6 +711,130 @@ impl Shared {
     }
 
     /// Build a chat message with server-assigned id and timestamp.
+    /// What `client` may do server-wide (no channel context).
+    pub fn can_globally(&self, client: ClientId, bits: Permissions) -> bool {
+        let snapshot = self.perm_state();
+        let inner = self.inner.read();
+        let Some(entry) = inner.clients.get(&client) else {
+            return false;
+        };
+        resolve(
+            &snapshot.roles,
+            &entry.info.roles,
+            entry.info.fingerprint(),
+            entry.info.owner,
+            None,
+        )
+        .contains(bits)
+    }
+
+    /// May the online actor act on this fingerprint — kick, ban, mute, move?
+    ///
+    /// Works for offline targets too: their grants come from the engine, and
+    /// the owner fingerprint is config, not presence. Rank alone; the bit is
+    /// the caller's check.
+    pub fn actor_outranks(&self, actor: ClientId, target: Fingerprint) -> bool {
+        let snapshot = self.perm_state();
+        let target_roles = snapshot.members.get(&target).cloned().unwrap_or_default();
+        let target_owner = self.is_owner(target);
+        let inner = self.inner.read();
+        let Some(entry) = inner.clients.get(&actor) else {
+            return false;
+        };
+        pickle_proto::can_act_on(
+            &snapshot.roles,
+            &entry.info.roles,
+            entry.info.owner,
+            &target_roles,
+            target_owner,
+        )
+    }
+
+    /// The fingerprint behind a live client id, if it is still connected.
+    pub fn fingerprint_of(&self, client: ClientId) -> Option<Fingerprint> {
+        self.inner
+            .read()
+            .clients
+            .get(&client)
+            .map(|c| c.info.fingerprint())
+    }
+
+    /// Remove a client by authority — a kick or a ban, not a quit.
+    ///
+    /// The victim is told first (a client that drains its queue learns *why*
+    /// before the door shuts), then removed, then everyone else is told with
+    /// the real reason. The returned entry carries the transport so the
+    /// caller can close it after letting the frame flush — the 50 ms grace is
+    /// the caller's, since this function must not sleep under any lock.
+    pub fn eject(&self, victim: ClientId, reason: DisconnectReason) -> Option<ConnectedClient> {
+        let entry = {
+            let mut inner = self.inner.write();
+            let entry = inner.clients.get(&victim)?;
+            let _ = try_queue(
+                entry,
+                ServerControl::UserLeft {
+                    client: victim,
+                    reason,
+                },
+            );
+            inner.clients.remove(&victim)
+        };
+        self.broadcast(
+            ServerControl::UserLeft {
+                client: victim,
+                reason,
+            },
+            None,
+        );
+        entry
+    }
+
+    /// Set the server-side mute flag the relay has enforced all along.
+    /// Returns the updated info for broadcasting, `None` if the client is gone.
+    pub fn set_server_muted(&self, client: ClientId, muted: bool) -> Option<UserInfo> {
+        let mut inner = self.inner.write();
+        let entry = inner.clients.get_mut(&client)?;
+        entry.info.voice.server_muted = muted;
+        Some(entry.info.clone())
+    }
+
+    /// Move a member by authority. The target's own CONNECT is deliberately
+    /// not consulted — the mover's is, by the caller — but the room's
+    /// existence, kind, and capacity still apply: movers do not bypass walls.
+    pub fn force_move(
+        &self,
+        client: ClientId,
+        to: Option<ChannelId>,
+    ) -> Result<Option<ChannelId>, ErrorCode> {
+        let mut inner = self.inner.write();
+        if let Some(channel) = to {
+            let target = inner
+                .channels
+                .get(&channel)
+                .ok_or(ErrorCode::NoSuchChannel)?;
+            if !target.kind.has_voice() {
+                return Err(ErrorCode::NotPermitted);
+            }
+            if let Some(max) = target.max_users {
+                let occupants = inner
+                    .clients
+                    .values()
+                    .filter(|c| c.info.channel == Some(channel) && c.info.client_id != client)
+                    .count();
+                if occupants >= max as usize {
+                    return Err(ErrorCode::ChannelFull);
+                }
+            }
+        }
+        let entry = inner
+            .clients
+            .get_mut(&client)
+            .ok_or(ErrorCode::NotAuthenticated)?;
+        let previous = entry.info.channel;
+        entry.info.channel = to;
+        Ok(previous)
+    }
+
     pub fn build_message(
         &self,
         author: &UserInfo,
@@ -791,7 +932,7 @@ fn sanitize_nickname(raw: &str, max_len: usize) -> Option<String> {
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1148,6 +1289,95 @@ mod tests {
             bob.sink.0.lock().is_empty(),
             "a client in no channel must reach nobody"
         );
+    }
+
+    #[test]
+    fn ejecting_tells_the_victim_then_everyone_with_the_real_reason() {
+        let shared = shared();
+        let mut alice = join(&shared, "alice");
+        let mut bob = join(&shared, "bob");
+
+        let entry = shared.eject(alice.info.client_id, DisconnectReason::Kicked);
+        assert!(
+            entry.is_some(),
+            "the entry comes back for the transport close"
+        );
+        assert_eq!(shared.user_count(), 1);
+
+        // Both the victim and the bystander hear UserLeft { Kicked }.
+        for (who, control) in [("alice", &mut alice.control), ("bob", &mut bob.control)] {
+            let frame = control
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{who} heard nothing"));
+            assert!(
+                matches!(
+                    frame,
+                    ServerControl::UserLeft {
+                        reason: DisconnectReason::Kicked,
+                        ..
+                    }
+                ),
+                "{who} must hear the real reason"
+            );
+        }
+
+        // Ejecting a ghost is a quiet no-op.
+        assert!(shared
+            .eject(alice.info.client_id, DisconnectReason::Kicked)
+            .is_none());
+    }
+
+    #[test]
+    fn a_server_mute_silences_the_relay_until_lifted() {
+        let shared = shared();
+        let alice = join_voice(&shared, "alice");
+        let bob = join_voice(&shared, "bob");
+
+        shared.set_server_muted(alice.info.client_id, true).unwrap();
+        shared.relay_voice(alice.info.client_id, voice_frame(1));
+        assert!(
+            bob.sink.0.lock().is_empty(),
+            "muted by authority, not by choice"
+        );
+
+        shared
+            .set_server_muted(alice.info.client_id, false)
+            .unwrap();
+        shared.relay_voice(alice.info.client_id, voice_frame(2));
+        assert_eq!(bob.sink.0.lock().len(), 1, "and the lift is immediate");
+    }
+
+    #[test]
+    fn force_move_bypasses_the_targets_permissions_but_not_the_walls() {
+        let shared = shared();
+        let alice = join(&shared, "alice");
+
+        // Into a voice room: fine, and reports where they were.
+        assert_eq!(shared.force_move(alice.info.client_id, Some(3)), Ok(None));
+        // Into a text channel: still refused — there is no room to stand in.
+        assert_eq!(
+            shared.force_move(alice.info.client_id, Some(1)),
+            Err(ErrorCode::NotPermitted)
+        );
+        // Out of voice entirely.
+        assert_eq!(shared.force_move(alice.info.client_id, None), Ok(Some(3)));
+    }
+
+    #[test]
+    fn hierarchy_helpers_answer_from_grants_and_config() {
+        let operator = Identity::generate();
+        let config = ServerConfig {
+            owner: Some(operator.fingerprint().to_string()),
+            ..test_config()
+        };
+        let shared = shared_from(config);
+        let alice = join(&shared, "alice");
+
+        // A roleless actor outranks nobody — not even another roleless member.
+        let bob = join(&shared, "bob");
+        assert!(!shared.actor_outranks(alice.info.client_id, bob.info.fingerprint()));
+        // And nobody outranks the owner, online or not.
+        assert!(!shared.actor_outranks(alice.info.client_id, operator.fingerprint()));
     }
 
     #[test]
