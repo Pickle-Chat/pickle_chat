@@ -107,6 +107,8 @@ pub struct UserDto {
     pub channel: Option<u32>,
     pub self_muted: bool,
     pub self_deafened: bool,
+    /// Muted by a moderator, not by choice — rendered distinctly.
+    pub server_muted: bool,
 }
 
 impl From<&UserInfo> for UserDto {
@@ -120,6 +122,31 @@ impl From<&UserInfo> for UserDto {
             channel: user.channel,
             self_muted: user.voice.self_muted,
             self_deafened: user.voice.self_deafened,
+            server_muted: user.voice.server_muted,
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BanDto {
+    pub fingerprint: String,
+    pub short: String,
+    pub reason: String,
+    pub until_unix_ms: Option<u64>,
+    pub issued_by_short: String,
+    pub issued_at_unix_ms: u64,
+}
+
+impl From<&pickle_proto::BanEntry> for BanDto {
+    fn from(ban: &pickle_proto::BanEntry) -> Self {
+        Self {
+            fingerprint: ban.fingerprint.to_string(),
+            short: ban.fingerprint.short(),
+            reason: ban.reason.clone(),
+            until_unix_ms: ban.until_unix_ms,
+            issued_by_short: ban.issued_by.short(),
+            issued_at_unix_ms: ban.issued_at_unix_ms,
         }
     }
 }
@@ -246,6 +273,9 @@ pub enum EventDto {
     },
     UserLeft {
         client_id: u32,
+        /// "left", "kicked" or "banned" — the occupant disappears either way,
+        /// but moderation is public and reads differently.
+        reason: &'static str,
     },
     UserMoved {
         client_id: u32,
@@ -279,6 +309,14 @@ pub enum EventDto {
         code: &'static str,
         detail: String,
     },
+    BanList {
+        bans: Vec<BanDto>,
+    },
+    CommandFailed {
+        nonce: u64,
+        code: &'static str,
+        detail: String,
+    },
     /// Derived by the Rust-side permission mirror, not translated from the
     /// wire: a complete snapshot, replaced wholesale, so the frontend never
     /// merges permission state.
@@ -297,7 +335,14 @@ impl EventDto {
             ClientEvent::UserJoined(user) => Self::UserJoined {
                 user: UserDto::from(user),
             },
-            ClientEvent::UserLeft { client, .. } => Self::UserLeft { client_id: *client },
+            ClientEvent::UserLeft { client, reason } => Self::UserLeft {
+                client_id: *client,
+                reason: match reason {
+                    pickle_proto::DisconnectReason::Kicked => "kicked",
+                    pickle_proto::DisconnectReason::Banned => "banned",
+                    _ => "left",
+                },
+            },
             ClientEvent::UserMoved { client, to, .. } => Self::UserMoved {
                 client_id: *client,
                 channel: *to,
@@ -337,17 +382,28 @@ impl EventDto {
             },
 
             // Handled on the Rust side or not yet surfaced in the UI.
-            // The role and admin-reply events feed the Rust-side permission
-            // mirror (next commit), which emits derived snapshot events the
-            // frontend can consume whole; the raw frames stay on this side of
-            // the bridge.
+            ClientEvent::BanList { bans } => Self::BanList {
+                bans: bans.iter().map(BanDto::from).collect(),
+            },
+            ClientEvent::CommandFailed {
+                nonce,
+                code,
+                detail,
+            } => Self::CommandFailed {
+                nonce: *nonce,
+                code: error_code_str(*code),
+                detail: detail.clone(),
+            },
+
+            // The role events feed the Rust-side permission mirror, which
+            // emits derived snapshot events the frontend consumes whole; the
+            // raw frames stay on this side of the bridge. Ack is silent —
+            // success shows as the broadcast it caused.
             ClientEvent::RoleCreated(_)
             | ClientEvent::RoleUpdated(_)
             | ClientEvent::RoleDeleted { .. }
             | ClientEvent::RolesReordered { .. }
-            | ClientEvent::BanList { .. }
             | ClientEvent::Ack { .. }
-            | ClientEvent::CommandFailed { .. }
             | ClientEvent::Voice(_)
             | ClientEvent::VoiceActivity { .. }
             | ClientEvent::Pong { .. }

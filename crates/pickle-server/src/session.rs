@@ -9,6 +9,7 @@
 //! reader, a control writer draining the outbound queue, and a datagram reader
 //! feeding the voice relay. The first to finish tears down the other two.
 
+use crate::moderation;
 use crate::state::Shared;
 use pickle_identity::PublicIdentity;
 use pickle_proto::codec::{self, CodecError};
@@ -151,6 +152,36 @@ async fn handshake(
         let _ = send.finish();
         tokio::time::sleep(Duration::from_millis(50)).await;
         return Ok(None);
+    }
+
+    // The ban check sits after the signature on purpose: ban status is only
+    // ever disclosed to the holder of the banned key, so an unauthenticated
+    // peer cannot probe fingerprints with unsigned Auth frames. Expiry is
+    // compared on read — a lapsed ban needs nothing running to stop applying.
+    if let Some(store) = shared.store() {
+        match store
+            .active_ban(auth.identity.fingerprint(), crate::state::now_unix_ms())
+            .await
+        {
+            Ok(Some(ban)) => {
+                warn!(fingerprint = %auth.identity.fingerprint(), "rejecting a banned client");
+                codec::write_frame(
+                    &mut send,
+                    &ServerControl::AuthFailed(AuthFailure::Banned {
+                        reason: ban.reason,
+                        until_unix_ms: ban.until_unix_ms,
+                    }),
+                )
+                .await?;
+                let _ = send.finish();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Ok(None);
+            }
+            Ok(None) => {}
+            // A store fault must not admit a banned client silently, but it
+            // also must not lock everyone out; log loudly and admit.
+            Err(error) => warn!(%error, "could not check the ban list; admitting"),
+        }
     }
 
     let (control_tx, control_rx) = mpsc::channel(crate::state::CONTROL_QUEUE_DEPTH);
@@ -391,16 +422,36 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
 
         ClientControl::Ping { nonce } => shared.send(client_id, ServerControl::Pong { nonce }),
 
+        ClientControl::Kick {
+            nonce,
+            client,
+            reason,
+        } => moderation::kick(shared, client_id, nonce, client, reason).await,
+        ClientControl::Ban {
+            nonce,
+            fingerprint,
+            reason,
+            until_unix_ms,
+        } => moderation::ban(shared, client_id, nonce, fingerprint, reason, until_unix_ms).await,
+        ClientControl::Unban { nonce, fingerprint } => {
+            moderation::unban(shared, client_id, nonce, fingerprint).await
+        }
+        ClientControl::ListBans { nonce } => {
+            moderation::list_bans(shared, client_id, nonce).await
+        }
+        ClientControl::SetServerMute {
+            nonce,
+            client,
+            muted,
+        } => moderation::set_server_mute(shared, client_id, nonce, client, muted),
+        ClientControl::MoveMember { nonce, client, to } => {
+            moderation::move_member(shared, client_id, nonce, client, to)
+        }
+
         // Declared in the v2 cutover so the wire indices are pinned; the
         // handlers arrive over the next PRs. Answering CommandFailed keeps a
         // newer client's admin UI honest instead of leaving it waiting.
-        ClientControl::Kick { nonce, .. }
-        | ClientControl::Ban { nonce, .. }
-        | ClientControl::Unban { nonce, .. }
-        | ClientControl::ListBans { nonce }
-        | ClientControl::SetServerMute { nonce, .. }
-        | ClientControl::MoveMember { nonce, .. }
-        | ClientControl::CreateRole { nonce, .. }
+        ClientControl::CreateRole { nonce, .. }
         | ClientControl::UpdateRole { nonce, .. }
         | ClientControl::DeleteRole { nonce, .. }
         | ClientControl::ReorderRoles { nonce, .. }

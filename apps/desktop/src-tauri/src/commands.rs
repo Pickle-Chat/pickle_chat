@@ -438,6 +438,109 @@ pub fn my_permissions(
     state.with_session(session, |active| active.perms.lock().my_permissions())
 }
 
+// ---- moderation -----------------------------------------------------------
+//
+// Nonces are minted here from a counter; refusals come back as CommandFailed
+// events carrying the same nonce. The mirror answers what to offer; the
+// server remains the authority on what happens.
+
+fn admin_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(1);
+    NONCE.fetch_add(1, Ordering::Relaxed)
+}
+
+#[tauri::command]
+pub fn kick(
+    state: State<'_, AppState>,
+    session: SessionId,
+    client_id: u32,
+    reason: Option<String>,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active
+            .client
+            .kick(admin_nonce(), client_id, reason.unwrap_or_default());
+    })
+}
+
+#[tauri::command]
+pub fn ban(
+    state: State<'_, AppState>,
+    session: SessionId,
+    fingerprint: String,
+    reason: String,
+    until_unix_ms: Option<u64>,
+) -> Result<(), String> {
+    let fingerprint = pickle_identity::Fingerprint::parse(&fingerprint)
+        .map_err(|e| format!("that fingerprint is not readable: {e}"))?;
+    state.with_session(session, |active| {
+        active
+            .client
+            .ban(admin_nonce(), fingerprint, reason, until_unix_ms);
+    })
+}
+
+#[tauri::command]
+pub fn unban(
+    state: State<'_, AppState>,
+    session: SessionId,
+    fingerprint: String,
+) -> Result<(), String> {
+    let fingerprint = pickle_identity::Fingerprint::parse(&fingerprint)
+        .map_err(|e| format!("that fingerprint is not readable: {e}"))?;
+    state.with_session(session, |active| {
+        active.client.unban(admin_nonce(), fingerprint);
+    })
+}
+
+/// Answered by a banList event.
+#[tauri::command]
+pub fn list_bans(state: State<'_, AppState>, session: SessionId) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active.client.list_bans(admin_nonce());
+    })
+}
+
+#[tauri::command]
+pub fn set_server_muted(
+    state: State<'_, AppState>,
+    session: SessionId,
+    client_id: u32,
+    muted: bool,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active
+            .client
+            .set_server_mute(admin_nonce(), client_id, muted);
+    })
+}
+
+#[tauri::command]
+pub fn move_user(
+    state: State<'_, AppState>,
+    session: SessionId,
+    client_id: u32,
+    channel: Option<u32>,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active.client.move_member(admin_nonce(), client_id, channel);
+    })
+}
+
+/// The mirror's answer for one member — pulled when the menu opens, so it is
+/// always fresh without a server round trip.
+#[tauri::command]
+pub fn moderation_options(
+    state: State<'_, AppState>,
+    session: SessionId,
+    client_id: u32,
+) -> Result<crate::perms::ModerationOptionsDto, String> {
+    state.with_session(session, |active| {
+        active.perms.lock().moderation_options(client_id)
+    })
+}
+
 #[tauri::command]
 pub fn send_message(
     state: State<'_, AppState>,

@@ -50,6 +50,29 @@ pub struct PermMirror {
     roles: Vec<Role>,
     my_roles: Vec<RoleId>,
     channels: BTreeMap<ChannelId, Channel>,
+    /// Everyone connected, for hierarchy answers: may I act on *them*?
+    users: std::collections::HashMap<pickle_proto::ClientId, MemberStanding>,
+}
+
+/// What hierarchy needs to know about another member.
+struct MemberStanding {
+    fingerprint: Fingerprint,
+    roles: Vec<RoleId>,
+    owner: bool,
+}
+
+/// The context menu's answer: which actions to offer against one member, and
+/// why not, when not.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModerationOptionsDto {
+    pub can_kick: bool,
+    pub can_ban: bool,
+    pub can_mute: bool,
+    pub can_move: bool,
+    /// Set when everything above is false — one honest sentence for the
+    /// disabled menu, e.g. "Their highest role is not below yours."
+    pub reason: Option<String>,
 }
 
 impl PermMirror {
@@ -61,6 +84,20 @@ impl PermMirror {
             my_roles: me.map(|u| u.roles.clone()).unwrap_or_default(),
             roles: info.roles.clone(),
             channels: info.channels.iter().map(|c| (c.id, c.clone())).collect(),
+            users: info
+                .users
+                .iter()
+                .map(|u| {
+                    (
+                        u.client_id,
+                        MemberStanding {
+                            fingerprint: u.fingerprint(),
+                            roles: u.roles.clone(),
+                            owner: u.owner,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -96,12 +133,29 @@ impl PermMirror {
                 self.roles.sort_by_key(|r| r.position);
                 true
             }
-            // Our own role grants arrive as a UserUpdated for us.
-            ClientEvent::UserUpdated(user) if user.fingerprint() == self.fingerprint => {
-                let changed = user.roles != self.my_roles || user.owner != self.owner;
-                self.my_roles = user.roles.clone();
-                self.owner = user.owner;
-                changed
+            ClientEvent::UserJoined(user) | ClientEvent::UserUpdated(user) => {
+                self.users.insert(
+                    user.client_id,
+                    MemberStanding {
+                        fingerprint: user.fingerprint(),
+                        roles: user.roles.clone(),
+                        owner: user.owner,
+                    },
+                );
+                // Our own grants arrive the same way; only they change what
+                // the interface should enable.
+                if user.fingerprint() == self.fingerprint {
+                    let changed = user.roles != self.my_roles || user.owner != self.owner;
+                    self.my_roles = user.roles.clone();
+                    self.owner = user.owner;
+                    changed
+                } else {
+                    false
+                }
+            }
+            ClientEvent::UserLeft { client, .. } => {
+                self.users.remove(client);
+                false
             }
             _ => false,
         }
@@ -142,6 +196,56 @@ impl PermMirror {
                 })
                 .collect(),
         }
+    }
+
+    /// Which moderation actions to offer against one member. Rendering state:
+    /// the server re-checks every action regardless.
+    pub fn moderation_options(&self, target: pickle_proto::ClientId) -> ModerationOptionsDto {
+        let none = |reason: &str| ModerationOptionsDto {
+            can_kick: false,
+            can_ban: false,
+            can_mute: false,
+            can_move: false,
+            reason: Some(reason.into()),
+        };
+        let Some(them) = self.users.get(&target) else {
+            return none("They are no longer connected.");
+        };
+        if them.fingerprint == self.fingerprint {
+            return none("That would be you.");
+        }
+        let outranked = pickle_proto::can_act_on(
+            &self.roles,
+            &self.my_roles,
+            self.owner,
+            &them.roles,
+            them.owner,
+        );
+        if !outranked {
+            return none(if them.owner {
+                "They own this server."
+            } else {
+                "Their highest role is not below yours."
+            });
+        }
+        let base = resolve(
+            &self.roles,
+            &self.my_roles,
+            self.fingerprint,
+            self.owner,
+            None,
+        );
+        let options = ModerationOptionsDto {
+            can_kick: base.contains(Permissions::KICK_MEMBERS),
+            can_ban: base.contains(Permissions::BAN_MEMBERS),
+            can_mute: base.contains(Permissions::MUTE_MEMBERS),
+            can_move: base.contains(Permissions::MOVE_MEMBERS),
+            reason: None,
+        };
+        if !(options.can_kick || options.can_ban || options.can_mute || options.can_move) {
+            return none("You have no moderation permissions here.");
+        }
+        options
     }
 }
 

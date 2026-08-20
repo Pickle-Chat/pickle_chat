@@ -5,6 +5,7 @@
 // from drifting apart as they are added.
 
 import type {
+  BanEntry,
   Channel,
   Connection,
   MyPermissions,
@@ -30,6 +31,9 @@ export interface ConnectionState {
   /// Set when the server drops us. The tab stays so the reason is readable
   /// rather than vanishing along with the explanation.
   disconnected: string | null;
+  /// The ban list, when an admin surface has asked for it. Null = never
+  /// fetched; the list is pull-based and replaced whole.
+  bans: BanEntry[] | null;
   /// What I may do here, per channel — resolved in Rust, rendered here.
   permissions: MyPermissions;
   /// The latest refusal, shown as a dismissible banner inside this tab. One
@@ -73,6 +77,7 @@ export function reduce(state: ConnectionsState, action: Action): ConnectionsStat
             info,
             identity,
             channels: info.channels,
+            bans: null,
             permissions,
             users: info.users,
             messages: [],
@@ -240,6 +245,14 @@ function applyEvent(
     // reason lands next to whatever provoked it. Only the `disconnected`
     // event — which the client core emits exactly when the control stream is
     // genuinely gone — may declare this connection dead.
+    case "banList":
+      return { ...connection, bans: event.bans };
+
+    // A refused admin command reuses the notice slot: the refusal answers the
+    // actor's most recent action, exactly like a serverError.
+    case "commandFailed":
+      return { ...connection, notice: { code: event.code, detail: event.detail } };
+
     case "permissionsChanged":
       return { ...connection, permissions: event.permissions };
 
