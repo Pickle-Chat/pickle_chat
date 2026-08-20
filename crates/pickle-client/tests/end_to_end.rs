@@ -6,6 +6,7 @@
 
 use pickle_client::{ClientEvent, ConnectError, ConnectOptions, TrustPolicy, TrustStore};
 use pickle_identity::Identity;
+use pickle_proto::DisconnectReason;
 use pickle_server::{Server, ServerConfig};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -60,6 +61,49 @@ impl TestServer {
     async fn default() -> Self {
         Self::start(|_| {}).await
     }
+
+    /// Start with role grants already in the database. Grants must exist
+    /// before the server binds — the engine loads them at startup — and the
+    /// only way to write them today is the store, which is also the honest
+    /// one: role-management commands arrive in a later PR.
+    async fn with_grants(grants: &[(pickle_identity::Fingerprint, u32)]) -> Self {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = pickle_server::store::Store::open(&pickle_server::store::Store::sqlite_url(
+            data_dir.path(),
+            "pickle.db",
+        ))
+        .await
+        .unwrap();
+        for (fingerprint, role) in grants {
+            store.insert_role_member(*fingerprint, *role).await.unwrap();
+        }
+
+        let mut config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            min_security_level: 0,
+            name: "Test Server".into(),
+            ..ServerConfig::default()
+        };
+        config.owner = None;
+
+        let server = Server::bind(config, data_dir.path()).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let fingerprint = server.fingerprint();
+        let (shutdown, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            server
+                .run_until(async {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        Self {
+            address,
+            fingerprint,
+            shutdown: Some(shutdown),
+            _data_dir: data_dir,
+        }
+    }
 }
 
 impl Drop for TestServer {
@@ -74,10 +118,19 @@ async fn connect_client(
     server: &TestServer,
     nickname: &str,
 ) -> Result<(pickle_client::Client, mpsc::UnboundedReceiver<ClientEvent>), ConnectError> {
-    let identity = Identity::generate();
+    connect_as(server, nickname, &Identity::generate()).await
+}
+
+/// Connect with a specific identity — how a test becomes the member a role
+/// was granted to before the server started.
+async fn connect_as(
+    server: &TestServer,
+    nickname: &str,
+    identity: &Identity,
+) -> Result<(pickle_client::Client, mpsc::UnboundedReceiver<ClientEvent>), ConnectError> {
     let mut trust = TrustStore::ephemeral();
     let options = ConnectOptions::new(server.address, nickname);
-    pickle_client::connect(options, &identity, &mut trust).await
+    pickle_client::connect(options, identity, &mut trust).await
 }
 
 /// Wait for the first event matching `predicate`, ignoring anything else.
@@ -807,4 +860,169 @@ async fn a_legacy_pin_for_another_identity_is_not_inherited() {
         matches!(result, Err(ConnectError::NotTrusted { .. })),
         "a stranger's pin must not be inherited",
     );
+}
+
+// ---- moderation ------------------------------------------------------------
+//
+// Role grants are written through the store before the server binds — the
+// engine loads them at startup, and the commands that will manage them live
+// arrive in a later PR. Moderator is role 1 in the seeded ladder.
+
+const MODERATOR: u32 = 1;
+
+#[tokio::test]
+async fn a_moderator_kicks_and_everyone_learns_why() {
+    let moderator = Identity::generate();
+    let server = TestServer::with_grants(&[(moderator.fingerprint(), MODERATOR)]).await;
+
+    let (mod_client, mut mod_events) = connect_as(&server, "mod", &moderator).await.unwrap();
+    let (_peon, mut peon_events) = connect_client(&server, "peon").await.unwrap();
+
+    let peon_id = expect_event(&mut mod_events, "the peon arriving", |event| match event {
+        ClientEvent::UserJoined(info) => Some(info.client_id),
+        _ => None,
+    })
+    .await;
+
+    assert!(mod_client.kick(7, peon_id, "bye"));
+
+    // The victim hears the real reason before the transport closes.
+    expect_event(&mut peon_events, "the kick", |event| match event {
+        ClientEvent::UserLeft {
+            client,
+            reason: DisconnectReason::Kicked,
+        } if *client == peon_id => Some(()),
+        _ => None,
+    })
+    .await;
+    // The actor gets a correlated Ack.
+    expect_event(&mut mod_events, "the ack", |event| match event {
+        ClientEvent::Ack { nonce: 7 } => Some(()),
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_ban_ejects_now_and_holds_at_the_door() {
+    let moderator = Identity::generate();
+    let peon = Identity::generate();
+    let server = TestServer::with_grants(&[(moderator.fingerprint(), MODERATOR)]).await;
+
+    let (mod_client, mut mod_events) = connect_as(&server, "mod", &moderator).await.unwrap();
+    let (_peon_client, mut peon_events) = connect_as(&server, "peon", &peon).await.unwrap();
+
+    expect_event(&mut mod_events, "the peon arriving", |event| match event {
+        ClientEvent::UserJoined(_) => Some(()),
+        _ => None,
+    })
+    .await;
+
+    assert!(mod_client.ban(9, peon.fingerprint(), "spam", None));
+    expect_event(&mut peon_events, "the ejection", |event| match event {
+        ClientEvent::UserLeft {
+            reason: DisconnectReason::Banned,
+            ..
+        } => Some(()),
+        _ => None,
+    })
+    .await;
+    expect_event(&mut mod_events, "the ack", |event| match event {
+        ClientEvent::Ack { nonce: 9 } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // The door refuses the same key, with the reason.
+    match connect_as(&server, "peon", &peon).await {
+        Err(ConnectError::Rejected(reason)) => {
+            assert!(
+                reason.to_string().contains("spam"),
+                "the refusal names the reason: {reason}"
+            );
+        }
+        Err(other) => panic!("refused for the wrong reason: {other}"),
+        Ok(_) => panic!("a banned key must be refused at the door"),
+    }
+}
+
+#[tokio::test]
+async fn hierarchy_blocks_equals_and_the_unprivileged() {
+    let first = Identity::generate();
+    let second = Identity::generate();
+    let server = TestServer::with_grants(&[
+        (first.fingerprint(), MODERATOR),
+        (second.fingerprint(), MODERATOR),
+    ])
+    .await;
+
+    let (first_client, mut first_events) = connect_as(&server, "one", &first).await.unwrap();
+    let (_second_client, _second_events) = connect_as(&server, "two", &second).await.unwrap();
+    let (peon_client, mut peon_events) = connect_client(&server, "peon").await.unwrap();
+
+    let second_id = expect_event(&mut first_events, "two arriving", |event| match event {
+        ClientEvent::UserJoined(info) if info.nickname == "two" => Some(info.client_id),
+        _ => None,
+    })
+    .await;
+
+    // Equal top roles cannot act on each other.
+    assert!(first_client.kick(1, second_id, "power grab"));
+    expect_event(&mut first_events, "the refusal", |event| match event {
+        ClientEvent::CommandFailed { nonce: 1, code, .. } => {
+            assert!(matches!(code, pickle_proto::ErrorCode::NotPermitted));
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    // The bit itself is checked before anything else.
+    assert!(peon_client.kick(2, second_id, "coup"));
+    expect_event(
+        &mut peon_events,
+        "the peon's refusal",
+        |event| match event {
+            ClientEvent::CommandFailed { nonce: 2, .. } => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_server_mute_reaches_everyone_and_a_move_relocates() {
+    let moderator = Identity::generate();
+    let server = TestServer::with_grants(&[(moderator.fingerprint(), MODERATOR)]).await;
+
+    let (mod_client, mut mod_events) = connect_as(&server, "mod", &moderator).await.unwrap();
+    let (_peon, mut peon_events) = connect_client(&server, "peon").await.unwrap();
+
+    let peon_id = expect_event(&mut mod_events, "the peon arriving", |event| match event {
+        ClientEvent::UserJoined(info) => Some(info.client_id),
+        _ => None,
+    })
+    .await;
+
+    assert!(mod_client.set_server_mute(3, peon_id, true));
+    // The flag is public state: the victim (and everyone) sees it flip.
+    expect_event(&mut peon_events, "the mute", |event| match event {
+        ClientEvent::UserUpdated(info) if info.client_id == peon_id && info.voice.server_muted => {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    // Moved into General (channel 3) by authority.
+    assert!(mod_client.move_member(4, peon_id, Some(3)));
+    expect_event(&mut peon_events, "the move", |event| match event {
+        ClientEvent::UserMoved {
+            client,
+            to: Some(3),
+            ..
+        } if *client == peon_id => Some(()),
+        _ => None,
+    })
+    .await;
 }

@@ -244,6 +244,22 @@ impl Store {
         Ok(grants)
     }
 
+    pub async fn insert_role_member(
+        &self,
+        fingerprint: Fingerprint,
+        role: RoleId,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO role_members (fingerprint, role_id) VALUES ($1, $2)
+             ON CONFLICT (fingerprint, role_id) DO NOTHING",
+        )
+        .bind(fingerprint.to_string())
+        .bind(role as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Every channel's overwrites, tagged with their channel id.
     pub async fn load_overwrites(&self) -> Result<Vec<(ChannelId, Overwrite)>, StoreError> {
         let rows =

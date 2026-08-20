@@ -356,6 +356,53 @@ impl Client {
         })
     }
 
+    // ---- moderation (the server checks every one; these just ask) ---------
+
+    pub fn kick(&self, nonce: u64, client: ClientId, reason: impl Into<String>) -> bool {
+        self.send_control(ClientControl::Kick {
+            nonce,
+            client,
+            reason: reason.into(),
+        })
+    }
+
+    pub fn ban(
+        &self,
+        nonce: u64,
+        fingerprint: Fingerprint,
+        reason: impl Into<String>,
+        until_unix_ms: Option<u64>,
+    ) -> bool {
+        self.send_control(ClientControl::Ban {
+            nonce,
+            fingerprint,
+            reason: reason.into(),
+            until_unix_ms,
+        })
+    }
+
+    pub fn unban(&self, nonce: u64, fingerprint: Fingerprint) -> bool {
+        self.send_control(ClientControl::Unban { nonce, fingerprint })
+    }
+
+    /// Answered by a [`ClientEvent::BanList`].
+    pub fn list_bans(&self, nonce: u64) -> bool {
+        self.send_control(ClientControl::ListBans { nonce })
+    }
+
+    pub fn set_server_mute(&self, nonce: u64, client: ClientId, muted: bool) -> bool {
+        self.send_control(ClientControl::SetServerMute {
+            nonce,
+            client,
+            muted,
+        })
+    }
+
+    /// `to: None` pulls the member out of voice entirely.
+    pub fn move_member(&self, nonce: u64, client: ClientId, to: Option<ChannelId>) -> bool {
+        self.send_control(ClientControl::MoveMember { nonce, client, to })
+    }
+
     /// Ask for past messages, answered by a [`ClientEvent::History`].
     ///
     /// `before` pages backwards: pass the oldest id already held to get the
