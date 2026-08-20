@@ -6,6 +6,7 @@
 // of an opinion.
 
 import { useEffect, useState } from "react";
+import { type ChannelKindName } from "../api";
 import {
   api,
   type Channel,
@@ -51,6 +52,95 @@ interface Draft {
 const keyOf = (target: OverwriteTarget) =>
   target.kind === "role" ? `role:${target.id}` : `member:${target.fingerprint}`;
 
+/// Create-or-edit form for one channel. Controlled by the caller: `channel`
+/// null is the create shape, else the full desired state is staged and sent
+/// whole — the wire takes complete states, not patches.
+function ChannelEditor({
+  session,
+  channel,
+  onError,
+  onDone,
+}: {
+  session: SessionId;
+  channel: Channel | null;
+  onError: (e: string) => void;
+  onDone: () => void;
+}) {
+  const [name, setName] = useState(channel?.name ?? "");
+  const [kind, setKind] = useState<ChannelKindName>(
+    channel === null
+      ? "voice_and_text"
+      : channel.hasVoice && channel.hasText
+        ? "voice_and_text"
+        : channel.hasVoice
+          ? "voice"
+          : "text",
+  );
+  const [topic, setTopic] = useState(channel?.topic ?? "");
+  const [maxUsers, setMaxUsers] = useState(channel?.maxUsers?.toString() ?? "");
+  const [order, setOrder] = useState((channel?.order ?? 0).toString());
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const parsedMax = maxUsers.trim() === "" ? undefined : Number(maxUsers);
+    const parsedOrder = Number(order) || 0;
+    const call =
+      channel === null
+        ? api.createChannel(session, {
+            name,
+            kind,
+            topic: topic || undefined,
+            maxUsers: parsedMax,
+            order: parsedOrder,
+          })
+        : api.updateChannel(session, channel.id, {
+            name,
+            kind,
+            parent: channel.parent,
+            topic,
+            maxUsers: parsedMax ?? null,
+            order: parsedOrder,
+          });
+    call.then(onDone).catch((e) => onError(String(e)));
+  };
+
+  return (
+    <form className="admin-channel-editor" onSubmit={submit}>
+      <input
+        placeholder="Name"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        required
+      />
+      <select value={kind} onChange={(e) => setKind(e.target.value as ChannelKindName)}>
+        <option value="voice_and_text">voice + text</option>
+        <option value="text">text</option>
+        <option value="voice">voice</option>
+      </select>
+      <input
+        placeholder="Topic"
+        value={topic}
+        onChange={(e) => setTopic(e.target.value)}
+      />
+      <input
+        placeholder="Cap"
+        title="Voice occupancy cap; empty for none"
+        value={maxUsers}
+        onChange={(e) => setMaxUsers(e.target.value.replace(/[^0-9]/g, ""))}
+        size={4}
+      />
+      <input
+        placeholder="Order"
+        title="Sort key; lower first"
+        value={order}
+        onChange={(e) => setOrder(e.target.value.replace(/[^0-9-]/g, ""))}
+        size={4}
+      />
+      <button type="submit">{channel === null ? "Create" : "Save"}</button>
+    </form>
+  );
+}
+
 export function ChannelsTab({
   session,
   channels,
@@ -76,6 +166,7 @@ export function ChannelsTab({
   const [added, setAdded] = useState<OverwriteTarget[]>([]);
   /// Text of the member-fingerprint field; null while the field is closed.
   const [memberDraft, setMemberDraft] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<number | null>(null);
 
   const channel = channels.find((c) => c.id === selected);
   // channelRemoved — or losing viewChannel — can take the selection away
@@ -202,7 +293,45 @@ export function ChannelsTab({
       )}
 
       {channel === undefined && !vanished && (
-        <p className="muted">Pick a channel to edit who can see and use it.</p>
+        <>
+          <p className="muted">Pick a channel to edit who can see and use it, or make one:</p>
+          <ChannelEditor
+            session={session}
+            channel={null}
+            onError={onError}
+            onDone={() => {}}
+          />
+        </>
+      )}
+
+      {channel !== undefined && (
+        <>
+          <ChannelEditor
+            key={channel.id}
+            session={session}
+            channel={channel}
+            onError={onError}
+            onDone={() => {}}
+          />
+          <p>
+            <button
+              className="linklike"
+              onClick={() => {
+                if (deleting === channel.id) {
+                  api.deleteChannel(session, channel.id).catch((e) => onError(String(e)));
+                  setDeleting(null);
+                  pick(null);
+                } else {
+                  setDeleting(channel.id);
+                }
+              }}
+            >
+              {deleting === channel.id
+                ? "Really delete? Its messages are kept, orphaned."
+                : "Delete this channel"}
+            </button>
+          </p>
+        </>
       )}
 
       {channel !== undefined &&

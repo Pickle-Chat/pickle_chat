@@ -912,6 +912,67 @@ impl Shared {
             .collect()
     }
 
+    /// The next channel id: ids are never reused, so overwrites and history
+    /// can never silently re-target a successor.
+    pub fn next_channel_id(&self) -> ChannelId {
+        self.inner
+            .read()
+            .channels
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// Would setting `child`'s parent to `parent` close a loop?
+    pub fn parent_would_cycle(&self, child: ChannelId, parent: Option<ChannelId>) -> bool {
+        let inner = self.inner.read();
+        let mut cursor = parent;
+        while let Some(id) = cursor {
+            if id == child {
+                return true;
+            }
+            cursor = inner.channels.get(&id).and_then(|c| c.parent);
+        }
+        false
+    }
+
+    pub fn insert_channel_mem(&self, channel: Channel) {
+        self.inner.write().channels.insert(channel.id, channel);
+    }
+
+    /// Replace a channel's fields, preserving its overwrites — they have
+    /// their own commands and their own storage row.
+    pub fn update_channel_mem(&self, channel: Channel) -> bool {
+        let mut inner = self.inner.write();
+        let Some(existing) = inner.channels.get_mut(&channel.id) else {
+            return false;
+        };
+        let overwrites = std::mem::take(&mut existing.overwrites);
+        *existing = channel;
+        existing.overwrites = overwrites;
+        true
+    }
+
+    /// Remove a channel, evicting its voice occupants to nowhere. Returns the
+    /// evicted, already updated, for the UserMoved broadcasts.
+    pub fn remove_channel_mem(&self, channel: ChannelId) -> Vec<UserInfo> {
+        let mut inner = self.inner.write();
+        if inner.channels.remove(&channel).is_none() {
+            return Vec::new();
+        }
+        inner
+            .clients
+            .values_mut()
+            .filter(|entry| entry.info.channel == Some(channel))
+            .map(|entry| {
+                entry.info.channel = None;
+                entry.info.clone()
+            })
+            .collect()
+    }
+
     /// Remove a client by authority — a kick or a ban, not a quit.
     ///
     /// The victim is told first (a client that drains its queue learns *why*

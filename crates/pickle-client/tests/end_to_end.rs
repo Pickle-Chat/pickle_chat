@@ -1218,3 +1218,92 @@ async fn the_subset_rule_stops_minting_and_everyone_is_untouchable() {
     })
     .await;
 }
+
+// ---- channel management -----------------------------------------------------
+
+#[tokio::test]
+async fn channels_are_created_renamed_and_deleted_live() {
+    let admin = Identity::generate();
+    let server = TestServer::with_grants(&[(admin.fingerprint(), ADMIN)]).await;
+
+    let (admin_client, mut admin_events) = connect_as(&server, "admin", &admin).await.unwrap();
+    let (peon_client, mut peon_events) = connect_client(&server, "peon").await.unwrap();
+
+    // Created: appears in every viewer's list, live.
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::CreateChannel {
+            nonce: 1,
+            name: "workshop".into(),
+            parent: None,
+            topic: "building".into(),
+            kind: pickle_proto::ChannelKind::VoiceAndText,
+            max_users: None,
+            order: 50,
+        },
+    );
+    let workshop = expect_event(&mut peon_events, "the new channel", |event| match event {
+        ClientEvent::ChannelCreated(channel) if channel.name == "workshop" => Some(channel.id),
+        _ => None,
+    })
+    .await;
+
+    // Renamed: still-viewers get the updated object.
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::UpdateChannel {
+            nonce: 2,
+            id: workshop,
+            parent: None,
+            name: "atelier".into(),
+            topic: "building".into(),
+            kind: pickle_proto::ChannelKind::VoiceAndText,
+            max_users: None,
+            order: 50,
+        },
+    );
+    expect_event(&mut peon_events, "the rename", |event| match event {
+        ClientEvent::ChannelUpdated(channel)
+            if channel.id == workshop && channel.name == "atelier" =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    // The peon stands in it; deletion evicts them to nowhere and removes the
+    // room from everyone.
+    assert!(peon_client.join_channel(workshop));
+    expect_event(&mut peon_events, "standing in it", |event| match event {
+        ClientEvent::UserMoved { to: Some(id), .. } if *id == workshop => Some(()),
+        _ => None,
+    })
+    .await;
+    send(
+        &admin_client,
+        pickle_proto::ClientControl::DeleteChannel {
+            nonce: 3,
+            id: workshop,
+        },
+    );
+    expect_event(&mut peon_events, "the eviction", |event| match event {
+        ClientEvent::UserMoved {
+            from: Some(id),
+            to: None,
+            ..
+        } if *id == workshop => Some(()),
+        _ => None,
+    })
+    .await;
+    expect_event(&mut peon_events, "the removal", |event| match event {
+        ClientEvent::ChannelRemoved(id) if *id == workshop => Some(()),
+        _ => None,
+    })
+    .await;
+    expect_event(&mut admin_events, "the ack", |event| match event {
+        ClientEvent::Ack { nonce: 3 } => Some(()),
+        _ => None,
+    })
+    .await;
+}

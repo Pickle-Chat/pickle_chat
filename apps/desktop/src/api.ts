@@ -63,6 +63,7 @@ export interface Channel {
   hasVoice: boolean;
   hasText: boolean;
   order: number;
+  maxUsers: number | null;
 }
 
 export interface User {
@@ -127,6 +128,8 @@ export type Permission =
   | "speak"
   | "muteMembers"
   | "moveMembers";
+
+export type ChannelKindName = "voice" | "text" | "voice_and_text";
 
 export type OverwriteTarget =
   | { kind: "role"; id: number }
@@ -456,6 +459,27 @@ export const api = {
     invoke<void>("delete_channel_overwrite", { session, channel, target }),
   channelOverwrites: (session: SessionId, channel: number) =>
     invoke<Overwrite[]>("channel_overwrites", { session, channel }),
+  createChannel: (
+    session: SessionId,
+    input: { name: string; kind: ChannelKindName; parent?: number; topic?: string; maxUsers?: number; order?: number },
+  ) => invoke<void>("create_channel", { session, ...input }),
+  updateChannel: (
+    session: SessionId,
+    channel: number,
+    input: { name: string; kind: ChannelKindName; parent: number | null; topic: string; maxUsers: number | null; order: number },
+  ) =>
+    invoke<void>("update_channel", {
+      session,
+      channel,
+      name: input.name,
+      kind: input.kind,
+      parent: input.parent ?? undefined,
+      topic: input.topic,
+      maxUsers: input.maxUsers ?? undefined,
+      order: input.order,
+    }),
+  deleteChannel: (session: SessionId, channel: number) =>
+    invoke<void>("delete_channel", { session, channel }),
   sendMessage: (session: SessionId, channel: number, content: string) =>
     invoke<void>("send_message", { session, channel, content }),
 

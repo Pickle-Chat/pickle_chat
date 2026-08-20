@@ -696,6 +696,89 @@ pub fn delete_channel_overwrite(
     })
 }
 
+fn parse_kind(kind: &str) -> Result<pickle_proto::ChannelKind, String> {
+    Ok(match kind {
+        "voice" => pickle_proto::ChannelKind::Voice,
+        "text" => pickle_proto::ChannelKind::Text,
+        "voice_and_text" => pickle_proto::ChannelKind::VoiceAndText,
+        other => return Err(format!("unknown channel kind {other:?}")),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn create_channel(
+    state: State<'_, AppState>,
+    session: SessionId,
+    name: String,
+    kind: String,
+    parent: Option<u32>,
+    topic: Option<String>,
+    max_users: Option<u16>,
+    order: Option<i32>,
+) -> Result<(), String> {
+    let kind = parse_kind(&kind)?;
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::CreateChannel {
+                nonce: admin_nonce(),
+                name,
+                parent,
+                topic: topic.unwrap_or_default(),
+                kind,
+                max_users,
+                order: order.unwrap_or(0),
+            });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn update_channel(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+    name: String,
+    kind: String,
+    parent: Option<u32>,
+    topic: String,
+    max_users: Option<u16>,
+    order: i32,
+) -> Result<(), String> {
+    let kind = parse_kind(&kind)?;
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::UpdateChannel {
+                nonce: admin_nonce(),
+                id: channel,
+                parent,
+                name,
+                topic,
+                kind,
+                max_users,
+                order,
+            });
+    })
+}
+
+#[tauri::command]
+pub fn delete_channel(
+    state: State<'_, AppState>,
+    session: SessionId,
+    channel: u32,
+) -> Result<(), String> {
+    state.with_session(session, |active| {
+        active
+            .client
+            .send_control(pickle_proto::ClientControl::DeleteChannel {
+                nonce: admin_nonce(),
+                id: channel,
+            });
+    })
+}
+
 /// One channel's overwrites, from the mirror, for the tri-state editor.
 #[tauri::command]
 pub fn channel_overwrites(
