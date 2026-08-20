@@ -70,6 +70,7 @@ pub fn spawn_event_pump(
     session: SessionId,
     engine: EngineSlot,
     voice: VoiceRoute,
+    perms: crate::perms::SessionPerms,
     mut events: mpsc::UnboundedReceiver<ClientEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -92,9 +93,23 @@ pub fn spawn_event_pump(
 
             let terminal = matches!(event, ClientEvent::Disconnected { .. });
 
+            // Fold the event into the permission mirror before translating.
+            // Original first, derived second: the frontend applies raw state
+            // (a channel now exists) before the gating computed from it.
+            let perms_changed = perms.lock().apply(&event);
+
             if let Some(event) = EventDto::from_event(&event) {
                 if let Err(e) = app.emit(EVENT_CHANNEL, SessionEvent { session, event }) {
                     debug!(error = %e, "could not emit an event to the frontend");
+                }
+            }
+            if perms_changed {
+                let snapshot = perms.lock().my_permissions();
+                let event = EventDto::PermissionsChanged {
+                    permissions: snapshot,
+                };
+                if let Err(e) = app.emit(EVENT_CHANNEL, SessionEvent { session, event }) {
+                    debug!(error = %e, "could not emit a permissions update");
                 }
             }
 

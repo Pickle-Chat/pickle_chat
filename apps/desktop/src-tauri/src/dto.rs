@@ -176,6 +176,7 @@ impl From<&SessionInfo> for SessionDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDto {
+    pub permissions: crate::perms::MyPermissionsDto,
     pub session: SessionId,
     pub info: SessionDto,
     /// Fingerprint of the identity this connection signed in with, which need
@@ -277,6 +278,12 @@ pub enum EventDto {
     ServerError {
         code: &'static str,
         detail: String,
+    },
+    /// Derived by the Rust-side permission mirror, not translated from the
+    /// wire: a complete snapshot, replaced wholesale, so the frontend never
+    /// merges permission state.
+    PermissionsChanged {
+        permissions: crate::perms::MyPermissionsDto,
     },
     Disconnected {
         reason: String,

@@ -306,6 +306,9 @@ pub async fn connect(
     );
 
     let client = Arc::new(client);
+    let perms: crate::perms::SessionPerms = Arc::new(parking_lot::Mutex::new(
+        crate::perms::PermMirror::from_session(identity.fingerprint(), client.session()),
+    ));
 
     // Leaves a running engine alone: connecting a second server has no business
     // reopening the devices and cutting the first one's audio.
@@ -313,8 +316,14 @@ pub async fn connect(
         .ensure_audio()
         .map_err(|e| format!("Connected, but {}", e.trim_start_matches("The ")))?;
 
-    let event_pump =
-        bridge::spawn_event_pump(app, id, state.engine.clone(), state.voice.clone(), events);
+    let event_pump = bridge::spawn_event_pump(
+        app,
+        id,
+        state.engine.clone(),
+        state.voice.clone(),
+        perms.clone(),
+        events,
+    );
 
     state.sessions.lock().insert(
         id,
@@ -322,6 +331,7 @@ pub async fn connect(
             id,
             client,
             event_pump,
+            perms: perms.clone(),
             address: address.clone(),
             identity: fingerprint,
         },
@@ -336,7 +346,9 @@ pub async fn connect(
 
     state.remember_open_connections();
 
+    let my_permissions = perms.lock().my_permissions();
     Ok(ConnectionDto {
+        permissions: my_permissions,
         session: id,
         info: session_dto,
         identity: state
@@ -363,6 +375,7 @@ pub fn sessions(state: State<'_, AppState>) -> SessionListDto {
         sessions: sessions
             .values()
             .map(|session| ConnectionDto {
+                permissions: session.perms.lock().my_permissions(),
                 session: session.id,
                 info: SessionDto::from(session.client.session()),
                 identity: session.identity.clone(),
@@ -414,6 +427,15 @@ pub fn fetch_history(
         // it here without a protocol conversation.
         active.client.fetch_history(channel, None, 100);
     })
+}
+
+/// The mirror's current answer, for re-seeding without a server round trip.
+#[tauri::command]
+pub fn my_permissions(
+    state: State<'_, AppState>,
+    session: SessionId,
+) -> Result<crate::perms::MyPermissionsDto, String> {
+    state.with_session(session, |active| active.perms.lock().my_permissions())
 }
 
 #[tauri::command]

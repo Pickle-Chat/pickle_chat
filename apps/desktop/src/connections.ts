@@ -7,6 +7,7 @@
 import type {
   Channel,
   Connection,
+  MyPermissions,
   Message,
   ServerErrorCode,
   ServerEvent,
@@ -29,6 +30,8 @@ export interface ConnectionState {
   /// Set when the server drops us. The tab stays so the reason is readable
   /// rather than vanishing along with the explanation.
   disconnected: string | null;
+  /// What I may do here, per channel — resolved in Rust, rendered here.
+  permissions: MyPermissions;
   /// The latest refusal, shown as a dismissible banner inside this tab. One
   /// slot, last wins: a refusal answers the user's most recent action, and a
   /// stack of stale ones would bury the answer. Deliberately NOT fatal — a
@@ -58,7 +61,7 @@ export type Action =
 export function reduce(state: ConnectionsState, action: Action): ConnectionsState {
   switch (action.type) {
     case "opened": {
-      const { session, info, identity } = action.connection;
+      const { session, info, identity, permissions } = action.connection;
       return {
         // Reconnecting an id that is somehow already present replaces it rather
         // than listing the same connection twice.
@@ -70,6 +73,7 @@ export function reduce(state: ConnectionsState, action: Action): ConnectionsStat
             info,
             identity,
             channels: info.channels,
+            permissions,
             users: info.users,
             messages: [],
             activeChannel: info.defaultChannel,
@@ -236,6 +240,9 @@ function applyEvent(
     // reason lands next to whatever provoked it. Only the `disconnected`
     // event — which the client core emits exactly when the control stream is
     // genuinely gone — may declare this connection dead.
+    case "permissionsChanged":
+      return { ...connection, permissions: event.permissions };
+
     case "serverError":
       return { ...connection, notice: { code: event.code, detail: event.detail } };
 

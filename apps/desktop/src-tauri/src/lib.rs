@@ -14,6 +14,7 @@ mod bridge;
 mod commands;
 mod dto;
 mod mouse_grab;
+mod perms;
 mod settings;
 mod shortcuts;
 mod state;
@@ -83,6 +84,7 @@ pub fn run() {
             commands::join_channel,
             commands::leave_channel,
             commands::fetch_history,
+            commands::my_permissions,
             commands::send_message,
             commands::set_muted,
             commands::set_deafened,
