@@ -17,8 +17,8 @@ use pickle_identity::{Fingerprint, Identity, PublicIdentity};
 use pickle_proto::codec::{self, CodecError};
 use pickle_proto::voice::{VoiceDownstream, VoiceUpstream};
 use pickle_proto::{
-    AuthFailure, Channel, ChannelId, ChatMessage, ClientAuth, ClientControl, ClientId,
-    DisconnectReason, ErrorCode, MessageId, ServerControl, ServerLimits, UserInfo,
+    AuthFailure, BanEntry, Channel, ChannelId, ChatMessage, ClientAuth, ClientControl, ClientId,
+    DisconnectReason, ErrorCode, MessageId, Role, RoleId, ServerControl, ServerLimits, UserInfo,
     PROTOCOL_VERSION,
 };
 use rustls_pki_types::CertificateDer;
@@ -203,10 +203,14 @@ pub struct SessionInfo {
     pub client_id: ClientId,
     pub server_name: String,
     pub server_identity: PublicIdentity,
+    /// Only the channels this member may view; the channel events keep the
+    /// caller's copy true as permissions change.
     pub channels: Vec<Channel>,
     pub users: Vec<UserInfo>,
-    /// The channel to read first — a suggestion, not a placement. `None` on
-    /// a server with no text-capable channel at all.
+    /// Every role on the server, ordered by position.
+    pub roles: Vec<Role>,
+    /// The channel to read first — a suggestion, not a placement. `None`
+    /// when no text-capable channel is visible to this member.
     pub default_channel: Option<ChannelId>,
     pub limits: ServerLimits,
 }
@@ -259,6 +263,28 @@ pub enum ClientEvent {
 
     /// One decoded voice frame. The audio layer owns jitter buffering and
     /// decoding; the client core only demultiplexes.
+    RoleCreated(Role),
+    RoleUpdated(Role),
+    RoleDeleted {
+        id: RoleId,
+    },
+    RolesReordered {
+        positions: Vec<(RoleId, u32)>,
+    },
+    BanList {
+        bans: Vec<BanEntry>,
+    },
+    /// A mutating admin command succeeded, by nonce.
+    Ack {
+        nonce: u64,
+    },
+    /// A mutating admin command was refused or failed, by nonce.
+    CommandFailed {
+        nonce: u64,
+        code: ErrorCode,
+        detail: String,
+    },
+
     Voice(VoiceDownstream),
 
     Pong {
@@ -307,10 +333,7 @@ impl Client {
     }
 
     pub fn join_channel(&self, channel: ChannelId) -> bool {
-        self.send_control(ClientControl::JoinChannel {
-            channel,
-            password: None,
-        })
+        self.send_control(ClientControl::JoinChannel { channel })
     }
 
     pub fn leave_channel(&self) -> bool {
@@ -488,6 +511,7 @@ pub async fn connect(
         server_identity: hello.server_identity,
         channels: ok.channels,
         users: ok.users,
+        roles: ok.roles,
         default_channel: ok.default_channel,
         limits: ok.limits,
     };
@@ -694,6 +718,22 @@ fn translate(message: ServerControl) -> Option<ClientEvent> {
         // Reactions arrive as an updated reaction set; surfaced through the
         // message store once persistence exists.
         ServerControl::ReactionUpdated { .. } => return None,
+
+        ServerControl::RoleCreated(role) => ClientEvent::RoleCreated(role),
+        ServerControl::RoleUpdated(role) => ClientEvent::RoleUpdated(role),
+        ServerControl::RoleDeleted { id } => ClientEvent::RoleDeleted { id },
+        ServerControl::RolesReordered { positions } => ClientEvent::RolesReordered { positions },
+        ServerControl::BanList { bans } => ClientEvent::BanList { bans },
+        ServerControl::Ack { nonce } => ClientEvent::Ack { nonce },
+        ServerControl::CommandFailed {
+            nonce,
+            code,
+            detail,
+        } => ClientEvent::CommandFailed {
+            nonce,
+            code,
+            detail,
+        },
 
         // Handshake frames; meaningless once the session is running.
         ServerControl::Hello(_) | ServerControl::AuthOk(_) | ServerControl::AuthFailed(_) => {

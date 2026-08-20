@@ -11,16 +11,16 @@
 //! after the lock is released, since removing needs the write lock.
 
 use crate::config::ServerConfig;
-use crate::roles::{RoleError, Roles};
 use crate::store::Store;
 use parking_lot::RwLock;
 use pickle_identity::{Fingerprint, Identity, PublicIdentity};
 use pickle_proto::voice::VoiceUpstream;
 use pickle_proto::{
-    AuthFailure, Channel, ChannelId, ChatMessage, ClientId, DisconnectReason, ErrorCode,
-    Permissions, Role, ServerControl, ServerLimits, UserInfo, VoiceState,
+    resolve, AuthFailure, Channel, ChannelId, ChatMessage, ClientId, DisconnectReason, ErrorCode,
+    Permissions, Role, RoleId, ServerControl, ServerLimits, UserInfo, VoiceState,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -88,21 +88,73 @@ struct Inner {
     next_message_id: u64,
 }
 
+/// The permission inputs, as one immutable snapshot.
+///
+/// Readers clone the `Arc` under a brief lock and resolve lock-free on the
+/// snapshot; writers (the admin handlers, from PR 4 on) build a new state and
+/// swap the `Arc` — after the database write, never before, so what clients
+/// are told always survives a restart. The perms lock is never held across an
+/// await and never while `inner` is being acquired.
+pub struct PermState {
+    /// Every role, @everyone included, ordered by position.
+    pub roles: Vec<Role>,
+    /// Explicit grants by fingerprint; @everyone is implicit.
+    pub members: HashMap<Fingerprint, Vec<RoleId>>,
+}
+
+impl PermState {
+    /// The ladder a fresh server starts with. Also what the seeder writes.
+    pub fn defaults() -> Self {
+        Self {
+            roles: default_roles(),
+            members: HashMap::new(),
+        }
+    }
+}
+
+/// The default ladder: @everyone with today's open behavior, a moderator
+/// rung, an admin rung. Mirrors the deleted roles.json ladder in spirit —
+/// admin over moderator — with positions dense because reordering now
+/// renumbers server-side.
+pub fn default_roles() -> Vec<Role> {
+    vec![
+        Role {
+            id: pickle_proto::EVERYONE_ROLE_ID,
+            name: "everyone".into(),
+            color: None,
+            position: 0,
+            permissions: Permissions::DEFAULT_EVERYONE,
+        },
+        Role {
+            id: 1,
+            name: "moderator".into(),
+            color: None,
+            position: 1,
+            permissions: Permissions::KICK_MEMBERS
+                .union(Permissions::BAN_MEMBERS)
+                .union(Permissions::MUTE_MEMBERS)
+                .union(Permissions::MOVE_MEMBERS)
+                .union(Permissions::MANAGE_MESSAGES),
+        },
+        Role {
+            id: 2,
+            name: "admin".into(),
+            color: None,
+            position: 2,
+            permissions: Permissions::ADMINISTRATOR,
+        },
+    ]
+}
+
 pub struct Shared {
     pub config: ServerConfig,
     pub identity: Identity,
     pub cert_hash: [u8; 32],
     pub limits: ServerLimits,
-    /// The channel a client should read first: the lowest-ordered top-level
-    /// channel that carries text. Text is open — every message reaches every
-    /// client, joined or not — so this is a suggestion about where to look,
-    /// not a placement. Nobody is placed anywhere on admission; presence
-    /// means standing in a voice room, and connecting must never do that.
-    pub default_channel: Option<ChannelId>,
-    /// Who holds which role. Behind its own lock rather than inside `Inner`, so
-    /// resolving permissions on every administrative command does not contend
-    /// with the client and channel maps that voice relay reads.
-    roles: RwLock<Roles>,
+    /// The permission inputs. Behind its own lock rather than inside `Inner`
+    /// so resolution never contends with the client and channel maps the
+    /// voice relay reads; behind an `Arc` so readers snapshot and get out.
+    perms: RwLock<Arc<PermState>>,
     /// Parsed once from the config. `None` when unset or unparseable — an
     /// operator who mistypes their fingerprint gets a server with no owner,
     /// which is recoverable, rather than one that refuses to start.
@@ -114,18 +166,18 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// `channels` and `perms` come from the database (seeded from the config
+    /// on first boot) — loaded by the caller, because construction stays
+    /// synchronous and usable in tests that need no database.
     pub fn new(
         config: ServerConfig,
         identity: Identity,
         cert_hash: [u8; 32],
-        roles: Roles,
+        channels: Vec<Channel>,
+        perms: PermState,
     ) -> Self {
-        let channels = build_channels(&config);
-        let default_channel = channels
-            .values()
-            .filter(|c| c.parent.is_none() && c.kind.has_text())
-            .min_by_key(|c| (c.order, c.id))
-            .map(|c| c.id);
+        let channels: BTreeMap<ChannelId, Channel> =
+            channels.into_iter().map(|c| (c.id, c)).collect();
 
         let limits = ServerLimits {
             max_users: config.max_users,
@@ -149,19 +201,19 @@ impl Shared {
         // existing warning above only fires on a value that is present but
         // malformed. So say which it is, every time, and name the fingerprint
         // so it can be checked against the one the client shows.
-        let assignments = roles.assignments().count();
+        let grants = perms.members.len();
         match &owner {
-            Some(fingerprint) => info!(%fingerprint, assignments, "owner configured"),
-            // Not fatal — roles can carry every capability — but the owner is
-            // deliberately kept out of `roles.json` precisely so a damaged or
-            // emptied file cannot lock an operator out, and a server relying
-            // only on that file has given up the safeguard.
-            None if assignments > 0 => warn!(
-                assignments,
-                "no owner configured; administration depends entirely on roles.json"
+            Some(fingerprint) => info!(%fingerprint, grants, "owner configured"),
+            // Not fatal — roles can carry every permission — but ownership is
+            // deliberately config-only precisely so a damaged or emptied role
+            // table cannot lock an operator out, and a server relying only on
+            // grants has given up that safeguard.
+            None if grants > 0 => warn!(
+                grants,
+                "no owner configured; administration depends entirely on role grants"
             ),
             None => warn!(
-                "no owner and no role assignments: nobody can administer this server. \
+                "no owner and no role grants: nobody can administer this server. \
                  Set PICKLE_OWNER to the fingerprint your client shows."
             ),
         }
@@ -171,8 +223,7 @@ impl Shared {
             identity,
             cert_hash,
             limits,
-            default_channel,
-            roles: RwLock::new(roles),
+            perms: RwLock::new(Arc::new(perms)),
             owner,
             store: RwLock::new(None),
             inner: RwLock::new(Inner {
@@ -184,30 +235,85 @@ impl Shared {
         }
     }
 
-    /// What this fingerprint may do here.
+    /// The current permission inputs, as a lock-free snapshot.
     ///
-    /// The single place ownership and roles are combined, so no caller can
-    /// accidentally consult one without the other.
-    pub fn permissions(&self, fingerprint: Fingerprint) -> Permissions {
-        let owner = self.owner == Some(fingerprint);
-        self.roles.read().permissions(fingerprint, owner)
+    /// Lock order everywhere: this snapshot is taken **before** `inner` is
+    /// acquired, never while holding it, so the two locks can never deadlock
+    /// and resolution never extends `inner`'s critical sections.
+    pub fn perm_state(&self) -> Arc<PermState> {
+        self.perms.read().clone()
     }
 
-    /// Grant or revoke a role, persisting the result.
-    ///
-    /// The capability and rank checks belong to the caller; this is the store.
-    pub fn assign_role(
-        &self,
-        fingerprint: Fingerprint,
-        role: Option<&str>,
-    ) -> Result<(), RoleError> {
-        let mut roles = self.roles.write();
-        roles.assign(fingerprint, role)?;
-        roles.save()
+    pub fn is_owner(&self, fingerprint: Fingerprint) -> bool {
+        self.owner == Some(fingerprint)
     }
 
-    pub fn roles(&self) -> Vec<Role> {
-        self.roles.read().list().to_vec()
+    /// The explicit role grants for a fingerprint. @everyone is implicit.
+    pub fn member_roles(&self, fingerprint: Fingerprint) -> Vec<RoleId> {
+        self.perms
+            .read()
+            .members
+            .get(&fingerprint)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// What `client` may do in `channel` right now. The everyday enforcement
+    /// entry point for the handlers that run outside the state locks.
+    pub fn can(&self, client: ClientId, channel: ChannelId, bits: Permissions) -> bool {
+        let snapshot = self.perm_state();
+        let inner = self.inner.read();
+        let Some(entry) = inner.clients.get(&client) else {
+            return false;
+        };
+        let Some(target) = inner.channels.get(&channel) else {
+            return false;
+        };
+        resolve(
+            &snapshot.roles,
+            &entry.info.roles,
+            entry.info.fingerprint(),
+            entry.info.owner,
+            Some(&target.overwrites),
+        )
+        .contains(bits)
+    }
+
+    /// The channels this member may view — what AuthOk sends, and the shape
+    /// the visibility resync keeps true afterwards.
+    pub fn visible_channels(&self, member: &UserInfo) -> Vec<Channel> {
+        let snapshot = self.perm_state();
+        self.inner
+            .read()
+            .channels
+            .values()
+            .filter(|c| {
+                resolve(
+                    &snapshot.roles,
+                    &member.roles,
+                    member.fingerprint(),
+                    member.owner,
+                    Some(&c.overwrites),
+                )
+                .contains(Permissions::VIEW_CHANNEL)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The channel this member should read first: the lowest-ordered
+    /// top-level text channel they can view. A suggestion, not a placement.
+    pub fn default_channel_for(&self, member: &UserInfo) -> Option<ChannelId> {
+        self.visible_channels(member)
+            .into_iter()
+            .filter(|c| c.parent.is_none() && c.kind.has_text())
+            .min_by_key(|c| (c.order, c.id))
+            .map(|c| c.id)
+    }
+
+    /// Every role, ordered by position — what AuthOk sends.
+    pub fn roles_snapshot(&self) -> Vec<Role> {
+        self.perms.read().roles.clone()
     }
 
     pub fn channels(&self) -> Vec<Channel> {
@@ -259,9 +365,11 @@ impl Shared {
                 reason: "nickname must contain at least one printable character".into(),
             })?;
 
-        // Resolved before taking the client lock, since it takes the role lock
-        // and holding both at once invites an ordering bug later.
-        let permissions = self.permissions(identity.fingerprint());
+        // Read before taking the client lock — the perms lock is always
+        // acquired first or not at all, never while `inner` is held.
+        let fingerprint = identity.fingerprint();
+        let roles = self.member_roles(fingerprint);
+        let owner = self.is_owner(fingerprint);
 
         let mut inner = self.inner.write();
         if inner.clients.len() >= self.config.max_users as usize {
@@ -278,7 +386,8 @@ impl Shared {
             channel: None,
             voice: VoiceState::default(),
             connected_at_unix_ms: now_unix_ms(),
-            permissions,
+            roles,
+            owner,
         };
 
         inner.clients.insert(
@@ -303,16 +412,38 @@ impl Shared {
         client: ClientId,
         channel: ChannelId,
     ) -> Result<Option<ChannelId>, ErrorCode> {
+        // Snapshot before `inner`, as everywhere: the perms lock is never
+        // acquired while `inner` is held, so the two can never deadlock.
+        let snapshot = self.perm_state();
         let mut inner = self.inner.write();
 
         let target = inner
             .channels
             .get(&channel)
             .ok_or(ErrorCode::NoSuchChannel)?;
+        let me = inner
+            .clients
+            .get(&client)
+            .ok_or(ErrorCode::NotAuthenticated)?;
+        let bits = resolve(
+            &snapshot.roles,
+            &me.info.roles,
+            me.info.fingerprint(),
+            me.info.owner,
+            Some(&target.overwrites),
+        );
+        // A channel you may not view answers exactly as one that does not
+        // exist: NotPermitted here would confirm there is something to see.
+        if !bits.contains(Permissions::VIEW_CHANNEL) {
+            return Err(ErrorCode::NoSuchChannel);
+        }
         // Being "in" a channel means being in its voice room. A text channel
         // has no room to stand in — everyone can already read and write it —
         // so joining one is refused rather than recorded as meaningless state.
         if !target.kind.has_voice() {
+            return Err(ErrorCode::NotPermitted);
+        }
+        if !bits.contains(Permissions::CONNECT) {
             return Err(ErrorCode::NotPermitted);
         }
         let max_users = target.max_users;
@@ -421,6 +552,43 @@ impl Shared {
     }
 
     /// Queue a control frame for everyone, optionally skipping one client.
+    /// Queue a frame for every client holding `VIEW_CHANNEL` on `channel`.
+    ///
+    /// The channel-scoped fan-out. With @everyone's default bits every client
+    /// passes, so a fresh server behaves exactly like the open-text model
+    /// this replaces — openness becomes the default rather than the rule.
+    pub fn broadcast_filtered(
+        &self,
+        message: ServerControl,
+        channel: ChannelId,
+        except: Option<ClientId>,
+    ) {
+        let snapshot = self.perm_state();
+        let overflowed: Vec<ClientId> = {
+            let inner = self.inner.read();
+            let Some(target) = inner.channels.get(&channel) else {
+                return;
+            };
+            inner
+                .clients
+                .iter()
+                .filter(|(id, _)| Some(**id) != except)
+                .filter(|(_, entry)| {
+                    resolve(
+                        &snapshot.roles,
+                        &entry.info.roles,
+                        entry.info.fingerprint(),
+                        entry.info.owner,
+                        Some(&target.overwrites),
+                    )
+                    .contains(Permissions::VIEW_CHANNEL)
+                })
+                .filter_map(|(_, entry)| try_queue(entry, message.clone()))
+                .collect()
+        };
+        self.drop_overflowed(overflowed.into_iter());
+    }
+
     pub fn broadcast(&self, message: ServerControl, except: Option<ClientId>) {
         let overflowed: Vec<ClientId> = {
             let inner = self.inner.read();
@@ -472,6 +640,10 @@ impl Shared {
     /// which costs per-speaker volume control and positional audio later on.
     /// Relaying keeps the server cheap and the client in charge.
     pub fn relay_voice(&self, from: ClientId, packet: VoiceUpstream) {
+        // Snapshot before `inner`, as everywhere. Per voice frame this is one
+        // uncontended read-lock clone of an Arc — nanoseconds against a 20 ms
+        // frame budget.
+        let snapshot = self.perm_state();
         let inner = self.inner.read();
 
         let Some(sender) = inner.clients.get(&from) else {
@@ -489,11 +661,23 @@ impl Shared {
         };
         // Routing uses the server's view of the sender's channel, never a
         // channel id supplied by the client.
-        if !inner
-            .channels
-            .get(&channel)
-            .map(|c| c.kind.has_voice())
-            .unwrap_or(false)
+        let Some(room) = inner.channels.get(&channel) else {
+            return;
+        };
+        if !room.kind.has_voice() {
+            return;
+        }
+        // SPEAK is enforced at the relay, not at the door: entering without
+        // it is allowed (listen-only), and revoking it mid-hold takes effect
+        // on the next frame.
+        if !resolve(
+            &snapshot.roles,
+            &sender.info.roles,
+            sender.info.fingerprint(),
+            sender.info.owner,
+            Some(&room.overwrites),
+        )
+        .contains(Permissions::SPEAK)
         {
             return;
         }
@@ -558,7 +742,10 @@ impl Shared {
     }
 }
 
-fn build_channels(config: &ServerConfig) -> BTreeMap<ChannelId, Channel> {
+/// Channels as the config file describes them — the first-boot seed, and what
+/// tests build their maps from. After the seed, the database owns channels
+/// and their ids; the config is a template.
+pub fn build_channels(config: &ServerConfig) -> Vec<Channel> {
     let ids: HashMap<&str, ChannelId> = config
         .channels
         .iter()
@@ -570,19 +757,15 @@ fn build_channels(config: &ServerConfig) -> BTreeMap<ChannelId, Channel> {
         .channels
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let id = i as ChannelId + 1;
-            let channel = Channel {
-                id,
-                parent: c.parent.as_deref().and_then(|p| ids.get(p).copied()),
-                name: c.name.clone(),
-                topic: c.topic.clone(),
-                kind: c.kind,
-                max_users: c.max_users,
-                password_protected: false,
-                order: c.order,
-            };
-            (id, channel)
+        .map(|(i, c)| Channel {
+            id: i as ChannelId + 1,
+            parent: c.parent.as_deref().and_then(|p| ids.get(p).copied()),
+            name: c.name.clone(),
+            topic: c.topic.clone(),
+            kind: c.kind,
+            max_users: c.max_users,
+            order: c.order,
+            overwrites: Vec::new(),
         })
         .collect()
 }
@@ -620,7 +803,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use parking_lot::Mutex;
-    use pickle_proto::{Capability, ChannelKind};
+    use pickle_proto::ChannelKind;
     use std::sync::Arc;
 
     /// Records what would have gone out on the wire.
@@ -633,11 +816,17 @@ mod tests {
         }
     }
 
-    /// A role store backed by a path that does not exist, so it starts from the
-    /// default ladder and never writes. Tests that need persistence open their
-    /// own store against a `tempdir`.
-    fn test_roles() -> Roles {
-        Roles::open(std::path::Path::new("/nonexistent/pickle-test/roles.json")).unwrap()
+    /// Build a Shared exactly as the server does, minus the database: the
+    /// config's channels and the default role ladder.
+    fn shared_from(config: ServerConfig) -> Shared {
+        let channels = build_channels(&config);
+        Shared::new(
+            config,
+            Identity::generate(),
+            [0u8; 32],
+            channels,
+            PermState::defaults(),
+        )
     }
 
     fn test_config() -> ServerConfig {
@@ -672,7 +861,7 @@ mod tests {
     }
 
     fn shared() -> Shared {
-        Shared::new(test_config(), Identity::generate(), [0u8; 32], test_roles())
+        shared_from(test_config())
     }
 
     #[test]
@@ -688,17 +877,28 @@ mod tests {
             owner: Some(operator.fingerprint().to_string()),
             ..test_config()
         };
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        let shared = shared_from(config);
 
-        let owner = shared.permissions(operator.fingerprint());
-        for capability in Capability::ALL {
-            assert!(owner.allows(capability), "owner denied {capability:?}");
-        }
+        let snapshot = shared.perm_state();
+        let owner = resolve(
+            &snapshot.roles,
+            &[],
+            operator.fingerprint(),
+            shared.is_owner(operator.fingerprint()),
+            None,
+        );
+        assert_eq!(owner, Permissions::ALL, "the owner passes every check");
 
-        let other = shared.permissions(bystander.fingerprint());
+        let other = resolve(
+            &snapshot.roles,
+            &[],
+            bystander.fingerprint(),
+            shared.is_owner(bystander.fingerprint()),
+            None,
+        );
         assert!(
-            !other.allows(Capability::KickUsers),
-            "an unrelated identity must not inherit the owner's capabilities"
+            !other.contains(Permissions::KICK_MEMBERS),
+            "an unrelated identity must not inherit the owner's permissions"
         );
     }
 
@@ -711,12 +911,10 @@ mod tests {
             owner: Some("not-a-fingerprint".into()),
             ..test_config()
         };
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        let shared = shared_from(config);
 
         assert!(
-            !shared
-                .permissions(Identity::generate().fingerprint())
-                .allows(Capability::KickUsers),
+            !shared.is_owner(Identity::generate().fingerprint()),
             "a server with an unreadable owner must grant nobody ownership"
         );
     }
@@ -797,7 +995,7 @@ mod tests {
     fn an_identity_below_the_minimum_level_is_refused() {
         let mut config = test_config();
         config.min_security_level = 200; // unreachable
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        let shared = shared_from(config);
 
         let (tx, _rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         let result = shared.admit(
@@ -816,7 +1014,7 @@ mod tests {
     fn the_server_stops_admitting_at_capacity() {
         let mut config = test_config();
         config.max_users = 1;
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        let shared = shared_from(config);
 
         join(&shared, "alice");
         let (tx, _rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
@@ -1010,7 +1208,7 @@ mod tests {
     fn a_full_channel_refuses_new_arrivals() {
         let mut config = test_config();
         config.channels[2].max_users = Some(1);
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        let shared = shared_from(config);
 
         let alice = join(&shared, "alice");
         let bob = join(&shared, "bob");
@@ -1027,7 +1225,7 @@ mod tests {
         // The occupant count must exclude the joiner, or a re-join would fail.
         let mut config = test_config();
         config.channels[2].max_users = Some(1);
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        let shared = shared_from(config);
 
         let alice = join(&shared, "alice");
         shared.join_channel(alice.info.client_id, 3).unwrap();
@@ -1054,7 +1252,7 @@ mod tests {
             max_users: None,
             order: 0,
         });
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
+        let shared = shared_from(config);
 
         let channels = shared.channels();
         let lobby = channels.iter().find(|c| c.name == "Lobby").unwrap();
@@ -1066,7 +1264,10 @@ mod tests {
     #[test]
     fn the_suggested_channel_is_the_lowest_ordered_text_one() {
         let shared = shared();
-        let lobby = shared.channel(shared.default_channel.unwrap()).unwrap();
+        let probe = join(&shared, "probe");
+        let lobby = shared
+            .channel(shared.default_channel_for(&probe.info).unwrap())
+            .unwrap();
         assert_eq!(lobby.name, "Lobby");
         assert!(lobby.kind.has_text());
     }
@@ -1077,8 +1278,9 @@ mod tests {
         for channel in &mut config.channels {
             channel.kind = ChannelKind::Voice;
         }
-        let shared = Shared::new(config, Identity::generate(), [0u8; 32], test_roles());
-        assert_eq!(shared.default_channel, None);
+        let shared = shared_from(config);
+        let probe = join(&shared, "probe");
+        assert_eq!(shared.default_channel_for(&probe.info), None);
     }
 
     #[test]

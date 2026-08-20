@@ -15,7 +15,7 @@ use pickle_proto::codec::{self, CodecError};
 use pickle_proto::voice::VoiceUpstream;
 use pickle_proto::{
     AuthFailure, AuthOk, ClientAuth, ClientControl, ClientId, DisconnectReason, ErrorCode,
-    ServerControl, ServerHello, ServerLimits, UserInfo, PROTOCOL_VERSION,
+    Permissions, ServerControl, ServerHello, ServerLimits, UserInfo, PROTOCOL_VERSION,
 };
 use rand::RngCore;
 use std::sync::Arc;
@@ -183,11 +183,16 @@ async fn handshake(
 
     let ok = AuthOk {
         client_id: info.client_id,
-        channels: shared.channels(),
+        // Only what this member may view. The visibility resync (the channel
+        // events, once something mutates permissions) keeps the shape true
+        // afterwards: a client's channel list is always exactly the channels
+        // it may see.
+        channels: shared.visible_channels(&info),
         // Snapshot taken after admission, so the client sees itself in the list
         // and does not need a special case for its own arrival.
         users: shared.users(),
-        default_channel: shared.default_channel,
+        roles: shared.roles_snapshot(),
+        default_channel: shared.default_channel_for(&info),
         // Reported per connection rather than from the static config, so a
         // server whose store failed to open says so instead of promising
         // history it cannot serve.
@@ -386,7 +391,36 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
 
         ClientControl::Ping { nonce } => shared.send(client_id, ServerControl::Pong { nonce }),
 
-        ClientControl::JoinChannel { channel, .. } => {
+        // Declared in the v2 cutover so the wire indices are pinned; the
+        // handlers arrive over the next PRs. Answering CommandFailed keeps a
+        // newer client's admin UI honest instead of leaving it waiting.
+        ClientControl::Kick { nonce, .. }
+        | ClientControl::Ban { nonce, .. }
+        | ClientControl::Unban { nonce, .. }
+        | ClientControl::ListBans { nonce }
+        | ClientControl::SetServerMute { nonce, .. }
+        | ClientControl::MoveMember { nonce, .. }
+        | ClientControl::CreateRole { nonce, .. }
+        | ClientControl::UpdateRole { nonce, .. }
+        | ClientControl::DeleteRole { nonce, .. }
+        | ClientControl::ReorderRoles { nonce, .. }
+        | ClientControl::SetMemberRoles { nonce, .. }
+        | ClientControl::SetChannelOverwrite { nonce, .. }
+        | ClientControl::DeleteChannelOverwrite { nonce, .. }
+        | ClientControl::CreateChannel { nonce, .. }
+        | ClientControl::UpdateChannel { nonce, .. }
+        | ClientControl::DeleteChannel { nonce, .. } => {
+            shared.send(
+                client_id,
+                ServerControl::CommandFailed {
+                    nonce,
+                    code: ErrorCode::Internal,
+                    detail: "this build does not implement that command yet".into(),
+                },
+            );
+        }
+
+        ClientControl::JoinChannel { channel } => {
             match shared.join_channel(client_id, channel) {
                 Ok(from) => shared.broadcast(
                     ServerControl::UserMoved {
@@ -453,13 +487,22 @@ async fn handle_control(shared: &Arc<Shared>, client_id: ClientId, message: Clie
         } => send_message(shared, client_id, channel, content, reply_to, nonce).await,
 
         ClientControl::Typing { channel } => {
-            shared.broadcast(
-                ServerControl::Typing {
-                    client: client_id,
+            // Silently dropped when the channel is missing, textless, hidden,
+            // or unwritable: typing is fire-and-forget, and an Error per
+            // keystroke from a misbehaving client would flood its own queue.
+            let ok = matches!(shared.channel(channel), Some(c) if c.kind.has_text())
+                && shared.can(client_id, channel, Permissions::VIEW_CHANNEL)
+                && shared.can(client_id, channel, Permissions::SEND_MESSAGES);
+            if ok {
+                shared.broadcast_filtered(
+                    ServerControl::Typing {
+                        client: client_id,
+                        channel,
+                    },
                     channel,
-                },
-                Some(client_id),
-            );
+                    Some(client_id),
+                );
+            }
         }
 
         ClientControl::FetchHistory {
@@ -508,14 +551,24 @@ async fn fetch_history(
         return;
     }
 
-    // Reading another channel's history is reading a room you may not be in, so
-    // the channel has to exist and carry text at all.
+    // Reading another channel's history is reading a room you may not be in,
+    // so the channel has to exist, carry text, and be viewable — and denied
+    // reads get the same empty page a nonexistent channel gets, because an
+    // error here would confirm there is something being hidden. A member who
+    // may view but not read history sees a room with no scrollback, which is
+    // exactly what READ_HISTORY-off means.
     match shared.channel(channel) {
         Some(c) if c.kind.has_text() => {}
         _ => {
             empty(shared);
             return;
         }
+    }
+    if !shared.can(client_id, channel, Permissions::VIEW_CHANNEL)
+        || !shared.can(client_id, channel, Permissions::READ_HISTORY)
+    {
+        empty(shared);
+        return;
     }
 
     let Some(store) = shared.store() else {
@@ -576,7 +629,21 @@ async fn send_message(
     }
 
     match shared.channel(channel) {
+        // A channel that does not exist and one this member may not view give
+        // the same answer, in the same order — the view check runs before the
+        // kind is even mentioned, so the reply never confirms what kind of
+        // room is being hidden.
         None => {
+            shared.send(
+                client_id,
+                ServerControl::Error {
+                    code: ErrorCode::NoSuchChannel,
+                    detail: format!("no channel {channel}"),
+                },
+            );
+            return;
+        }
+        Some(_) if !shared.can(client_id, channel, Permissions::VIEW_CHANNEL) => {
             shared.send(
                 client_id,
                 ServerControl::Error {
@@ -592,6 +659,16 @@ async fn send_message(
                 ServerControl::Error {
                     code: ErrorCode::NotPermitted,
                     detail: format!("channel {:?} does not carry text", c.name),
+                },
+            );
+            return;
+        }
+        Some(_) if !shared.can(client_id, channel, Permissions::SEND_MESSAGES) => {
+            shared.send(
+                client_id,
+                ServerControl::Error {
+                    code: ErrorCode::NotPermitted,
+                    detail: "you may not send messages in this channel".into(),
                 },
             );
             return;
@@ -628,14 +705,16 @@ async fn send_message(
             nonce: Some(nonce),
         },
     );
-    // To everyone, not to the channel's occupants: text is readable without
-    // joining, and occupancy means voice presence. The channel id on the
-    // message is how clients file it, not who may see it.
-    shared.broadcast(
+    // To every client that may view the channel, joined or not: occupancy
+    // means voice presence, and reading is gated by VIEW_CHANNEL alone. With
+    // @everyone's default bits that is every client — openness is the
+    // default now, rather than the rule.
+    shared.broadcast_filtered(
         ServerControl::MessagePosted {
             message: Box::new(message),
             nonce: None,
         },
+        channel,
         Some(client_id),
     );
 }

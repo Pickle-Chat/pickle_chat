@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   api,
+  type MyPermissions,
   type Bookmark,
   type Channel,
   type Connection,
@@ -133,6 +134,11 @@ export function App() {
   const historyRequested = useRef(new Set<string>());
   const requestHistoryOnce = (session: SessionId, channel: number | null) => {
     if (channel === null) return;
+    // Politeness, not enforcement: the server answers a denied read with an
+    // empty page anyway, so skipping the round trip changes nothing visible.
+    const readable =
+      connections.byId[session]?.permissions.channels[channel]?.readHistory ?? true;
+    if (!readable) return;
     const key = `${session}:${channel}`;
     if (historyRequested.current.has(key)) return;
     historyRequested.current.add(key);
@@ -410,12 +416,17 @@ function ConnectionView({
         activeChannel={connection.activeChannel}
         selfId={connection.info.clientId}
         hasVoice={hasVoice}
+        permissions={connection.permissions}
         onSelect={onSelectChannel}
         onJoinVoice={onJoinVoice}
         onLeave={onLeaveChannel}
       />
       <ChatPane
         channel={channel}
+        canSend={
+          connection.activeChannel !== null &&
+          (connection.permissions.channels[connection.activeChannel]?.send ?? false)
+        }
         messages={connection.messages.filter((m) => m.channel === connection.activeChannel)}
         onSend={(content) => {
           if (connection.activeChannel !== null) {
@@ -618,6 +629,7 @@ function ChannelList({
   activeChannel,
   selfId,
   hasVoice,
+  permissions,
   onSelect,
   onJoinVoice,
   onLeave,
@@ -629,6 +641,7 @@ function ChannelList({
   selfId: number;
   /// Whether this connection is the one carrying voice.
   hasVoice: boolean;
+  permissions: MyPermissions;
   onSelect: (id: number) => void;
   onJoinVoice: (id: number) => void;
   onLeave: () => void;
@@ -681,7 +694,13 @@ function ChannelList({
             </button>
             {/* Presence is entered and left explicitly, only where there is a
                 voice room to be present in. */}
+            {/* Hidden, not disabled, without CONNECT — Discord's choice: a
+                door you cannot open is not shown as a door. Leave always
+                shows; you can always get out. */}
             {channel.hasVoice &&
+              (permissions.channels[channel.id]?.connect ?? false
+                ? true
+                : users.some((u) => u.clientId === selfId && u.channel === channel.id)) &&
               (users.some((u) => u.clientId === selfId && u.channel === channel.id) ? (
                 <button
                   className="presence leave"
@@ -773,10 +792,12 @@ function ChannelList({
 
 function ChatPane({
   channel,
+  canSend,
   messages,
   onSend,
 }: {
   channel: Channel | null;
+  canSend: boolean;
   messages: Message[];
   onSend: (content: string) => void;
 }) {
@@ -825,10 +846,16 @@ function ChatPane({
         <input
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder={channel.hasText ? `Message ${channel.name}` : "This channel is voice only"}
-          disabled={!channel.hasText}
+          placeholder={
+            !channel.hasText
+              ? "This channel is voice only"
+              : !canSend
+                ? "You don't have permission to send messages here"
+                : `Message ${channel.name}`
+          }
+          disabled={!channel.hasText || !canSend}
         />
-        <button type="submit" disabled={!channel.hasText}>
+        <button type="submit" disabled={!channel.hasText || !canSend}>
           Send
         </button>
       </form>

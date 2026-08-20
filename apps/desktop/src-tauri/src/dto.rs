@@ -176,6 +176,7 @@ impl From<&SessionInfo> for SessionDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDto {
+    pub permissions: crate::perms::MyPermissionsDto,
     pub session: SessionId,
     pub info: SessionDto,
     /// Fingerprint of the identity this connection signed in with, which need
@@ -278,6 +279,12 @@ pub enum EventDto {
         code: &'static str,
         detail: String,
     },
+    /// Derived by the Rust-side permission mirror, not translated from the
+    /// wire: a complete snapshot, replaced wholesale, so the frontend never
+    /// merges permission state.
+    PermissionsChanged {
+        permissions: crate::perms::MyPermissionsDto,
+    },
     Disconnected {
         reason: String,
     },
@@ -330,7 +337,18 @@ impl EventDto {
             },
 
             // Handled on the Rust side or not yet surfaced in the UI.
-            ClientEvent::Voice(_)
+            // The role and admin-reply events feed the Rust-side permission
+            // mirror (next commit), which emits derived snapshot events the
+            // frontend can consume whole; the raw frames stay on this side of
+            // the bridge.
+            ClientEvent::RoleCreated(_)
+            | ClientEvent::RoleUpdated(_)
+            | ClientEvent::RoleDeleted { .. }
+            | ClientEvent::RolesReordered { .. }
+            | ClientEvent::BanList { .. }
+            | ClientEvent::Ack { .. }
+            | ClientEvent::CommandFailed { .. }
+            | ClientEvent::Voice(_)
             | ClientEvent::VoiceActivity { .. }
             | ClientEvent::Pong { .. }
             | ClientEvent::MessageEdited { .. }
@@ -449,7 +467,8 @@ mod tests {
             channel: None,
             voice: Default::default(),
             connected_at_unix_ms: 0,
-            permissions: Default::default(),
+            roles: Vec::new(),
+            owner: false,
         };
         let dto = UserDto::from(&user);
         assert_eq!(dto.fingerprint, identity.fingerprint().to_string());
