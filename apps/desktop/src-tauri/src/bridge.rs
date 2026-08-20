@@ -96,11 +96,19 @@ pub fn spawn_event_pump(
             // Fold the event into the permission mirror before translating.
             // Original first, derived second: the frontend applies raw state
             // (a channel now exists) before the gating computed from it.
+            let roles_changed = crate::perms::PermMirror::touches_roles(&event);
             let perms_changed = perms.lock().apply(&event);
 
             if let Some(event) = EventDto::from_event(&event) {
                 if let Err(e) = app.emit(EVENT_CHANNEL, SessionEvent { session, event }) {
                     debug!(error = %e, "could not emit an event to the frontend");
+                }
+            }
+            if roles_changed {
+                let snapshot = perms.lock().roles_dto();
+                let event = EventDto::RolesChanged { roles: snapshot };
+                if let Err(e) = app.emit(EVENT_CHANNEL, SessionEvent { session, event }) {
+                    debug!(error = %e, "could not emit a roles update");
                 }
             }
             if perms_changed {

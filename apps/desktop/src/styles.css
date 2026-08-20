@@ -222,7 +222,27 @@ button.fingerprint.copyable:focus-visible {
   grid-template-columns: 240px 1fr 180px;
 }
 
+.sidebar-column {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* The server's name above its channels, and the door to administering it —
+   shown only to those with any standing, since a gear that only ever refuses
+   is noise. */
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--bg);
+}
+
 .channels {
+  flex: 1;
+  min-height: 0;
   background: var(--panel);
   border-right: 1px solid var(--line);
   overflow-y: auto;
@@ -898,4 +918,261 @@ button.fingerprint.copyable:focus-visible {
 .voice p {
   font-size: 12px;
   margin: 0;
+}
+
+/* --- admin: roles tab ----------------------------------------------------- */
+
+.admin-role-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.admin-role-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+/* The chip is the role's tint; with no colour set it is an empty outline —
+   an absence, not a grey. */
+.admin-role-chip {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex: none;
+}
+
+.admin-role-chip.unset {
+  border: 1px solid var(--line);
+}
+
+/* The name is the row's click target but should read as a name, not as a
+   control, so no button chrome. */
+.admin-role-name {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.admin-role-row.open .admin-role-name {
+  color: var(--accent);
+}
+
+/* Reorder arrows are controls, not links: bare glyphs that brighten on hover
+   rather than underlined text. */
+.admin-move {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.admin-move:hover:not(:disabled) {
+  color: var(--text);
+}
+
+/* Indented under its row so the expansion reads as belonging to it. */
+.admin-role-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-left: 20px;
+  padding: 10px 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.admin-role-editor .row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* The global input chrome is sized for text; a colour swatch brings its own. */
+.admin-role-editor input[type=\"color\"] {
+  padding: 2px;
+  width: 44px;
+  height: 26px;
+}
+
+.admin-perm-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.admin-perm-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Checkboxes read sideways; the pane's default label direction is a column. */
+.admin-perm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 4px 14px;
+}
+
+.admin-perm-grid label {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.admin-perm-grid input[type=\"checkbox\"] {
+  padding: 0;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* --- admin members tab ---------------------------------------------------- */
+
+.admin-member-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* Two lines per member — identity above, grant controls below — because a
+   server with more than a handful of roles cannot fit both on one. */
+.admin-member-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.admin-member-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.admin-member-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Wraps rather than scrolls: Apply sends exactly the staged set, so every
+   box has to be visible when the button is pressed. */
+.admin-role-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.admin-member-controls .admin-role-picks {
+  flex: 1;
+}
+
+/* --- admin: channel overwrites -------------------------------------------- */
+
+.admin-overwrite-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* One overwrite: a header line, then the tri-state grid beneath it. */
+.admin-overwrite {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.admin-overwrite-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.admin-overwrite-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+/* Two columns keeps eight permissions from becoming a tower; minmax(0, …)
+   lets the names truncate instead of widening the dialog. */
+.admin-tri-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 16px;
+}
+
+.admin-tri {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-tri-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.admin-tri-buttons {
+  display: flex;
+  gap: 2px;
+}
+
+/* Quiet until chosen: only the active state carries a colour, so a row that
+   is all inherit reads as blank rather than as 24 competing glyphs. */
+.admin-tri-buttons button {
+  padding: 1px 7px;
+  font-size: 12px;
+  line-height: 1.4;
+  border-radius: 4px;
+  color: var(--muted);
+}
+
+.admin-tri-buttons button.on.admin-tri-allow {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.admin-tri-buttons button.on.admin-tri-inherit {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.admin-tri-buttons button.on.admin-tri-deny {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* The add-overwrite picker, and the fingerprint field it can open. */
+.admin-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.admin-add input {
+  flex: 1;
 }

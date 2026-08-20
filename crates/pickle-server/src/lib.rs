@@ -5,6 +5,7 @@
 //! configuration all live in one data directory that can be copied between
 //! machines to move a server without users noticing.
 
+mod admin;
 pub mod config;
 mod moderation;
 pub mod session;

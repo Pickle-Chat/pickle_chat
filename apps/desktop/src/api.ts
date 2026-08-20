@@ -78,6 +78,8 @@ export interface User {
   selfDeafened: boolean;
   /** Muted by a moderator, not by choice. */
   serverMuted: boolean;
+  /** Role grants, @everyone implicit. */
+  roles: number[];
 }
 
 export interface Message {
@@ -96,6 +98,44 @@ export interface ChannelPermissions {
   readHistory: boolean;
   connect: boolean;
   speak: boolean;
+}
+
+export interface Role {
+  id: number;
+  name: string;
+  /** "#rrggbb" or null. */
+  color: string | null;
+  /** Higher outranks. */
+  position: number;
+  permissions: Permission[];
+  isEveryone: boolean;
+}
+
+/** Every permission name the editor can toggle — mirrors the Rust list. */
+export type Permission =
+  | "administrator"
+  | "manageServer"
+  | "manageRoles"
+  | "manageChannels"
+  | "kickMembers"
+  | "banMembers"
+  | "viewChannel"
+  | "sendMessages"
+  | "readHistory"
+  | "manageMessages"
+  | "connect"
+  | "speak"
+  | "muteMembers"
+  | "moveMembers";
+
+export type OverwriteTarget =
+  | { kind: "role"; id: number }
+  | { kind: "member"; fingerprint: string };
+
+export interface Overwrite {
+  target: OverwriteTarget;
+  allow: Permission[];
+  deny: Permission[];
 }
 
 export interface BanEntry {
@@ -119,6 +159,8 @@ export interface ModerationOptions {
 export interface MyPermissions {
   isOwner: boolean;
   isAdmin: boolean;
+  /** Any administrative standing at all — gates the admin gear. */
+  canOpenAdmin: boolean;
   channels: Record<number, ChannelPermissions>;
 }
 
@@ -138,6 +180,7 @@ export type SessionId = number;
 
 export interface Connection {
   permissions: MyPermissions;
+  roles: Role[];
   session: SessionId;
   info: Session;
   /// Fingerprint of the identity this connection signed in with, which need not
@@ -206,6 +249,7 @@ export type ServerEvent =
   | { type: "channelCreated"; channel: Channel }
   | { type: "channelUpdated"; channel: Channel }
   | { type: "channelRemoved"; channelId: number }
+  | { type: "rolesChanged"; roles: Role[] }
   | { type: "banList"; bans: BanEntry[] }
   | { type: "commandFailed"; nonce: number; code: ServerErrorCode; detail: string }
   | { type: "permissionsChanged"; permissions: MyPermissions }
@@ -379,6 +423,39 @@ export const api = {
     invoke<void>("move_user", { session, clientId, channel }),
   moderationOptions: (session: SessionId, clientId: number) =>
     invoke<ModerationOptions>("moderation_options", { session, clientId }),
+  createRole: (session: SessionId, name: string, permissions: Permission[]) =>
+    invoke<void>("create_role", { session, name, permissions }),
+  updateRole: (
+    session: SessionId,
+    roleId: number,
+    /** `color: null` clears the tint; omitting leaves it untouched. */
+    patch: { name?: string; color?: number | null; permissions?: Permission[] },
+  ) =>
+    invoke<void>("update_role", {
+      session,
+      roleId,
+      name: patch.name,
+      color: patch.color ?? undefined,
+      clearColor: patch.color === null ? true : undefined,
+      permissions: patch.permissions,
+    }),
+  deleteRole: (session: SessionId, roleId: number) =>
+    invoke<void>("delete_role", { session, roleId }),
+  reorderRoles: (session: SessionId, positions: [number, number][]) =>
+    invoke<void>("reorder_roles", { session, positions }),
+  setMemberRoles: (session: SessionId, fingerprint: string, roles: number[]) =>
+    invoke<void>("set_member_roles", { session, fingerprint, roles }),
+  setChannelOverwrite: (
+    session: SessionId,
+    channel: number,
+    target: OverwriteTarget,
+    allow: Permission[],
+    deny: Permission[],
+  ) => invoke<void>("set_channel_overwrite", { session, channel, target, allow, deny }),
+  deleteChannelOverwrite: (session: SessionId, channel: number, target: OverwriteTarget) =>
+    invoke<void>("delete_channel_overwrite", { session, channel, target }),
+  channelOverwrites: (session: SessionId, channel: number) =>
+    invoke<Overwrite[]>("channel_overwrites", { session, channel }),
   sendMessage: (session: SessionId, channel: number, content: string) =>
     invoke<void>("send_message", { session, channel, content }),
 

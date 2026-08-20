@@ -16,6 +16,7 @@ import {
 import { EMPTY, reduce, type ConnectionState } from "./connections";
 import { Fingerprint } from "./Fingerprint";
 import { UserMenu, type MenuTarget } from "./UserMenu";
+import { AdminDialog } from "./admin/AdminDialog";
 import { LevelMeter } from "./LevelMeter";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { usePushToTalk } from "./usePushToTalk";
@@ -398,9 +399,17 @@ function ConnectionView({
 
   const channel =
     connection.channels.find((c) => c.id === connection.activeChannel) ?? null;
+  const [adminOpen, setAdminOpen] = useState(false);
 
   return (
     <>
+      {adminOpen && (
+        <AdminDialog
+          connection={connection}
+          onError={onError}
+          onClose={() => setAdminOpen(false)}
+        />
+      )}
       {connection.notice && (
         <div className="banner error connection-notice" role="alert">
           {connection.notice.detail}
@@ -410,6 +419,20 @@ function ConnectionView({
         </div>
       )}
       <main className="layout">
+      <div className="sidebar-column">
+      <div className="sidebar-header">
+        <strong>{connection.info.serverName}</strong>
+        {connection.permissions.canOpenAdmin && (
+          <button
+            className="icon"
+            onClick={() => setAdminOpen(true)}
+            aria-label="Server administration"
+            title="Server administration"
+          >
+            ⚙
+          </button>
+        )}
+      </div>
       <ChannelList
         session={connection.session}
         channels={connection.channels}
@@ -423,6 +446,7 @@ function ConnectionView({
         onLeave={onLeaveChannel}
         onMenuError={onError}
       />
+      </div>
       <ChatPane
         channel={channel}
         canSend={

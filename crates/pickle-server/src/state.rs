@@ -17,7 +17,7 @@ use pickle_identity::{Fingerprint, Identity, PublicIdentity};
 use pickle_proto::voice::VoiceUpstream;
 use pickle_proto::{
     resolve, AuthFailure, Channel, ChannelId, ChatMessage, ClientId, DisconnectReason, ErrorCode,
-    Permissions, Role, RoleId, ServerControl, ServerLimits, UserInfo, VoiceState,
+    Overwrite, Permissions, Role, RoleId, ServerControl, ServerLimits, UserInfo, VoiceState,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -757,6 +757,159 @@ impl Shared {
             .clients
             .get(&client)
             .map(|c| c.info.fingerprint())
+    }
+
+    /// Swap the permission inputs for a new snapshot. Writers call this
+    /// after the database write succeeds — stored before announced — and
+    /// then broadcast whatever the mutation implies.
+    pub fn swap_perm_state(&self, next: PermState) {
+        *self.perms.write() = Arc::new(next);
+    }
+
+    /// Each connected client's currently-visible channel set. Captured before
+    /// a permission mutation; diffed after, to drive the resync events.
+    pub fn visible_ids_by_client(&self) -> Vec<(ClientId, std::collections::HashSet<ChannelId>)> {
+        let snapshot = self.perm_state();
+        let inner = self.inner.read();
+        inner
+            .clients
+            .values()
+            .map(|entry| {
+                let visible = inner
+                    .channels
+                    .values()
+                    .filter(|c| {
+                        resolve(
+                            &snapshot.roles,
+                            &entry.info.roles,
+                            entry.info.fingerprint(),
+                            entry.info.owner,
+                            Some(&c.overwrites),
+                        )
+                        .contains(Permissions::VIEW_CHANNEL)
+                    })
+                    .map(|c| c.id)
+                    .collect();
+                (entry.info.client_id, visible)
+            })
+            .collect()
+    }
+
+    /// After a permission mutation: tell each client exactly what its channel
+    /// list gained, lost, or kept-but-changed, so the list every client holds
+    /// is always precisely the channels it may view. `touched` names channels
+    /// whose contents changed (an overwrite edit) so still-viewers get the
+    /// updated object; role-level mutations pass none and only gains and
+    /// losses flow.
+    pub fn resync_visibility(
+        &self,
+        before: &[(ClientId, std::collections::HashSet<ChannelId>)],
+        touched: &[ChannelId],
+    ) {
+        let after = self.visible_ids_by_client();
+        let after_map: HashMap<ClientId, &std::collections::HashSet<ChannelId>> =
+            after.iter().map(|(id, set)| (*id, set)).collect();
+        let channels: HashMap<ChannelId, Channel> = {
+            let inner = self.inner.read();
+            inner.channels.clone().into_iter().collect()
+        };
+
+        for (client, was) in before {
+            let Some(now) = after_map.get(client) else {
+                continue;
+            };
+            for gained in now.iter().filter(|id| !was.contains(id)) {
+                if let Some(channel) = channels.get(gained) {
+                    self.send(*client, ServerControl::ChannelCreated(channel.clone()));
+                }
+            }
+            for lost in was.iter().filter(|id| !now.contains(id)) {
+                self.send(*client, ServerControl::ChannelRemoved(*lost));
+            }
+            for id in touched {
+                if was.contains(id) && now.contains(id) {
+                    if let Some(channel) = channels.get(id) {
+                        self.send(*client, ServerControl::ChannelUpdated(channel.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update the cached role list on every live session of a fingerprint,
+    /// returning the refreshed infos for broadcasting. Role changes must land
+    /// on live sessions — the whole reason resolution reads inputs, not
+    /// admission snapshots.
+    pub fn update_live_member_roles(
+        &self,
+        fingerprint: Fingerprint,
+        roles: &[RoleId],
+    ) -> Vec<UserInfo> {
+        let mut inner = self.inner.write();
+        inner
+            .clients
+            .values_mut()
+            .filter(|entry| entry.info.fingerprint() == fingerprint)
+            .map(|entry| {
+                entry.info.roles = roles.to_vec();
+                entry.info.clone()
+            })
+            .collect()
+    }
+
+    /// Strip a deleted role from every live session holding it.
+    pub fn strip_live_role(&self, role: RoleId) -> Vec<UserInfo> {
+        let mut inner = self.inner.write();
+        inner
+            .clients
+            .values_mut()
+            .filter(|entry| entry.info.roles.contains(&role))
+            .map(|entry| {
+                entry.info.roles.retain(|r| *r != role);
+                entry.info.clone()
+            })
+            .collect()
+    }
+
+    /// Replace or insert one overwrite on a channel, in memory. The store
+    /// write happened first; this is the announce half.
+    pub fn set_channel_overwrite(&self, channel: ChannelId, overwrite: Overwrite) -> bool {
+        let mut inner = self.inner.write();
+        let Some(target) = inner.channels.get_mut(&channel) else {
+            return false;
+        };
+        target.overwrites.retain(|o| o.target != overwrite.target);
+        target.overwrites.push(overwrite);
+        true
+    }
+
+    pub fn remove_channel_overwrite(
+        &self,
+        channel: ChannelId,
+        target: &pickle_proto::OverwriteTarget,
+    ) -> bool {
+        let mut inner = self.inner.write();
+        let Some(entry) = inner.channels.get_mut(&channel) else {
+            return false;
+        };
+        entry.overwrites.retain(|o| o.target != *target);
+        true
+    }
+
+    /// Strip every overwrite naming a deleted role, returning the channels
+    /// touched so the resync can update still-viewers.
+    pub fn strip_role_overwrites(&self, role: RoleId) -> Vec<ChannelId> {
+        let mut inner = self.inner.write();
+        let target = pickle_proto::OverwriteTarget::Role(role);
+        inner
+            .channels
+            .values_mut()
+            .filter(|c| c.overwrites.iter().any(|o| o.target == target))
+            .map(|c| {
+                c.overwrites.retain(|o| o.target != target);
+                c.id
+            })
+            .collect()
     }
 
     /// Remove a client by authority — a kick or a ban, not a quit.
