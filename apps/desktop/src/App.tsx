@@ -17,6 +17,7 @@ import { EMPTY, reduce, type ConnectionState } from "./connections";
 import { Fingerprint } from "./Fingerprint";
 import { UserMenu, type MenuTarget } from "./UserMenu";
 import { AdminDialog } from "./admin/AdminDialog";
+import { ChannelMenu, type ChannelMenuTarget } from "./ChannelMenu";
 import { LevelMeter } from "./LevelMeter";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { usePushToTalk } from "./usePushToTalk";
@@ -685,6 +686,7 @@ function ChannelList({
 }) {
   const [speaking, setSpeaking] = useState<number[]>([]);
   const [menu, setMenu] = useState<MenuTarget | null>(null);
+  const [channelMenu, setChannelMenu] = useState<ChannelMenuTarget | null>(null);
 
   const openMenu = (e: React.MouseEvent, user: User) => {
     e.preventDefault();
@@ -734,12 +736,12 @@ function ChannelList({
                 onChannelSettings &&
                 ((e) => {
                   e.preventDefault();
-                  onChannelSettings(channel.id);
+                  setChannelMenu({ channel, x: e.clientX, y: e.clientY });
                 })
               }
               title={
                 onChannelSettings
-                  ? `${channel.topic}\nRight-click for permissions`.trim()
+                  ? `${channel.topic}\nRight-click for options`.trim()
                   : channel.topic
               }
             >
@@ -856,6 +858,15 @@ function ChannelList({
           target={menu}
           channels={channels}
           onClose={() => setMenu(null)}
+          onError={onMenuError}
+        />
+      )}
+      {channelMenu && onChannelSettings && (
+        <ChannelMenu
+          session={session}
+          target={channelMenu}
+          onEditPermissions={() => onChannelSettings(channelMenu.channel.id)}
+          onClose={() => setChannelMenu(null)}
           onError={onMenuError}
         />
       )}
