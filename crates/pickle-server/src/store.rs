@@ -223,6 +223,113 @@ impl Store {
         Ok(())
     }
 
+    pub async fn update_role(&self, role: &Role) -> Result<(), StoreError> {
+        sqlx::query("UPDATE roles SET name = $2, color = $3, permissions = $4 WHERE id = $1")
+            .bind(role.id as i64)
+            .bind(role.name.clone())
+            .bind(role.color.map(|c| c as i64))
+            .bind(role.permissions.0 as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a role and everything that references it: grants and
+    /// role-targeted overwrites. Deleting a role demotes its holders.
+    pub async fn delete_role(&self, role: RoleId) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM role_members WHERE role_id = $1")
+            .bind(role as i64)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM channel_overwrites WHERE target_kind = 0 AND target = $1")
+            .bind(role.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM roles WHERE id = $1")
+            .bind(role as i64)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Write a full ordering in one transaction, so a crash mid-reorder can
+    /// never leave two roles at one position.
+    pub async fn set_role_positions(&self, positions: &[(RoleId, u32)]) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        for (role, position) in positions {
+            sqlx::query("UPDATE roles SET position = $2 WHERE id = $1")
+                .bind(*role as i64)
+                .bind(*position as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replace a member's grants wholesale — the wire command's semantics.
+    pub async fn replace_member_roles(
+        &self,
+        fingerprint: Fingerprint,
+        roles: &[RoleId],
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM role_members WHERE fingerprint = $1")
+            .bind(fingerprint.to_string())
+            .execute(&mut *tx)
+            .await?;
+        for role in roles {
+            sqlx::query("INSERT INTO role_members (fingerprint, role_id) VALUES ($1, $2)")
+                .bind(fingerprint.to_string())
+                .bind(*role as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn upsert_overwrite(
+        &self,
+        channel: ChannelId,
+        overwrite: &Overwrite,
+    ) -> Result<(), StoreError> {
+        let (kind, target) = overwrite_key(&overwrite.target);
+        sqlx::query(
+            "INSERT INTO channel_overwrites (channel, target_kind, target, allow, deny)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (channel, target_kind, target) DO UPDATE SET allow = $4, deny = $5",
+        )
+        .bind(channel as i64)
+        .bind(kind)
+        .bind(target)
+        .bind(overwrite.allow.0 as i64)
+        .bind(overwrite.deny.0 as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_overwrite(
+        &self,
+        channel: ChannelId,
+        target: &OverwriteTarget,
+    ) -> Result<(), StoreError> {
+        let (kind, key) = overwrite_key(target);
+        sqlx::query(
+            "DELETE FROM channel_overwrites
+             WHERE channel = $1 AND target_kind = $2 AND target = $3",
+        )
+        .bind(channel as i64)
+        .bind(kind)
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Every member's explicit role grants.
     pub async fn load_role_members(&self) -> Result<Vec<(Fingerprint, RoleId)>, StoreError> {
         let rows = sqlx::query("SELECT fingerprint, role_id FROM role_members")
@@ -456,6 +563,14 @@ pub struct History {
     /// Oldest first.
     pub messages: Vec<ChatMessage>,
     pub reached_start: bool,
+}
+
+/// The storage key for an overwrite target: (kind column, target column).
+fn overwrite_key(target: &OverwriteTarget) -> (i64, String) {
+    match target {
+        OverwriteTarget::Role(id) => (0, id.to_string()),
+        OverwriteTarget::Member(fingerprint) => (1, fingerprint.to_string()),
+    }
 }
 
 fn row_to_role(row: &AnyRow) -> Result<Role, sqlx::Error> {
@@ -888,6 +1003,117 @@ mod tests {
             vec![(member, 2)],
             "the unreadable row is skipped, not fatal"
         );
+    }
+
+    #[tokio::test]
+    async fn role_updates_reorders_and_deletion_cascade() {
+        let (_dir, store) = store().await;
+        let member = Identity::generate().fingerprint();
+        for role in [
+            Role {
+                id: 0,
+                name: "everyone".into(),
+                color: None,
+                position: 0,
+                permissions: Permissions::DEFAULT_EVERYONE,
+            },
+            Role {
+                id: 1,
+                name: "helper".into(),
+                color: None,
+                position: 1,
+                permissions: Permissions::NONE,
+            },
+        ] {
+            store.insert_role(&role).await.unwrap();
+        }
+        store.insert_role_member(member, 1).await.unwrap();
+        store
+            .upsert_overwrite(
+                7,
+                &Overwrite {
+                    target: OverwriteTarget::Role(1),
+                    allow: Permissions::SEND_MESSAGES,
+                    deny: Permissions::NONE,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Update sticks.
+        let renamed = Role {
+            id: 1,
+            name: "mod".into(),
+            color: Some(7),
+            position: 1,
+            permissions: Permissions::KICK_MEMBERS,
+        };
+        store.update_role(&renamed).await.unwrap();
+        assert_eq!(store.load_roles().await.unwrap()[1], renamed);
+
+        // Reorder is transactional and total.
+        store.set_role_positions(&[(0, 0), (1, 5)]).await.unwrap();
+        assert_eq!(store.load_roles().await.unwrap()[1].position, 5);
+
+        // Deleting cascades to grants and role-targeted overwrites.
+        store.delete_role(1).await.unwrap();
+        assert!(store.load_role_members().await.unwrap().is_empty());
+        assert!(store.load_overwrites().await.unwrap().is_empty());
+        assert_eq!(store.load_roles().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn member_roles_replace_wholesale_and_overwrites_upsert() {
+        let (_dir, store) = store().await;
+        let member = Identity::generate().fingerprint();
+        for id in [1u32, 2, 3] {
+            store
+                .insert_role(&Role {
+                    id,
+                    name: format!("r{id}"),
+                    color: None,
+                    position: id,
+                    permissions: Permissions::NONE,
+                })
+                .await
+                .unwrap();
+        }
+        store.replace_member_roles(member, &[1, 2]).await.unwrap();
+        store.replace_member_roles(member, &[3]).await.unwrap();
+        let grants = store.load_role_members().await.unwrap();
+        assert_eq!(grants, vec![(member, 3)], "replacement, not accumulation");
+
+        let target = OverwriteTarget::Member(member);
+        store
+            .upsert_overwrite(
+                4,
+                &Overwrite {
+                    target,
+                    allow: Permissions::CONNECT,
+                    deny: Permissions::NONE,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_overwrite(
+                4,
+                &Overwrite {
+                    target,
+                    allow: Permissions::NONE,
+                    deny: Permissions::CONNECT,
+                },
+            )
+            .await
+            .unwrap();
+        let loaded = store.load_overwrites().await.unwrap();
+        assert_eq!(loaded.len(), 1, "same key upserts");
+        assert_eq!(loaded[0].1.deny, Permissions::CONNECT);
+
+        store.delete_overwrite(4, &target).await.unwrap();
+        assert!(store.load_overwrites().await.unwrap().is_empty());
+        // Deleting again is a quiet no-op.
+        store.delete_overwrite(4, &target).await.unwrap();
     }
 
     #[tokio::test]
