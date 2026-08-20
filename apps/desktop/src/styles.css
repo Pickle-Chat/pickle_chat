@@ -1206,18 +1206,13 @@ button.fingerprint.copyable:focus-visible {
   text-align: left;
   font-weight: 400;
   color: var(--muted);
-  padding: 3px 8px;
+  padding: 3px 4px;
   white-space: nowrap;
 }
 
 .admin-matrix thead th {
-  vertical-align: bottom;
-  font-size: 11px;
-}
-
-.admin-matrix-colrest {
-  display: block;
   font-size: 10px;
+  text-align: center;
 }
 
 .admin-matrix tbody th {
@@ -1238,8 +1233,8 @@ button.fingerprint.copyable:focus-visible {
   background: none;
   border: 1px solid transparent;
   border-radius: 4px;
-  width: 28px;
-  padding: 2px 0;
+  width: 24px;
+  padding: 1px 0;
   cursor: pointer;
   color: var(--muted);
 }

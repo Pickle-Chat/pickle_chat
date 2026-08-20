@@ -71,6 +71,18 @@ function ChannelMatrix({
   onChanged: () => void;
 }) {
   const columns = matrix[0]?.cells.map((c) => c.name) ?? [];
+  // One short word per column, or the grid forces sideways scrolling before
+  // a single overwrite exists. The full name lives in the tooltip.
+  const short: Record<string, string> = {
+    viewChannel: "View",
+    sendMessages: "Send",
+    readHistory: "History",
+    manageMessages: "Manage",
+    connect: "Connect",
+    speak: "Speak",
+    muteMembers: "Mute",
+    moveMembers: "Move",
+  };
 
   const cycle = (row: MatrixRow, cell: { name: Permission; state: string }) => {
     // The full allow and deny lists for this role, with one bit moved one
@@ -103,10 +115,7 @@ function ChannelMatrix({
             <th />
             {columns.map((name) => (
               <th key={name} title={name}>
-                {name.replace(/([A-Z])/g, " $1").split(" ")[0]}
-                <span className="admin-matrix-colrest">
-                  {name.replace(/([A-Z])/g, " $1").split(" ").slice(1).join(" ")}
-                </span>
+                {short[name] ?? name}
               </th>
             ))}
           </tr>
@@ -364,11 +373,16 @@ export function ChannelsTab({
     setDrafts((d) => ({ ...d, [key]: { allow: [], deny: [] } }));
   };
 
+  // Role overwrites are the matrix's job — visible and editable in one grid —
+  // so the card list below carries only member exceptions, which a role grid
+  // cannot show.
   const rows: { target: OverwriteTarget; saved: Overwrite | null }[] =
     overwrites === null
       ? []
       : [
-          ...overwrites.map((o) => ({ target: o.target, saved: o })),
+          ...overwrites
+            .filter((o) => o.target.kind === "member")
+            .map((o) => ({ target: o.target, saved: o })),
           // Another admin can create the overwrite we have staged; the
           // mirror's row wins, and our stage becomes its pending edit.
           ...added
@@ -463,8 +477,7 @@ export function ChannelsTab({
           <>
             {rows.length === 0 ? (
               <p className="muted">
-                No overwrites — everyone sees this channel exactly as their
-                roles allow.
+                No member exceptions — the grid above is the whole story.
               </p>
             ) : (
               <ul className="admin-overwrite-list">
@@ -507,27 +520,11 @@ export function ChannelsTab({
             )}
 
             <div className="admin-add">
-              {/* A menu wearing a select: controlled back to the placeholder,
-                  so the same choice can fire again next time. */}
-              <select
-                value=""
-                aria-label="Add an overwrite"
-                onChange={(e) => {
-                  const value = e.target.value;
-                  if (value === "member") setMemberDraft("");
-                  else if (value !== "") addTarget({ kind: "role", id: Number(value) });
-                }}
-              >
-                <option value="" disabled>
-                  Add an overwrite…
-                </option>
-                {roles.map((role) => (
-                  <option key={role.id} value={role.id}>
-                    {role.name}
-                  </option>
-                ))}
-                <option value="member">member fingerprint…</option>
-              </select>
+              {memberDraft === null && (
+                <button className="linklike" onClick={() => setMemberDraft("")}>
+                  Add a member exception…
+                </button>
+              )}
             </div>
 
             {memberDraft !== null && (
