@@ -475,6 +475,40 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub async fn update_channel(&self, channel: &Channel) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE channels SET parent = $2, name = $3, topic = $4, kind = $5,
+             max_users = $6, sort_order = $7 WHERE id = $1",
+        )
+        .bind(channel.id as i64)
+        .bind(channel.parent.map(|p| p as i64))
+        .bind(channel.name.clone())
+        .bind(channel.topic.clone())
+        .bind(kind_str(channel.kind))
+        .bind(channel.max_users.map(|m| m as i64))
+        .bind(channel.order as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a channel and its overwrites. Its messages stay, orphaned on
+    /// purpose: deleting a room is not permission to erase what people said,
+    /// and retention policy is a different feature's job.
+    pub async fn delete_channel(&self, channel: ChannelId) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM channel_overwrites WHERE channel = $1")
+            .bind(channel as i64)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM channels WHERE id = $1")
+            .bind(channel as i64)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// The active ban for a fingerprint, if any. Expiry is compared here, on
     /// read, so a lapsed ban needs nothing running to stop applying.
     pub async fn active_ban(
@@ -1114,6 +1148,52 @@ mod tests {
         assert!(store.load_overwrites().await.unwrap().is_empty());
         // Deleting again is a quiet no-op.
         store.delete_overwrite(4, &target).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_updates_stick_and_deletion_orphans_history() {
+        let (_dir, store) = store().await;
+        let mut channel = Channel {
+            id: 5,
+            parent: None,
+            name: "workshop".into(),
+            topic: String::new(),
+            kind: ChannelKind::Text,
+            max_users: None,
+            order: 1,
+            overwrites: Vec::new(),
+        };
+        store.insert_channel(&channel).await.unwrap();
+        store.insert_message(&message(1, 5, "kept")).await.unwrap();
+        store
+            .upsert_overwrite(
+                5,
+                &Overwrite {
+                    target: OverwriteTarget::Role(0),
+                    allow: Permissions::NONE,
+                    deny: Permissions::SEND_MESSAGES,
+                },
+            )
+            .await
+            .unwrap();
+
+        channel.name = "atelier".into();
+        channel.kind = ChannelKind::VoiceAndText;
+        channel.max_users = Some(4);
+        store.update_channel(&channel).await.unwrap();
+        assert_eq!(store.load_channels().await.unwrap(), vec![channel]);
+
+        store.delete_channel(5).await.unwrap();
+        assert!(store.load_channels().await.unwrap().is_empty());
+        assert!(
+            store.load_overwrites().await.unwrap().is_empty(),
+            "overwrites go"
+        );
+        assert_eq!(
+            store.message_count().await.unwrap(),
+            1,
+            "history stays, orphaned"
+        );
     }
 
     #[tokio::test]

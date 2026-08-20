@@ -1176,3 +1176,17 @@ button.fingerprint.copyable:focus-visible {
 .admin-add input {
   flex: 1;
 }
+
+/* One row of channel fields; the wire takes whole states, so every field is
+   always present. */
+.admin-channel-editor {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.admin-channel-editor input:first-child {
+  flex: 1;
+  min-width: 120px;
+}
