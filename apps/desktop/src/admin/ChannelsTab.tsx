@@ -1,7 +1,7 @@
-// The Channels tab of the admin dialog: per-channel overwrites.
+// The Channels tab of the admin dialog.
 //
-// Channel create/rename/delete is a later PR. What lives here is the
-// tri-state editor for who can see and use one channel beyond what roles
+// Creating, renaming and deleting channels, plus the per-channel overwrites:
+// the tri-state editors for who can see and use one channel beyond what roles
 // grant — allow and deny per target, with inherit as the deliberate absence
 // of an opinion.
 

@@ -46,6 +46,10 @@ export interface ConnectionState {
   notice: { code: ServerErrorCode; detail: string } | null;
   /// Cleared when the tab is looked at, so a tab you are reading never nags.
   unread: number;
+  /// The tab badge cannot reach here: new messages in channels you are not
+  /// reading, in the tab you are looking at. Cleared per channel as it is
+  /// selected, so the mark follows the eye rather than the tab.
+  unreadChannels: Record<number, number>;
 }
 
 export interface ConnectionsState {
@@ -89,6 +93,7 @@ export function reduce(state: ConnectionsState, action: Action): ConnectionsStat
             disconnected: null,
             notice: null,
             unread: 0,
+            unreadChannels: {},
           },
         },
         active: session,
@@ -119,11 +124,15 @@ export function reduce(state: ConnectionsState, action: Action): ConnectionsStat
             : patch(state, action.session, (c) => ({ ...c, unread: 0 })),
       };
 
-    case "channelSelected":
-      return {
-        ...state,
-        byId: patch(state, action.session, (c) => ({ ...c, activeChannel: action.channel })),
+    case "channelSelected": {
+      // The eye moved to this channel: whatever it had, it has now been seen.
+      const clear = (c: ConnectionState) => {
+        const unreadChannels = { ...c.unreadChannels };
+        if (action.channel !== null) delete unreadChannels[action.channel];
+        return { ...c, activeChannel: action.channel, unreadChannels };
       };
+      return { ...state, byId: patch(state, action.session, clear) };
+    }
 
     case "noticeDismissed":
       return {
@@ -190,14 +199,26 @@ function applyEvent(
         ),
       };
 
-    case "message":
+    case "message": {
+      const here = active === connection.session;
+      // The tab badge counts only when the tab is not looked at; inside the
+      // looked-at tab the same message counts against the channel not being
+      // read, so a busy sidebar can show where the unseen things are.
+      const unreadChannels =
+        here && event.message.channel !== connection.activeChannel
+          ? {
+              ...connection.unreadChannels,
+              [event.message.channel]:
+                (connection.unreadChannels[event.message.channel] ?? 0) + 1,
+            }
+          : connection.unreadChannels;
       return {
         ...connection,
         messages: [...connection.messages, event.message],
-        // Only counts against a tab you are not looking at.
-        unread:
-          active === connection.session ? connection.unread : connection.unread + 1,
+        unread: here ? connection.unread : connection.unread + 1,
+        unreadChannels,
       };
+    }
 
     case "history": {
       // The past merges in rather than replacing: live messages may already
@@ -242,7 +263,9 @@ function applyEvent(
             ? connection.info.defaultChannel
             : null
           : connection.activeChannel;
-      return { ...connection, channels, activeChannel };
+      const unreadChannels = { ...connection.unreadChannels };
+      delete unreadChannels[event.channelId];
+      return { ...connection, channels, activeChannel, unreadChannels };
     }
 
     // A refusal is an answer, not an outage: the tab stays alive and the

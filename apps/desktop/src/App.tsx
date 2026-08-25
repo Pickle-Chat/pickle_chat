@@ -129,6 +129,50 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings !== null]);
 
+  // Tabs are reachable without the mouse: Ctrl+Tab / Ctrl+Shift+Tab cycle,
+  // Ctrl+1..9 jump to the n-th tab, Ctrl+0 returns to the connect form. A
+  // voice keybind on the same keys wins — the global grab registers first.
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      if (e.altKey || e.repeat) return;
+      // Cmd+Tab is the OS app switcher on macOS, so cycling rarely arrives
+      // there; the number keys are the path that does.
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      )
+        return;
+      if (settingsOpen) return;
+      const order = connections.order;
+      const index = connections.active === null ? -1 : order.indexOf(connections.active);
+      if (e.key === "Tab") {
+        if (order.length === 0) return;
+        e.preventDefault();
+        const next = index < 0 ? 0 : (index + (e.shiftKey ? -1 : 1) + order.length) % order.length;
+        dispatch({ type: "focused", session: order[next] });
+        return;
+      }
+      if (e.key === "0") {
+        if (order.length === 0) return;
+        e.preventDefault();
+        dispatch({ type: "focused", session: null });
+        return;
+      }
+      const digit = Number.parseInt(e.key, 10);
+      if (digit >= 1 && digit <= order.length) {
+        e.preventDefault();
+        dispatch({ type: "focused", session: order[digit - 1] });
+      }
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [connections.order, connections.active, settingsOpen]);
+
   const active = connections.active === null ? null : connections.byId[connections.active] ?? null;
 
   // Channels whose past has already been requested, keyed session:channel.
@@ -443,6 +487,7 @@ function ConnectionView({
         channels={connection.channels}
         users={connection.users}
         activeChannel={connection.activeChannel}
+        unreadChannels={connection.unreadChannels}
         selfId={connection.info.clientId}
         hasVoice={hasVoice}
         permissions={connection.permissions}
@@ -564,11 +609,30 @@ function ConnectForm({
   const [busy, setBusy] = useState(false);
   const [known, setKnown] = useState<{ address: string; name: string; fingerprint: string }[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  // The address currently waiting on its second "really forget" click.
+  const [forgetting, setForgetting] = useState<string | null>(null);
 
   useEffect(() => {
     api.knownServers().then(setKnown).catch(() => setKnown([]));
     api.bookmarks().then(setBookmarks).catch(() => setBookmarks([]));
   }, []);
+
+  // A stray click is not a decision: the arm expires on its own.
+  useEffect(() => {
+    if (forgetting === null) return;
+    const timer = setTimeout(() => setForgetting(null), 2000);
+    return () => clearTimeout(timer);
+  }, [forgetting]);
+
+  const forget = async (address: string) => {
+    setForgetting(null);
+    try {
+      await api.forgetServer(address);
+      setKnown(await api.knownServers());
+    } catch (e) {
+      onError(describeError(e));
+    }
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -650,6 +714,28 @@ function ConnectForm({
                     check a server is the one you think it is. */}
                 <Fingerprint value={server.fingerprint} />
                 <span className="muted">{server.address}</span>
+                {forgetting === server.address ? (
+                  <>
+                    <button
+                      className="danger"
+                      title="Stop trusting this fingerprint"
+                      onClick={() => forget(server.address)}
+                    >
+                      really forget?
+                    </button>
+                    <button className="linklike" onClick={() => setForgetting(null)}>
+                      cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="linklike"
+                    title="Forget this server: stop trusting its fingerprint, and ask to verify it again next time you connect"
+                    onClick={() => setForgetting(server.address)}
+                  >
+                    forget
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -664,6 +750,7 @@ function ChannelList({
   channels,
   users,
   activeChannel,
+  unreadChannels,
   selfId,
   hasVoice,
   permissions,
@@ -678,6 +765,7 @@ function ChannelList({
   channels: Channel[];
   users: User[];
   activeChannel: number | null;
+  unreadChannels: Record<number, number>;
   selfId: number;
   /// Whether this connection is the one carrying voice.
   hasVoice: boolean;
@@ -764,6 +852,16 @@ function ChannelList({
               <span className="glyph">{channel.hasVoice ? "🔊" : "#"}</span>
               {channel.name}
             </button>
+            {/* The tab badge's cousin for the tab you are already in: unseen
+                messages in a channel that is not the one being read. */}
+            {(unreadChannels[channel.id] ?? 0) > 0 && (
+              <span
+                className="channel-unread"
+                aria-label={`${unreadChannels[channel.id]} new messages in ${channel.name}`}
+              >
+                {unreadChannels[channel.id]}
+              </span>
+            )}
             {/* Presence is entered and left explicitly, only where there is a
                 voice room to be present in. */}
             {/* Hidden, not disabled, without CONNECT — Discord's choice: a
@@ -908,10 +1006,35 @@ function ChatPane({
 }) {
   const [draft, setDraft] = useState("");
   const bottom = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
+
+  // `/` puts the cursor in the composer without reaching for the mouse. Only
+  // the active connection's view is mounted, so this cannot focus another
+  // server's pane; typing `/` inside a field is left alone.
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      if (!channel || !channel.hasText || !canSend) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable ||
+          target.closest(".modal, .user-menu"))
+      )
+        return;
+      e.preventDefault();
+      input.current?.focus();
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [channel, canSend]);
 
   if (!channel) {
     return <section className="chat empty">Pick a channel.</section>;
@@ -949,6 +1072,7 @@ function ChatPane({
         }}
       >
         <input
+          ref={input}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           placeholder={
