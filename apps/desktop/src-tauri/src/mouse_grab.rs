@@ -177,8 +177,66 @@ fn button_code(accelerator: &str) -> Option<evdev::KeyCode> {
         "Mouse5" => Some(KeyCode::BTN_EXTRA),
         // Mouse1 is refused in the UI; binding it would key the microphone on
         // every click.
-        _ => None,
+        _ => fkey_code(accelerator),
     }
+}
+
+/// The F-keys mice get remapped to. Gaming mice are routinely told to emit
+/// F13 through F24 precisely because those keys type nothing — and the
+/// remapped button then arrives as a *keyboard* key from the *mouse's* device
+/// node, which the keyboard grab can rarely catch: default X keymaps have no
+/// keycode for those keysyms at all. Reading them from the device is the same
+/// job as reading BTN_SIDE, so they share the path.
+#[cfg(target_os = "linux")]
+fn fkey_code(accelerator: &str) -> Option<evdev::KeyCode> {
+    use evdev::KeyCode;
+    Some(match accelerator {
+        "F13" => KeyCode::KEY_F13,
+        "F14" => KeyCode::KEY_F14,
+        "F15" => KeyCode::KEY_F15,
+        "F16" => KeyCode::KEY_F16,
+        "F17" => KeyCode::KEY_F17,
+        "F18" => KeyCode::KEY_F18,
+        "F19" => KeyCode::KEY_F19,
+        "F20" => KeyCode::KEY_F20,
+        "F21" => KeyCode::KEY_F21,
+        "F22" => KeyCode::KEY_F22,
+        "F23" => KeyCode::KEY_F23,
+        "F24" => KeyCode::KEY_F24,
+        _ => return None,
+    })
+}
+
+/// Should this F-key accelerator be read from a mouse rather than grabbed
+/// from the keyboard?
+///
+/// Yes when a readable, qualifying mouse advertises the key — the remapped
+/// case — and also when mice exist that we cannot open, because then the
+/// honest answer is the device path's permission guidance, not a keyboard
+/// grab that silently cannot fire. A plain keyboard-produced F-key (no such
+/// mouse anywhere) keeps the grab path untouched.
+#[cfg(target_os = "linux")]
+pub fn fkey_routes(accelerator: &str) -> bool {
+    let Some(code) = fkey_code(accelerator) else {
+        return false;
+    };
+    if accelerator.contains('+') {
+        // A modified chord needs the keyboard's modifiers, which a mouse
+        // device cannot see; leave it to the grab.
+        return false;
+    }
+    let advertised = evdev::enumerate().any(|(_, device)| {
+        is_mouse_only(&device)
+            && device
+                .supported_keys()
+                .is_some_and(|keys| keys.contains(code))
+    });
+    advertised || !unreadable_mice().is_empty()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn fkey_routes(_accelerator: &str) -> bool {
+    false
 }
 
 /// Whether a device is a pointer, and *only* a pointer.
@@ -820,5 +878,19 @@ mod tests {
             "would require watching a keyboard",
         );
         assert_eq!(super::button_code("KeyM"), None);
+    }
+
+    #[test]
+    fn fkeys_map_to_their_evdev_codes_and_nothing_else_does() {
+        use evdev::KeyCode;
+        assert_eq!(button_code("F13"), Some(KeyCode::KEY_F13));
+        assert_eq!(button_code("F24"), Some(KeyCode::KEY_F24));
+        // The ordinary function row stays with the keyboard grab.
+        assert_eq!(button_code("F12"), None);
+        assert_eq!(button_code("F25"), None);
+        // A modified chord needs the keyboard's modifiers; refused here.
+        assert_eq!(button_code("Ctrl+F24"), None);
+        assert!(!fkey_routes("Ctrl+F24"));
+        assert!(!fkey_routes("F12"));
     }
 }
