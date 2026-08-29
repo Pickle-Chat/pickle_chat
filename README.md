@@ -225,6 +225,12 @@ system will not deliver it: X11 and Wayland both hand pointer buttons to
 whatever is focused, which during a game is not Pickle. The only way to see the
 button is to read the mouse's `/dev/input/event*` node directly.
 
+A mouse whose firmware remaps a button to F13–F24 rides the same path: the
+remapped key arrives from the mouse's own device node, and the keyboard grab
+could rarely catch it anyway — default keymaps carry no keycode for those
+keysyms. Bind the F-key and it is read from the device like any thumb button,
+under the same udev rule.
+
 That node is not readable by default. The usual advice is to join the `input`
 group:
 

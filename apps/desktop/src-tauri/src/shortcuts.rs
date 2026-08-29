@@ -329,8 +329,12 @@ pub fn apply(app: &AppHandle) -> Vec<BindingStatus> {
         // Mouse bindings never reach the shortcut layer: it is keyboard-only,
         // and handing it "Mouse4" would produce an "unsupported key" complaint
         // that reads like a fault rather than a limit. They are collected and
-        // handed to the input-device reader below instead.
-        if is_mouse(&accelerator) {
+        // handed to the input-device reader below instead — as are F13–F24
+        // when a mouse is what emits them: firmware remaps arrive as keyboard
+        // keys from the mouse's own device node, which the keyboard grab can
+        // rarely catch (default keymaps have no keycode for those keysyms),
+        // while the device reader catches them exactly like a thumb button.
+        if is_mouse(&accelerator) || mouse_grab::fkey_routes(&accelerator) {
             mouse_bindings.push((accelerator, action));
             continue;
         }
